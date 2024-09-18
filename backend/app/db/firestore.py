@@ -26,15 +26,17 @@ def update_document(collection: str, document_id: str, data: dict) -> bool:
 
 def delete_document(collection: str, document_id: str) -> bool:
     try:
-        db.collection(collection).document(document_id).delete()
+        doc_ref = db.collection(collection).document(document_id)
+        doc_ref.delete()
         return True
     except NotFound:
         return False
 
 # HUMAN ASSISTANCE NEEDED
-# The query_documents function might need additional error handling and optimization for production use
+# The following function might need additional error handling and optimization for production use
 def query_documents(collection: str, filters: dict) -> list:
     query = db.collection(collection)
-    for key, value in filters.items():
-        query = query.where(key, '==', value)
-    return [doc.to_dict() for doc in query.stream()]
+    for field, value in filters.items():
+        query = query.where(field, '==', value)
+    docs = query.stream()
+    return [doc.to_dict() for doc in docs]
