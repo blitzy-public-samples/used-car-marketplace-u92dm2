@@ -25,16 +25,7 @@
       "@context/*": ["context/*"]
     }
   },
-  "include": [
-    "src/**/*.ts",
-    "src/**/*.tsx"
-  ],
-  "exclude": [
-    "node_modules",
-    "build",
-    "dist",
-    "**/*.spec.ts",
-    "**/*.test.ts"
-  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "build", "dist", "**/*.spec.ts", "**/*.test.ts"],
   "types": ["react", "react-dom"]
 }
