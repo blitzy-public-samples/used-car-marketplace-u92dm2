@@ -13,8 +13,11 @@ echo "Building and pushing Docker images..."
 docker build -t gcr.io/used-car-marketplace/api:latest ./backend/api
 docker push gcr.io/used-car-marketplace/api:latest
 
-docker build -t gcr.io/used-car-marketplace/worker:latest ./backend/worker
-docker push gcr.io/used-car-marketplace/worker:latest
+docker build -t gcr.io/used-car-marketplace/auth:latest ./backend/auth
+docker push gcr.io/used-car-marketplace/auth:latest
+
+docker build -t gcr.io/used-car-marketplace/search:latest ./backend/search
+docker push gcr.io/used-car-marketplace/search:latest
 
 # Apply Terraform configurations
 echo "Applying Terraform configurations..."
@@ -26,7 +29,7 @@ cd ..
 # Deploy backend services to Google Kubernetes Engine
 echo "Deploying backend services to GKE..."
 gcloud container clusters get-credentials used-car-marketplace-cluster --zone us-central1-a
-kubectl apply -f kubernetes/
+kubectl apply -f k8s/
 
 # Update Google Cloud Storage buckets
 echo "Updating Google Cloud Storage buckets..."
@@ -39,13 +42,13 @@ gcloud firestore indexes create firestore.indexes.json
 # Update DNS settings
 echo "Updating DNS settings..."
 gcloud dns record-sets transaction start --zone=used-car-marketplace-zone
-gcloud dns record-sets transaction add --name=api.usedcarmarketplace.com. --type=A --ttl=300 "$(kubectl get service api-service -o=jsonpath='{.status.loadBalancer.ingress[0].ip}')" --zone=used-car-marketplace-zone
+gcloud dns record-sets transaction add --name=api.usedcarmarketplace.com. --type=A --ttl=300 "$(kubectl get svc api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" --zone=used-car-marketplace-zone
 gcloud dns record-sets transaction execute --zone=used-car-marketplace-zone
 
 # Run post-deployment tests
 echo "Running post-deployment tests..."
 cd tests
-npm run post-deployment
+npm run post-deployment-tests
 cd ..
 
 echo "Deployment completed successfully!"
