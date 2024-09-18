@@ -1,0 +1,62 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run linting checks
+      run: |
+        pip install flake8
+        flake8 .
+
+    - name: Run unit tests
+      run: |
+        pip install pytest
+        pytest
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        export_default_credentials: true
+
+    - name: Build and push Docker image
+      env:
+        GCR_HOSTNAME: gcr.io
+      run: |
+        docker build -t $GCR_HOSTNAME/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }} .
+        gcloud auth configure-docker
+        docker push $GCR_HOSTNAME/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }}
+
+    - name: Deploy to GKE
+      if: github.ref == 'refs/heads/main'
+      run: |
+        gcloud container clusters get-credentials ${{ secrets.GKE_CLUSTER_NAME }} --zone ${{ secrets.GKE_ZONE }}
+        kubectl set image deployment/backend backend=$GCR_HOSTNAME/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }}
+
+# HUMAN ASSISTANCE NEEDED
+# Please review the following:
+# 1. Ensure that all necessary secrets (GCP_PROJECT_ID, GCP_SA_KEY, GKE_CLUSTER_NAME, GKE_ZONE) are properly set in the repository settings.
+# 2. Verify that the Docker build context and Dockerfile location are correct.
+# 3. Confirm that the GKE deployment name 'backend' is accurate for your setup.
+# 4. Adjust the Python version if a different version is required for your project.
