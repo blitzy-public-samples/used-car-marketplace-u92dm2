@@ -43,10 +43,11 @@ def process_payment(token: str, amount: float, currency: str) -> Dict[str, Any]:
             "error": str(e),
             "status": "failed"
         }
-    except ValueError as e:
+    except Exception as e:
+        # Handle unexpected errors
         return {
             "success": False,
-            "error": str(e),
+            "error": "An unexpected error occurred",
             "status": "failed"
         }
 
@@ -84,9 +85,10 @@ def create_refund(charge_id: str, amount: float) -> Dict[str, Any]:
             "error": str(e),
             "status": "failed"
         }
-    except ValueError as e:
+    except Exception as e:
+        # Handle unexpected errors
         return {
             "success": False,
-            "error": str(e),
+            "error": "An unexpected error occurred",
             "status": "failed"
         }
