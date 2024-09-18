@@ -57,26 +57,24 @@ A comprehensive platform for buying and selling used cars, connecting sellers wi
 
 ## Usage
 
-1. Register an account or log in
+1. Register an account or log in if you already have one
 2. Browse car listings or create your own listing
 3. Use the search and filter options to find specific cars
 4. Contact sellers through the messaging system
-5. Manage your listings and account settings
-
-For detailed usage instructions, please refer to the User Guide in the `docs` folder.
+5. Leave reviews and ratings for completed transactions
 
 ## API Documentation
 
-Our API documentation is available at `/api-docs` when running the server. It provides detailed information about available endpoints, request/response formats, and authentication requirements.
+For detailed API documentation, please refer to the [API Documentation](./docs/api.md) file.
 
 ## Contributing
 
-We welcome contributions to the Used Car Marketplace project. Please read our [Contributing Guidelines](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+We welcome contributions to the Used Car Marketplace project. Please read our [Contributing Guidelines](./CONTRIBUTING.md) for more information on how to get started.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
 
 ## Support
 
-If you encounter any issues or have questions, please file an issue on our GitHub repository or contact our support team at support@usedcarmarketplace.com.
+If you encounter any issues or have questions, please open an issue on our GitHub repository or contact our support team at support@usedcarmarketplace.com.
