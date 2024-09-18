@@ -45,5 +45,4 @@ output "vpc_subnet_information" {
 # HUMAN ASSISTANCE NEEDED
 # Please verify that the resource names (e.g., google_container_cluster.primary, google_storage_bucket.buckets)
 # match the actual resource names used in other Terraform files.
-# Also, ensure that all necessary resources are included and that the output
-# values correspond to the correct attributes of each resource.
+# Also, ensure that the database and Redis instance names are correct.
