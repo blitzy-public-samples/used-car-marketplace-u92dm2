@@ -54,7 +54,7 @@ export const uploadPhoto = async (photo: File): Promise<string> => {
 };
 
 // HUMAN ASSISTANCE NEEDED
-// Define the VehicleListing interface based on your application's data model
+// Define the VehicleListing interface based on your backend API structure
 interface VehicleListing {
   // Add properties for the vehicle listing
 }
