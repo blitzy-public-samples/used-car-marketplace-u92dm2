@@ -8,8 +8,7 @@ import { PaymentForm } from '@/components/PaymentForm';
 import { fetchListingDetails } from '@/services/api';
 
 // HUMAN ASSISTANCE NEEDED
-// The following component may need additional error handling, loading states, and possibly
-// more robust type checking. Please review and enhance as necessary.
+// The following component may need additional error handling, loading states, and responsive design considerations for production readiness.
 
 const VehicleDetailsPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -17,14 +16,12 @@ const VehicleDetailsPage: React.FC = () => {
 
   useEffect(() => {
     const fetchDetails = async () => {
-      if (id) {
-        try {
-          const details = await fetchListingDetails(id);
-          setListingDetails(details);
-        } catch (error) {
-          console.error('Error fetching listing details:', error);
-          // TODO: Add proper error handling
-        }
+      try {
+        const details = await fetchListingDetails(id);
+        setListingDetails(details);
+      } catch (error) {
+        console.error('Error fetching listing details:', error);
+        // TODO: Implement proper error handling
       }
     };
 
@@ -32,7 +29,7 @@ const VehicleDetailsPage: React.FC = () => {
   }, [id]);
 
   if (!listingDetails) {
-    return <div>Loading...</div>;
+    return <div>Loading...</div>; // TODO: Replace with a proper loading component
   }
 
   return (
