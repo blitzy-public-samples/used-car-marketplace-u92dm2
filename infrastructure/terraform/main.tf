@@ -8,12 +8,9 @@ provider "google" {
 
 # Resource definitions for Google Kubernetes Engine cluster
 resource "google_container_cluster" "primary" {
-  name     = "${var.project_id}-gke"
+  name     = "primary-cluster"
   location = var.region
-  
-  # We can't create a cluster with no node pool defined, but we want to only use
-  # separately managed node pools. So we create the smallest possible default
-  # node pool and immediately delete it.
+
   remove_default_node_pool = true
   initial_node_count       = 1
 
@@ -22,7 +19,7 @@ resource "google_container_cluster" "primary" {
 }
 
 resource "google_container_node_pool" "primary_nodes" {
-  name       = "${google_container_cluster.primary.name}-node-pool"
+  name       = "primary-node-pool"
   location   = var.region
   cluster    = google_container_cluster.primary.name
   node_count = var.gke_num_nodes
@@ -52,18 +49,6 @@ resource "google_storage_bucket" "static_assets" {
   force_destroy = true
 
   uniform_bucket_level_access = true
-
-  website {
-    main_page_suffix = "index.html"
-    not_found_page   = "404.html"
-  }
-
-  cors {
-    origin          = ["*"]
-    method          = ["GET", "HEAD", "PUT", "POST", "DELETE"]
-    response_header = ["*"]
-    max_age_seconds = 3600
-  }
 }
 
 # Resource definitions for Google Cloud Firestore
@@ -76,7 +61,7 @@ resource "google_firestore_database" "database" {
 
 # Resource definitions for Google Cloud SQL instance
 resource "google_sql_database_instance" "main" {
-  name             = "${var.project_id}-db-instance"
+  name             = "main-instance"
   database_version = "POSTGRES_13"
   region           = var.region
 
@@ -85,11 +70,6 @@ resource "google_sql_database_instance" "main" {
   }
 
   deletion_protection = false
-}
-
-resource "google_sql_database" "database" {
-  name     = "${var.project_id}-database"
-  instance = google_sql_database_instance.main.name
 }
 
 # Resource definitions for networking components (VPC, subnets, firewall rules)
@@ -106,40 +86,36 @@ resource "google_compute_subnetwork" "subnet" {
 }
 
 resource "google_compute_firewall" "default" {
-  name    = "${var.project_id}-firewall"
+  name    = "allow-internal"
   network = google_compute_network.vpc.name
 
   allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8080", "1000-2000"]
+    protocol = "icmp"
   }
 
-  source_tags = ["web"]
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "80", "443", "8080"]
+  }
+
+  source_ranges = ["10.10.0.0/24"]
 }
 
 # Resource definitions for IAM roles and service accounts
 resource "google_service_account" "default" {
-  account_id   = "${var.project_id}-sa"
-  display_name = "Service Account for ${var.project_id}"
+  account_id   = "service-account-id"
+  display_name = "Service Account"
 }
 
-resource "google_project_iam_member" "service_account_role" {
+resource "google_project_iam_member" "service_account" {
   project = var.project_id
   role    = "roles/editor"
   member  = "serviceAccount:${google_service_account.default.email}"
 }
 
 # HUMAN ASSISTANCE NEEDED
-# The following IAM roles might need to be adjusted based on the specific requirements of the project
-# Please review and modify as necessary
-resource "google_project_iam_member" "additional_roles" {
-  for_each = toset([
-    "roles/cloudsql.client",
-    "roles/datastore.user",
-    "roles/storage.objectAdmin",
-  ])
-  
-  project = var.project_id
-  role    = each.key
-  member  = "serviceAccount:${google_service_account.default.email}"
-}
+# The following variables need to be defined in a separate variables.tf file:
+# - var.project_id
+# - var.region
+# - var.gke_num_nodes
+# Please create a variables.tf file and define these variables with appropriate default values or descriptions.
