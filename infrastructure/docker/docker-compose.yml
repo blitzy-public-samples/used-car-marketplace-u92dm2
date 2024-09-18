@@ -49,8 +49,8 @@ volumes:
 # HUMAN ASSISTANCE NEEDED
 # Please review and update the following:
 # 1. Ensure that the frontend and backend Dockerfile paths are correct
-# 2. Update the REACT_APP_API_URL to match your production setup
-# 3. Set a strong, unique JWT_SECRET for production
-# 4. Update database credentials (user, password) for production use
-# 5. Consider adding health checks for services
-# 6. Review and adjust port mappings as needed for your production environment
+# 2. Update the REACT_APP_API_URL if a different URL structure is required
+# 3. Set a strong, unique JWT_SECRET for the backend service
+# 4. Review and adjust the database credentials as needed
+# 5. Consider adding health checks for the services
+# 6. Evaluate if additional environment variables are required for each service
