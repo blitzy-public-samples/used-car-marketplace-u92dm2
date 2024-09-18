@@ -17,7 +17,7 @@ class TestAPI(unittest.TestCase):
     def test_register_user(self):
         response = self.client.post("/auth/register", json={
             "username": "testuser",
-            "email": "testuser@example.com",
+            "email": "test@example.com",
             "password": "testpassword"
         })
         self.assertEqual(response.status_code, 201)
@@ -44,7 +44,6 @@ class TestAPI(unittest.TestCase):
         self.assertIn("id", response.json())
 
     def test_get_listing(self):
-        # Assume a listing with id 1 exists
         response = self.client.get("/listings/1")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["title"], "Test Listing")
@@ -109,15 +108,25 @@ class TestAPI(unittest.TestCase):
     def test_create_listing_without_auth(self):
         response = self.client.post("/listings/", json={
             "title": "Unauthorized Listing",
-            "description": "This should fail",
-            "price": 100.00,
-            "category": "Electronics"
+            "description": "This should not be created",
+            "price": 50.00,
+            "category": "Other"
         })
         self.assertEqual(response.status_code, 401)
 
     def test_get_nonexistent_listing(self):
         response = self.client.get("/listings/9999")
         self.assertEqual(response.status_code, 404)
+
+    def test_update_listing_not_owned(self):
+        token = create_access_token({"sub": "otheruser"})
+        response = self.client.put("/listings/1", json={
+            "title": "Unauthorized Update",
+            "description": "This should not be updated",
+            "price": 200.00,
+            "category": "Electronics"
+        }, headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 403)
 
     # HUMAN ASSISTANCE NEEDED
     # The following test cases might need to be adjusted based on the actual implementation of rate limiting and input validation
