@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://backend:5000
+    networks:
+      - used-car-marketplace
+
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      - database
+    environment:
+      - DATABASE_URL=postgresql://user:password@database:5432/used_car_marketplace
+      - JWT_SECRET=your_jwt_secret_here
+    networks:
+      - used-car-marketplace
+
+  database:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=used_car_marketplace
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - used-car-marketplace
+
+networks:
+  used-car-marketplace:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+# HUMAN ASSISTANCE NEEDED
+# Please review and update the following:
+# 1. Ensure that the frontend and backend Dockerfile paths are correct
+# 2. Update the REACT_APP_API_URL to match your production setup
+# 3. Set a strong, unique JWT_SECRET for production
+# 4. Update database credentials (user, password) for production use
+# 5. Consider adding health checks for services
+# 6. Review and adjust port mappings as needed for your production environment
