@@ -7,23 +7,21 @@ import { processPayment } from '@/services/payment';
 
 // HUMAN ASSISTANCE NEEDED
 // This component may need additional error handling and loading states.
-// Consider adding more robust error handling for API calls and payment processing.
-// Implement proper loading indicators for better user experience.
+// Consider adding proper TypeScript interfaces for the transaction and payment data.
 
 const TransactionPage: React.FC = () => {
   const { transactionId } = useParams<{ transactionId: string }>();
   const [transaction, setTransaction] = useState<any>(null);
-  const [paymentStatus, setPaymentStatus] = useState<'pending' | 'success' | 'failed'>('pending');
+  const [paymentStatus, setPaymentStatus] = useState<string | null>(null);
 
   useEffect(() => {
     const loadTransactionDetails = async () => {
       try {
         const details = await fetchTransactionDetails(transactionId);
         setTransaction(details);
-        setPaymentStatus(details.status);
       } catch (error) {
-        console.error('Error fetching transaction details:', error);
-        setPaymentStatus('failed');
+        console.error('Failed to fetch transaction details:', error);
+        // TODO: Handle error state
       }
     };
 
@@ -31,15 +29,17 @@ const TransactionPage: React.FC = () => {
   }, [transactionId]);
 
   const handlePayment = async () => {
-    try {
-      const result = await processPayment(transactionId);
-      setPaymentStatus(result.status);
-      // Update transaction details after payment processing
-      const updatedDetails = await fetchTransactionDetails(transactionId);
-      setTransaction(updatedDetails);
-    } catch (error) {
-      console.error('Error processing payment:', error);
-      setPaymentStatus('failed');
+    if (transaction && transaction.status === 'pending') {
+      try {
+        const result = await processPayment(transactionId);
+        setPaymentStatus(result.status);
+        // Refresh transaction details after payment
+        const updatedDetails = await fetchTransactionDetails(transactionId);
+        setTransaction(updatedDetails);
+      } catch (error) {
+        console.error('Payment processing failed:', error);
+        setPaymentStatus('failed');
+      }
     }
   };
 
@@ -51,11 +51,17 @@ const TransactionPage: React.FC = () => {
     <div className="transaction-page">
       <h1>Transaction Details</h1>
       <TransactionDetails transaction={transaction} />
-      <PaymentStatus status={paymentStatus} />
-      {paymentStatus === 'pending' && (
+      <PaymentStatus status={transaction.status} />
+      {transaction.status === 'pending' && (
         <button onClick={handlePayment}>Process Payment</button>
       )}
-      {paymentStatus === 'success' && (
+      {paymentStatus && (
+        <div className="payment-result">
+          <h2>Payment Result</h2>
+          <p>Status: {paymentStatus}</p>
+        </div>
+      )}
+      {transaction.status === 'completed' && (
         <div className="transaction-receipt">
           <h2>Transaction Receipt</h2>
           {/* Add receipt details here */}
