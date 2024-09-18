@@ -1,8 +1,7 @@
 import imageCompression from 'browser-image-compression';
 
 // HUMAN ASSISTANCE NEEDED
-// The compressImage function has a confidence level below 0.8 and may need adjustments for production readiness.
-// Please review and optimize the compression options and error handling.
+// The compressImage function has a confidence level below 0.8 and may need adjustments for production readiness
 export async function compressImage(imageFile: File): Promise<File> {
   const options = {
     maxSizeMB: 1,
@@ -20,7 +19,7 @@ export async function compressImage(imageFile: File): Promise<File> {
   }
 }
 
-export function getImageDimensions(imageFile: File): Promise<{ width: number, height: number }> {
+export function getImageDimensions(imageFile: File): Promise<{ width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -29,9 +28,7 @@ export function getImageDimensions(imageFile: File): Promise<{ width: number, he
         height: img.height
       });
     };
-    img.onerror = (error) => {
-      reject(error);
-    };
+    img.onerror = reject;
     img.src = URL.createObjectURL(imageFile);
   });
 }
