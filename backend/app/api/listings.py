@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
+import json
 import logging
 import uuid
 from app.schema.listing import VehicleListing
@@ -10,6 +11,14 @@ from app.services.ai_vision import analyze_vehicle_photo
 from app.services.document_processing import process_maintenance_document
 
 logger = logging.getLogger(__name__)
+
+# Bounds applied to maintenance input before processing and persistence: the
+# maximum record count parsed, the maximum aggregate decoded content bytes, and
+# the maximum serialized listing size written to one Firestore document.
+_MAX_MAINTENANCE_RECORDS = 20
+_MAX_MAINTENANCE_CONTENT_BYTES = 900 * 1024
+_MAX_SERIALIZED_LISTING_BYTES = 1_000_000
+
 router = APIRouter()
 
 # HUMAN ASSISTANCE NEEDED
@@ -25,26 +34,67 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
 
     # Process maintenance documents per record. process_maintenance_document is
     # synchronous, so it is called without await, and failures are handled here.
+    # The record count and aggregate content size are bounded, and each content
+    # value must be non-empty bytes-like after string encoding.
     correlation_id = str(uuid.uuid4())
+    records = listing.maintenance_records
+    if len(records) > _MAX_MAINTENANCE_RECORDS:
+        logger.warning(
+            "too many maintenance records",
+            extra={"correlation_id": correlation_id},
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Unable to process maintenance documents",
+        )
     maintenance_data = []
+    total_content_bytes = 0
     try:
-        for record in listing.maintenance_records:
+        for record in records:
             content = record.get('content')
             if content is None:
                 continue
             if isinstance(content, str):
                 content = content.encode('utf-8')
+            elif isinstance(content, bytearray):
+                content = bytes(content)
+            if not isinstance(content, bytes) or not content:
+                raise ValueError("maintenance content must be non-empty bytes")
+            total_content_bytes += len(content)
+            if total_content_bytes > _MAX_MAINTENANCE_CONTENT_BYTES:
+                raise ValueError("aggregate maintenance content is too large")
             doc_format = record.get('format', 'pdf')
-            maintenance_data.append(process_maintenance_document(content, doc_format))
+            maintenance_data.append(
+                process_maintenance_document(content, doc_format)
+            )
     except Exception:
-        logger.exception("maintenance processing failed", extra={"correlation_id": correlation_id})
-        raise HTTPException(status_code=422, detail="Unable to process maintenance documents")
+        logger.exception(
+            "maintenance processing failed",
+            extra={"correlation_id": correlation_id},
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Unable to process maintenance documents",
+        )
 
     # Create a new listing document in the database
     listing_data = listing.dict()
     listing_data['seller_id'] = current_user.id
     listing_data['photo_analysis'] = photo_analysis
     listing_data['maintenance_data'] = maintenance_data
+
+    # Reject a serialized listing that exceeds Firestore's per-document size
+    # limit before writing it to the database.
+    serialized_size = len(json.dumps(listing_data, default=str).encode())
+    if serialized_size > _MAX_SERIALIZED_LISTING_BYTES:
+        logger.warning(
+            "listing exceeds serialized size budget",
+            extra={"correlation_id": correlation_id},
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Listing payload is too large to store",
+        )
 
     doc_ref = db.collection('listings').document()
     doc_ref.set(listing_data)
