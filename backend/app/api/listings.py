@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
+import logging
+import uuid
 from app.schema.listing import VehicleListing
+from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
 from app.services.ai_vision import analyze_vehicle_photo
 from app.services.document_processing import process_maintenance_document
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # HUMAN ASSISTANCE NEEDED
@@ -19,8 +23,22 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
     # Analyze vehicle photos using AI vision service
     photo_analysis = await analyze_vehicle_photo(listing.photos)
 
-    # Process maintenance documents
-    maintenance_data = await process_maintenance_document(listing.maintenance_documents)
+    # Process maintenance documents per record. process_maintenance_document is
+    # synchronous, so it is called without await, and failures are handled here.
+    correlation_id = str(uuid.uuid4())
+    maintenance_data = []
+    try:
+        for record in listing.maintenance_records:
+            content = record.get('content')
+            if content is None:
+                continue
+            if isinstance(content, str):
+                content = content.encode('utf-8')
+            doc_format = record.get('format', 'pdf')
+            maintenance_data.append(process_maintenance_document(content, doc_format))
+    except Exception:
+        logger.exception("maintenance processing failed", extra={"correlation_id": correlation_id})
+        raise HTTPException(status_code=422, detail="Unable to process maintenance documents")
 
     # Create a new listing document in the database
     listing_data = listing.dict()
