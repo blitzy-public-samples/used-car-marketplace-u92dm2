@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional
+import logging
 from pydantic import BaseModel
 from app.core.config import settings
 from app.db.firestore import db
@@ -11,6 +12,7 @@ from app.schema.user import User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token')
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+logger = logging.getLogger(__name__)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -37,8 +39,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
-# HUMAN ASSISTANCE NEEDED
-# This function might need additional error handling and security checks
 def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     credentials_exception = HTTPException(
         status_code=401,
@@ -49,11 +49,14 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
+            logger.warning("JWT missing 'sub' claim")
             raise credentials_exception
     except JWTError:
+        logger.warning("JWT validation failed")
         raise credentials_exception
     user_doc = db.collection('users').document(user_id).get()
     if not user_doc.exists:
+        logger.warning("Authenticated subject not found: %s", user_id)
         raise credentials_exception
     return User.from_dict(user_doc.to_dict())
 
