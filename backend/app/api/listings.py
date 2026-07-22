@@ -21,8 +21,6 @@ _MAX_SERIALIZED_LISTING_BYTES = 1_000_000
 
 router = APIRouter()
 
-# HUMAN ASSISTANCE NEEDED
-# The confidence level for this function is below 0.8. Please review and adjust as necessary.
 @router.post('/listings')
 async def create_listing(listing: VehicleListing, current_user: User = Depends(get_current_user)):
     # Validate the current user's role (must be a seller)
