@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str
     API_V1_STR: str
     SECRET_KEY: str
+    ALGORITHM: str = "HS256"  # JWT signing algorithm used by token issuance and validation
     ACCESS_TOKEN_EXPIRE_MINUTES: int
     GOOGLE_CLOUD_PROJECT: str
     GOOGLE_CLOUD_STORAGE_BUCKET: str
