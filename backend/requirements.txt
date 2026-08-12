@@ -1,0 +1,49 @@
+# Backend runtime and tooling dependencies for the Used Car Marketplace API.
+#
+# Target runtime: Python 3.9 (pinned by .github/workflows/backend_ci.yml).
+# Every version below is resolved and installed together on CPython 3.9.25.
+#
+# IMPORTANT: pydantic MUST stay on the 1.x line. backend/app/core/config.py
+# imports `BaseSettings` directly from pydantic, which Pydantic v2 removed
+# (it moved to the separate pydantic-settings package).
+
+# --- Web framework / ASGI ---------------------------------------------------
+fastapi==0.103.2
+uvicorn[standard]==0.23.2
+pydantic==1.10.13
+python-multipart==0.0.6
+
+# --- Authentication ---------------------------------------------------------
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 probes the bcrypt backend at import time and is incompatible
+# with bcrypt >= 4.1 (its version probe raises
+# "ValueError: password cannot be longer than 72 bytes" / "__about__" errors).
+# 4.0.1 is the newest release passlib 1.7.4 can drive, so it is pinned
+# explicitly instead of being left to the resolver.
+bcrypt==4.0.1
+
+# --- Google Cloud -----------------------------------------------------------
+google-cloud-firestore==2.13.1
+google-cloud-storage==2.13.0
+google-cloud-vision==3.4.5
+google-cloud-documentai==2.20.1
+
+# --- Payments ---------------------------------------------------------------
+stripe==7.9.0
+
+# --- Background jobs --------------------------------------------------------
+# The [redis] extra pulls the redis client that kombu's redis:// transport
+# needs. app/tasks/background_jobs.py builds its Celery app from
+# settings.CELERY_BROKER_URL, and the documented local broker is
+# redis://localhost:6379/0, which is unusable without this extra.
+celery[redis]==5.3.6
+
+# --- Media / document processing -------------------------------------------
+Pillow==10.1.0
+PyPDF2==3.0.1
+
+# --- Test and lint tooling (invoked by .github/workflows/backend_ci.yml) ---
+pytest==7.4.4
+httpx==0.25.2
+flake8==6.1.0

@@ -1,0 +1,47 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# --- Node -----------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.eslintcache
+
+# --- Build output ---------------------------------------------------------
+dist/
+build/
+coverage/
+frontend/dist/
+frontend/build/
+
+# --- Local environment / secrets ------------------------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+service-account*.json
+
+# --- Editor / OS ----------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# --- Local run artifacts --------------------------------------------------
+*.log
+.emulator/
+
+# Agent run artifacts (screenshots / screen recordings) - binary, never committed
+blitzy/screenshots/
+blitzy/screen_recordings/
