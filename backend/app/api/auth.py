@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -10,7 +10,13 @@ from app.core.config import settings
 from app.db.firestore import db
 from app.schema.user import User
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token')
+# tokenUrl must name the route that actually mints tokens. The literal 'token'
+# matched no route, so the OpenAPI security scheme advertised an endpoint that
+# does not exist and the Swagger authorize flow could never complete.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f'{settings.API_V1_STR}/auth/login')
+# This module held a complete set of authentication helpers and no router at
+# all, so main.py had nothing to mount and every auth path answered 404.
+router = APIRouter()
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
 logger = logging.getLogger(__name__)
 
@@ -63,3 +69,153 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+class RegisterRequest(BaseModel):
+    # The field set comes from the User schema, not from a client: the SPA
+    # ships no register function, and every User field except the password
+    # hash is required, so persisting a partial document would fail
+    # validation on the next authenticated request instead of here.
+    email: str
+    password: str
+    first_name: str
+    last_name: str
+    role: str
+
+class LoginRequest(BaseModel):
+    # The SPA posts a JSON body {email, password}, so login binds a
+    # request model rather than OAuth2PasswordRequestForm: a form-bound
+    # route would reject every call the client makes, and would newly
+    # require python-multipart. Accepted consequence: Swagger's
+    # "Authorize" password flow, which submits a form, cannot complete
+    # against this route.
+    email: str
+    password: str
+
+def _public_user(user: User) -> dict:
+    # Project the public fields explicitly. No route in this codebase
+    # declares a response_model and User still carries hashed_password, so
+    # returning the model itself would serialise the bcrypt hash back to
+    # the client.
+    return {
+        'id': user.id,
+        'email': user.email,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'role': user.role,
+        'created_at': user.created_at,
+        'updated_at': user.updated_at,
+    }
+
+def _issue_token(user: User) -> str:
+    # Supply the configured lifetime explicitly.
+    # ACCESS_TOKEN_EXPIRE_MINUTES is a required setting that no module
+    # read, so create_access_token's 15-minute fallback silently governed
+    # every token and a deployment asking for 60 minutes received 15. The
+    # subject is the user id because get_current_user resolves 'sub' as a
+    # Firestore document id.
+    return create_access_token(
+        {'sub': user.id},
+        expires_delta=timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        ),
+    )
+
+@router.post('/register', status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest):
+    """Create a user account and return a token with the public profile."""
+    # The handlers below are synchronous like every other function in this
+    # module, so Starlette runs their blocking Firestore calls in a
+    # threadpool instead of on the event loop, and none carries a return
+    # annotation because FastAPI would infer a response_model from one
+    # where no route in this codebase declares any.
+    #
+    # Firestore enforces no unique index on email and authenticate_user's
+    # limit(1) would silently pick one of any duplicates, so a collision
+    # is rejected here, before anything is written.
+    existing = (
+        db.collection('users')
+        .where('email', '==', payload.email)
+        .limit(1)
+        .get()
+    )
+    if existing:
+        logger.warning("Registration rejected: email already registered")
+        raise HTTPException(
+            status_code=409,
+            detail="Email is already registered",
+        )
+    # Reserve the document reference first so its id can be stored inside the
+    # document itself: authenticate_user and get_current_user both hydrate
+    # through User.from_dict, which requires every field but the hash.
+    user_ref = db.collection('users').document()
+    now = datetime.utcnow()
+    user_data = {
+        'id': user_ref.id,
+        'email': payload.email,
+        'first_name': payload.first_name,
+        'last_name': payload.last_name,
+        'role': payload.role,
+        'created_at': now,
+        'updated_at': now,
+        'hashed_password': get_password_hash(payload.password),
+    }
+    user_ref.set(user_data)
+    logger.info("Registered user %s", user_ref.id)
+    user = User.from_dict(user_data)
+    token = _issue_token(user)
+    # access_token and token_type honour the OAuth2 convention the Token
+    # model above describes; token and user are the keys the SPA actually
+    # reads, and it throws "Invalid response from server" when a top-level
+    # token is absent.
+    return {
+        'access_token': token,
+        'token_type': 'bearer',
+        'token': token,
+        'user': _public_user(user),
+    }
+
+@router.post('/login')
+def login(payload: LoginRequest):
+    """Exchange an email and password for an access token."""
+    user = authenticate_user(payload.email, payload.password)
+    # authenticate_user is annotated -> User but returns False on both of
+    # its failure branches, so falsiness is what must be tested here: "if
+    # user is None" would treat every failed login as a success and mint a
+    # token for it.
+    if not user:
+        logger.warning("Login rejected: invalid credentials")
+        # One message for an unknown email and for a wrong password, so the
+        # response cannot be used to enumerate accounts, and the same header
+        # get_current_user already returns on a 401.
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = _issue_token(user)
+    logger.info("Issued access token for user %s", user.id)
+    # The same four keys register returns, for the same client contract.
+    return {
+        'access_token': token,
+        'token_type': 'bearer',
+        'token': token,
+        'user': _public_user(user),
+    }
+
+@router.post('/logout')
+def logout(current_user: User = Depends(get_current_user)):
+    """Acknowledge a sign-out; the token stays valid until it expires."""
+    # Acknowledgement only. Tokens carry just 'sub' and 'exp' and this
+    # codebase holds no denylist, revocation list or server-side session,
+    # so nothing here can shorten a token's life. The route exists because
+    # the SPA posts to it and clears its stored token whatever the
+    # outcome, and 404 was the only answer it ever received.
+    logger.info("Logout acknowledged for user %s", current_user.id)
+    return {"detail": "Logged out"}
+
+@router.get('/me')
+def read_current_user(current_user: User = Depends(get_current_user)):
+    """Return the authenticated user's public profile."""
+    # Nested under 'user' because the SPA reads response.data.user; a flat body
+    # would hand it undefined.
+    return {'user': _public_user(current_user)}
