@@ -24,6 +24,7 @@
  *   - exposed accessible names      `toHaveAccessibleName('Rate 3 out of 5')`
  *   - exposed state                 `aria-checked` tracking
  *   - a single, predictable Tab stop roving-`tabindex` tests
+ *   - a VISIBLE focus indicator     focus-indicator contract tests
  *   - value not carried by colour   textual-echo tests
  *
  * Queries are deliberately role- and accessible-name-based rather than
@@ -33,6 +34,12 @@
  * `data-testid` selector would pass just as happily against a `<div>` soup that
  * no screen reader can operate. There is no component library anywhere in this
  * repository, so there are also no library test ids to fall back on.
+ *
+ * The focus-indicator tests are the one documented exception, and they are an
+ * exception because jsdom applies no stylesheet: computed style is empty for
+ * every element, so visible focus cannot be observed and has to be asserted
+ * against the source contract instead. The reasoning, and how those assertions
+ * stay implementation-agnostic, is set out above that block.
  *
  * HOW THE TEST GLOBALS RESOLVE (do not "fix" this with a Vitest import)
  * -----------------------------------------------------------------------------
@@ -110,6 +117,19 @@ const MID_SCORE = SCORES[Math.floor((SCORES.length - 1) / 2)];
 const NO_SCORE_TEXT = 'No score selected';
 
 /**
+ * The two star glyphs, as escapes rather than literal characters so a
+ * re-encoding of this file cannot silently change what is being asserted.
+ *
+ * U+2605 BLACK STAR marks a position at or below the score, U+2606 WHITE STAR a
+ * position beyond it. They are declared here rather than imported because the
+ * component keeps them module-local — deliberately, since they are an
+ * implementation detail of its rendering — and restating them is what lets this
+ * suite assert the VISUAL channel independently of the ARIA one.
+ */
+const FILLED_STAR = '\u2605';
+const EMPTY_STAR = '\u2606';
+
+/**
  * The accessible name each option must expose. Naming an option by the value it
  * selects is what makes the choice unambiguous when announced out of visual
  * context; the star glyph alone would announce as a punctuation character.
@@ -127,6 +147,59 @@ const echoText = (score: number): string => `${score} out of ${RATING_MAX}`;
  * gate runs with `--max-warnings 0`.
  */
 const ignoreScore = (): void => undefined;
+
+/**
+ * Utility that REMOVES the indicator the browser draws for a focused element.
+ *
+ * Matched rather than compared, so the `focus-visible:` variant of the same
+ * suppression counts, as does `outline-hidden`.
+ */
+const OUTLINE_SUPPRESSOR = /^focus(-visible)?:outline-(none|0|hidden)$/;
+
+/**
+ * Any focus-state utility that could constitute an indicator, EXCLUDING the
+ * suppressor above — which is a focus-state utility too, and the one thing that
+ * must never be mistaken for an indicator.
+ *
+ * Deliberately broad: ring, outline, border, shadow and background are all
+ * legitimate ways to mark focus, and this suite has no business dictating which.
+ */
+const FOCUS_INDICATOR =
+  /^focus(-visible)?:(ring|outline|border|shadow|bg)(-|$)/;
+
+/**
+ * A focus indicator carrying a WIDTH, which is what makes it actually drawn —
+ * e.g. `focus:ring-2`, `focus:outline-2`, `focus:border-4`. A colour alone
+ * (`focus:ring-blue-600`) paints nothing.
+ *
+ * The offset variants are excluded, since `focus:ring-offset-2` is a gap rather
+ * than a stroke and would otherwise satisfy this on its own.
+ */
+const SIZED_FOCUS_INDICATOR =
+  /^focus(-visible)?:(ring|outline|border)-\d+$/;
+
+/** The gap that keeps the indicator clear of the glyph it surrounds. */
+const FOCUS_INDICATOR_OFFSET =
+  /^focus(-visible)?:(ring|outline)-offset-\d+$/;
+
+/**
+ * An element's classes as a list, with empty entries dropped so a double space
+ * in a composed `className` cannot produce a phantom member.
+ */
+const classListOf = (element: HTMLElement): string[] =>
+  element.className.split(/\s+/).filter((name) => name.length > 0);
+
+/**
+ * The focus-indicator classes on an element, if any.
+ *
+ * A helper rather than an inline filter because three tests below ask the same
+ * question of different elements, and because it keeps the definition of "is
+ * there an indicator" in exactly one place.
+ */
+const focusIndicatorClasses = (element: HTMLElement): string[] =>
+  classListOf(element).filter(
+    (name) => FOCUS_INDICATOR.test(name) && !OUTLINE_SUPPRESSOR.test(name),
+  );
 
 interface HarnessProps {
   /** Score the harness starts with; `null` models the pre-choice state. */
@@ -336,6 +409,62 @@ describe('StarRatingInput selection state', () => {
   });
 });
 
+/*
+ * A value the scale cannot represent.
+ *
+ * `value` is typed `number | null`, so nothing stops a caller passing a score
+ * from a differently bounded scale, an uninitialised `0`, or a fractional average
+ * meant for a different component. The requirement is not that the component
+ * guess what was intended — it is that all FOUR channels agree on one answer,
+ * because the alternative is a control that contradicts itself: five filled
+ * glyphs for a sighted user, "nothing selected" for a screen reader, and an
+ * impossible sentence in between.
+ *
+ * Each case below therefore asserts the same four things at once — checked state,
+ * glyphs, echo and tab stop — and the tab stop matters most: a group with no
+ * `tabIndex={0}` is unreachable by keyboard, which is a WCAG 2.1.1 failure rather
+ * than a cosmetic one.
+ */
+describe('StarRatingInput controlled value outside the scale', () => {
+  const UNREPRESENTABLE = [RATING_MAX + 1, RATING_MIN - 1, 0, MID_SCORE + 0.5];
+
+  UNREPRESENTABLE.forEach((value) => {
+    it(`treats ${value} as no selection, coherently in every channel`, () => {
+      render(<StarRatingInput value={value} onChange={ignoreScore} />);
+
+      expectCheckedScore(null);
+      expectSingleTabStop(RATING_MIN);
+      expect(screen.getByText(NO_SCORE_TEXT)).toBeInTheDocument();
+      expect(screen.queryByText(echoText(value))).not.toBeInTheDocument();
+    });
+  });
+
+  it('fills no glyph for an out-of-scale value, rather than filling all of them', () => {
+    const { container } = render(
+      <StarRatingInput value={RATING_MAX + 1} onChange={ignoreScore} />,
+    );
+
+    // The filled glyph is U+2605 and the outline is U+2606. Asserted on the
+    // rendered characters because that is what a sighted reader actually sees;
+    // the class names could change without the appearance changing.
+    expect(container.textContent).not.toContain('\u2605');
+    expect(
+      (container.textContent ?? '').split('\u2606').length - 1,
+    ).toBe(OPTION_COUNT);
+  });
+
+  it('recovers a real selection made after an out-of-scale value', async () => {
+    const user = renderHarness({ initial: RATING_MAX + 1 });
+
+    expectCheckedScore(null);
+
+    await user.click(optionFor(MID_SCORE));
+
+    expectCheckedScore(MID_SCORE);
+    expect(screen.getByText(echoText(MID_SCORE))).toBeInTheDocument();
+  });
+});
+
 describe('StarRatingInput roving tabindex', () => {
   it('puts the single tab stop on the first option before any choice', async () => {
     const user = renderHarness();
@@ -375,6 +504,108 @@ describe('StarRatingInput roving tabindex', () => {
 });
 
 /*
+ * WCAG 2.4.7 Focus Visible — the half the tests above cannot reach.
+ *
+ * Everything before this point proves that focus MOVES: Tab reaches the group,
+ * arrows walk it, `document.activeElement` lands where it should. None of it
+ * proves that a sighted keyboard user can SEE where focus landed, and the two are
+ * separate failures with separate causes. WCAG 2.1 Level AA is a stated
+ * requirement (SRS L187, L525, L556-L557), and 2.4.7 is the criterion that a
+ * keyboard-operable control most commonly fails while every focus-movement test
+ * stays green.
+ *
+ * The specific hazard is concrete rather than hypothetical. This component sets
+ * `focus:outline-none`, which REMOVES the indicator the browser supplies for
+ * free, and substitutes a ring. Delete the ring utilities and nothing observable
+ * to any other test in this file changes — focus still moves, `aria-checked`
+ * still tracks, the echo still updates — while a keyboard user is left with no
+ * indication at all of which of the five stars they are on. That is the
+ * regression these tests exist to catch.
+ *
+ * WHY THESE ASSERT ON CLASS NAMES, WHEN NOTHING ELSE IN THIS FILE DOES
+ * -----------------------------------------------------------------------------
+ * Reluctantly, and because the alternative does not exist here. Proving an
+ * indicator is visible needs computed style, which needs the stylesheet — and
+ * the styles are Tailwind utilities compiled by PostCSS at build time, so under
+ * jsdom every element's computed style is empty whatever classes it carries. A
+ * `getComputedStyle` assertion would therefore pass identically against a
+ * component with no focus styling whatsoever: worse than no test, because it
+ * would read as coverage.
+ *
+ * So the contract is asserted at the level the source can actually be held to,
+ * and it is written as a GUARANTEE rather than as a literal — "the native
+ * outline is not suppressed without a sized, offset replacement" — so a
+ * legitimate refactor to `focus-visible:`, or to a real outline instead of a
+ * ring, keeps passing while a deletion fails. The utility names are matched by
+ * pattern for the same reason: `focus:ring-4` or `focus-visible:outline-2` are
+ * as acceptable as today's `focus:ring-2`.
+ */
+describe('StarRatingInput visible focus indicator', () => {
+  it('gives every option a focus-state indicator', () => {
+    render(<StarRatingInput value={null} onChange={ignoreScore} />);
+
+    options().forEach((option) => {
+      expect(focusIndicatorClasses(option).length).toBeGreaterThan(0);
+    });
+  });
+
+  it('never suppresses the native outline without replacing it', () => {
+    render(<StarRatingInput value={MID_SCORE} onChange={ignoreScore} />);
+
+    options().forEach((option) => {
+      const classes = classListOf(option);
+
+      if (!classes.some((name) => OUTLINE_SUPPRESSOR.test(name))) {
+        // Nothing was taken away, so nothing has to be given back: the
+        // browser's own indicator is still in place and is sufficient.
+        return;
+      }
+
+      // A width, so the replacement is actually drawn. `focus:ring-blue-600`
+      // on its own paints nothing.
+      expect(
+        classes.filter((name) => SIZED_FOCUS_INDICATOR.test(name)),
+      ).not.toHaveLength(0);
+
+      // An offset, so the ring sits clear of the glyph it surrounds rather
+      // than on top of it, where it is easily mistaken for part of the star.
+      expect(
+        classes.filter((name) => FOCUS_INDICATOR_OFFSET.test(name)),
+      ).not.toHaveLength(0);
+    });
+  });
+
+  it('carries the indicator on the option that actually receives focus', async () => {
+    const user = renderHarness({ initial: MID_SCORE });
+
+    await user.tab();
+
+    // Ties the two halves together. The assertions above could be satisfied by
+    // an indicator declared on elements that never take focus; this one starts
+    // from `document.activeElement` — reached by a real Tab press — and requires
+    // the indicator to be on THAT element.
+    const focused = document.activeElement as HTMLElement;
+
+    expect(focused).toBe(optionFor(MID_SCORE));
+    expect(focusIndicatorClasses(focused).length).toBeGreaterThan(0);
+  });
+
+  it('keeps the indicator on each option as focus moves across the group', async () => {
+    const user = renderHarness({ initial: RATING_MIN });
+    await user.tab();
+
+    for (let step = 1; step < OPTION_COUNT; step += 1) {
+      await user.keyboard('{ArrowRight}');
+
+      const focused = document.activeElement as HTMLElement;
+
+      expect(focused).toBe(optionFor(RATING_MIN + step));
+      expect(focusIndicatorClasses(focused).length).toBeGreaterThan(0);
+    }
+  });
+});
+
+/*
  * ARIA Authoring-Practices radio-group keyboard semantics.
  *
  * `MID_SCORE` is an interior score by construction, so `MID_SCORE + 1` and
@@ -393,11 +624,16 @@ describe('StarRatingInput roving tabindex', () => {
  * `onChange` either through the component's own key handling or through native
  * button activation, and a test that pinned one route would fail on a refactor
  * that legitimately chose the other while the user experienced no change at all.
- * What genuinely must not regress is the arithmetic of it: if the component
- * handles Space and forgets to suppress the click the platform would otherwise
- * synthesise, `onChange` fires twice for one keypress and writes the same score
- * into the reputation aggregate twice. That failure is pinned — by the exact,
- * ordered call log in the `onChange` suite below, not here.
+ *
+ * What genuinely must not regress is that one keypress reports one choice. If the
+ * component handles Space and forgets to suppress the click the platform would
+ * otherwise synthesise, `onChange` fires TWICE for a single press. Nothing is
+ * persisted by that — this control is a leaf that owns no state, issues no
+ * request and touches neither the store nor any service, so the only thing a
+ * duplicate call can corrupt is the parent's controlled value: two updates for
+ * one press, a doubled entry in whatever history the parent keeps, and any
+ * parent-side effect keyed on a change running twice. That failure is pinned by
+ * the exact, ordered call log in the `onChange` suite below, not here.
  */
 describe('StarRatingInput keyboard adjustment', () => {
   it('advances one score on ArrowRight', async () => {
@@ -554,6 +790,94 @@ describe('StarRatingInput textual score echo', () => {
 });
 
 /*
+ * An unrepresentable controlled value.
+ *
+ * `value` is typed `number | null`, so a parent can pass a number this scale
+ * cannot represent: a stale score from a widened scale, an uninitialised `0`, a
+ * fraction taken from an average, or a parsed query parameter. The component is
+ * controlled and cannot correct its own prop, so the only question is what it
+ * RENDERS - and every channel has to give the same answer.
+ *
+ * They used to disagree. The roving tab stop was guarded and `aria-checked`
+ * reported the raw value, but the stars filled on `score <= value` and the echo
+ * interpolated the raw value - so `value={RATING_MAX + 5}` lit every star and
+ * announced "10 out of 5" while telling assistive technology that nothing was
+ * checked. A visual claim of a maximum score that a screen reader denies is worse
+ * than either answer alone, and the number shown was not on the scale at all.
+ *
+ * The whole block asserts one rule: an unrepresentable value renders as the
+ * UNSELECTED state, in every channel at once, and is never clamped into a score
+ * the user did not choose.
+ */
+describe('StarRatingInput unrepresentable controlled value', () => {
+  const unrepresentable = [
+    ['above the scale', RATING_MAX + 5],
+    ['below the scale', RATING_MIN - 1],
+    ['zero', 0],
+    ['negative', -3],
+    ['fractional', RATING_MIN + 0.5],
+    ['not a number', Number.NaN],
+  ] as const;
+
+  unrepresentable.forEach(([label, value]) => {
+    it(`reports nothing as checked for a value ${label}`, () => {
+      render(<StarRatingInput value={value} onChange={ignoreScore} />);
+
+      expectCheckedScore(null);
+    });
+
+    it(`echoes the empty state for a value ${label}`, () => {
+      render(<StarRatingInput value={value} onChange={ignoreScore} />);
+
+      expect(screen.getByText(NO_SCORE_TEXT)).toBeInTheDocument();
+      // The raw value must not appear anywhere in the rendered text - not as
+      // "10 out of 5", and not on its own either.
+      expect(
+        screen.queryByText(new RegExp(`${String(value).replace('.', '\\.')}`)),
+      ).not.toBeInTheDocument();
+    });
+
+    it(`fills no star for a value ${label}`, () => {
+      const { container } = render(
+        <StarRatingInput value={value} onChange={ignoreScore} />,
+      );
+
+      // Read from the DOM rather than from a class name: the filled and empty
+      // glyphs are the visual channel, and a filled star beside "No score
+      // selected" is the contradiction this asserts against.
+      const text = container.textContent ?? '';
+
+      expect(text).not.toContain(FILLED_STAR);
+      expect(
+        (text.match(new RegExp(EMPTY_STAR, 'g')) ?? []).length,
+      ).toBe(OPTION_COUNT);
+    });
+
+    it(`keeps exactly one tab stop for a value ${label}`, () => {
+      render(<StarRatingInput value={value} onChange={ignoreScore} />);
+
+      // WCAG 2.1.1: whatever the prop says, the control stays reachable. The
+      // first option carries the tab stop when nothing is selected.
+      expectSingleTabStop(RATING_MIN);
+    });
+  });
+
+  it('recovers to a real selection once the parent supplies one', async () => {
+    // The unrepresentable value is not sticky: it renders as unselected and the
+    // very next legitimate choice behaves exactly as it would have from `null`.
+    const user = renderHarness({ initial: RATING_MAX + 5 });
+
+    expectCheckedScore(null);
+    expect(screen.getByText(NO_SCORE_TEXT)).toBeInTheDocument();
+
+    await user.click(optionFor(MID_SCORE));
+
+    expectCheckedScore(MID_SCORE);
+    expect(screen.getByText(echoText(MID_SCORE))).toBeInTheDocument();
+  });
+});
+
+/*
  * The reported value.
  *
  * `onChange` is observed through a plain closure that appends to a typed array
@@ -561,8 +885,9 @@ describe('StarRatingInput textual score echo', () => {
  * all, and reaching for a spy just to keep a call log would pull an otherwise
  * unused mocking facility into a mock-free file. An array also asserts ORDER and
  * COUNT, which is what the "exactly once" guarantee actually needs — a
- * double-fired handler would write two identical scores into the reputation
- * aggregate.
+ * double-fired handler would hand the parent two updates for a single user
+ * action, so the parent's controlled value, and any effect it keys on a change,
+ * would run twice for one choice.
  */
 describe('StarRatingInput onChange contract', () => {
   it('reports the chosen score as a number, once per pointer choice', async () => {
@@ -624,4 +949,3 @@ describe('StarRatingInput onChange contract', () => {
     expectCheckedScore(null);
   });
 });
-

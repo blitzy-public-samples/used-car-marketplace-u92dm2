@@ -1,6 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 from app.schema.message import Message
+# Required because both handlers annotate ``current_user: User``, and a
+# parameter annotation is evaluated at function-definition time: without
+# the name bound here the module raises NameError while being imported,
+# which stops app/main.py - and therefore every API surface - from
+# loading at all, so this router would contribute no route.
+from app.schema.user import User
+# ``send_message`` below stamps its document with
+# ``firestore.SERVER_TIMESTAMP`` and the name was never bound, so the
+# handler raised NameError on every call. That was invisible while this
+# router could not be imported at all; now that it is registered for
+# real, the endpoint is reachable and the missing import would be a
+# guaranteed 500 on the first message sent.
+from google.cloud import firestore
 from app.db.firestore import db
 from app.api.auth import get_current_user
 

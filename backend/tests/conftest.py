@@ -7,22 +7,50 @@ to be dealt with before any test module is loaded.
 1. ``app/core/config.py`` evaluates ``settings = Settings()`` at module
    scope, and eight of its fields are required with no default. Import
    it without them and pydantic raises a ``ValidationError`` naming all
-   eight. So the values are put into ``os.environ`` here, at module
-   scope, before the first ``app.*`` import. pytest imports a directory's
-   ``conftest.py`` before it collects anything in that directory, which
-   is what makes this the right place - and why the seeding is NOT in a
-   fixture, which would run far too late.
+   eight. So deterministic test values are IMPOSED on ``os.environ``
+   here, at module scope, before the first ``app.*`` import - assigned
+   rather than defaulted, so the suite means the same thing on a machine
+   that has sourced ``backend/.env`` as on one that has not, and restored
+   when the session ends so the run leaves no trace on its host. pytest
+   imports a directory's ``conftest.py`` before it collects anything in
+   that directory, which is what makes this the right place - and why the
+   seeding is NOT in a fixture, which would run far too late.
 
-2. ``app/db/firestore.py`` builds ``db = Client(project=...)`` at module
-   scope, and ``google.cloud.client.Client.__init__`` resolves
-   credentials EAGERLY by calling ``google.auth.default()``. Where
-   application default credentials happen to be present that call
-   SUCCEEDS, so an unguarded test run does not fail safely - it builds a
-   real Firestore client bound to a real Google Cloud project. The
-   neutralisation below is therefore structural rather than hopeful: the
-   ``Client`` symbol is replaced on its own source module BEFORE
-   ``app.db.firestore`` is imported, so no client is ever constructed and
-   ``google.auth`` is never reached, whether or not credentials resolve.
+2. FOUR modules build a Google Cloud client at module scope inside
+   ``app/main.py``'s import graph, and every one of those constructors
+   resolves credentials EAGERLY by calling ``google.auth.default()``.
+   Where application default credentials happen to be present that call
+   SUCCEEDS, so an unguarded test run does not fail safely - it builds
+   real clients bound to a real Google Cloud project:
+
+   * ``app/db/firestore.py`` builds ``db = Client(project=...)``;
+   * ``app/services/ai_vision.py`` builds ``ImageAnnotatorClient()``,
+     reached from ``app.main`` through its ``app.api.listings`` import;
+   * ``app/services/document_processing.py`` builds
+     ``DocumentProcessorServiceClient()``, reached the same way;
+   * ``app/db/cloud_storage.py`` builds ``Client(project=...)`` and
+     immediately calls ``.bucket(...)`` on it.
+
+   The neutralisation below is therefore structural rather than hopeful,
+   and it is applied in THREE independent layers. Each constructor symbol
+   is replaced on its own source module BEFORE the ``app.*`` module that
+   consumes it is imported, so no real client is ever built; the ambient
+   credentials are separately revoked for the process
+   (:func:`neutralise_google_credentials`), so a constructor reached by
+   some path that bypassed the replaced symbol cannot resolve a
+   credential either; and outbound TCP is BLOCKED for the whole run
+   (:func:`install_network_guard`). No layer relies on another and none
+   relies on the environment: the outcome is identical whether or not
+   application default credentials would have resolved.
+
+   Firestore is replaced by a faithful in-memory double because the suite
+   depends on its behaviour; the other three are replaced by objects that
+   record their construction and raise on use, because no test here has
+   any business calling Vision, Document AI or Cloud Storage. The client
+   patches stop what this application is known to construct; the socket
+   guard stops what nobody predicted - a transitive dependency phoning
+   home, a metadata-server probe - and turns it into a named failure
+   instead of a hang, a flake, or a live call.
 
 THE IMPORT-ORDER HAZARD
 -----------------------------------------------------------------------
@@ -60,6 +88,16 @@ unproven claim:
   field matches no filter, a document missing an ``order_by`` field is
   excluded from the result, and ``__name__`` breaks ties in the
   direction of the last explicit sort.
+* A QUERY IS SERVED ONLY IF AN INDEX SERVES IT. The composite index
+  declarations in ``infrastructure/firestore.indexes.json`` are parsed at
+  import - loudly, so a missing or malformed file fails the run rather
+  than the deployment - and every query is matched against them plus
+  Firestore's automatic single-field indexes. An undeclared composite
+  shape raises the real ``FailedPrecondition``, exactly as production
+  would. Without this the suite would be more permissive than the
+  datastore, and index drift would first be noticed by users. See
+  :func:`require_declared_index`, including the pre-existing
+  ``listings`` equality-plus-price-range gap it deliberately exposes.
 * Anything the double does not implement raises loudly. Unsupported
   operators, filter types and field transforms are rejected with an
   explanatory error instead of being ignored.
@@ -74,8 +112,22 @@ PUBLIC API
 -----------------------------------------------------------------------
 Bootstrap
     ``REQUIRED_SETTINGS``, :func:`seed_required_settings`,
-    :func:`ensure_backend_on_sys_path`, :func:`install_firestore_double`,
-    :func:`rebind_firestore_holders`.
+    :func:`restore_seeded_settings`, :func:`ensure_backend_on_sys_path`,
+    :func:`neutralise_google_credentials`,
+    :func:`install_network_guard`, :func:`install_google_client_guards`,
+    ``BlockedGoogleClient``, ``IMPORT_TIME_GOOGLE_CLIENTS``,
+    :func:`install_external_client_doubles`, ``InertExternalClient``,
+    ``EXTERNAL_CLIENT_TARGETS``,
+    :func:`install_firestore_double`, :func:`rebind_firestore_holders`,
+    and the session-scoped ``restore_process_state`` fixture.
+
+Index declarations
+    ``DECLARED_COMPOSITE_INDEXES`` (parsed at import),
+    :func:`load_declared_indexes`, :func:`require_declared_index` and
+    :func:`describe_query_shape`. A test that wants to assert the
+    contract directly - "this shape is declared", "that one is not" -
+    calls :func:`require_declared_index`, optionally against its own
+    declarations rather than the repository's.
 
 The double
     ``fake_db`` (the process-wide singleton), :func:`get_fake_db`, and
@@ -85,9 +137,15 @@ The double
     ``fake_db.document_body(collection, doc_id)``,
     ``fake_db.document_ids(collection)``,
     ``fake_db.exists(collection, doc_id)`` and
-    ``fake_db.count(collection)``. State is cleared between tests by the
-    autouse :func:`reset_firestore_double` fixture, which also restores
-    the rating tunables on ``settings``.
+    ``fake_db.count(collection)``.
+
+Per-test isolation
+    The autouse :func:`reset_firestore_double` fixture resets every
+    piece of mutable state this module shares, before and after each
+    test: the stored documents and ``fake_db.project`` through
+    ``fake_db.reset()``, the server-timestamp cursor through
+    :func:`reset_server_timestamps`, and the rating tunables on
+    ``settings``.
 
 Builders (module-level callables, because ``unittest.TestCase`` methods
 cannot receive pytest fixtures as arguments)
@@ -106,14 +164,21 @@ Seeding and authentication
 Deliberately NOT done here: no ``__init__.py``, ``pytest.ini``,
 ``setup.cfg``, ``tox.ini``, ``pyproject.toml`` or ``.flake8`` is
 created, because the validation criteria assume bare ``pytest`` and
-stock ``flake8``; and ``app.tasks.background_jobs`` is never imported,
-because it reads a ``CELERY_BROKER_URL`` setting that is deliberately
-not declared and would break collection.
+stock ``flake8``; and this module never imports
+``app.tasks.background_jobs``, because nothing in the rating feature's
+correctness depends on the worker tier - the read paths publish
+opportunistically instead - so a test module that wants the task can
+import it for itself. It is importable: ``CELERY_BROKER_URL`` is now a
+declared optional setting with a documented in-memory fallback.
 """
 
 import copy
 import functools
+import importlib
+import json
+
 import os
+import socket
 import sys
 import threading
 import uuid
@@ -121,7 +186,11 @@ from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from google.api_core.exceptions import AlreadyExists, NotFound
+from google.api_core.exceptions import (
+    AlreadyExists,
+    FailedPrecondition,
+    NotFound,
+)
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_transaction import MAX_ATTEMPTS
 from jose import jwt
@@ -146,10 +215,33 @@ PENDING_STATUS = 'pending'
 ASCENDING = firestore.Query.ASCENDING
 DESCENDING = firestore.Query.DESCENDING
 
-# Firestore's name for a document's own ID inside a query. Ordering by
-# it needs no composite index, which is why app/services/rating.py uses
-# it as the cursor ordering for its sweeps.
+# Firestore's name for a document's own ID inside a query. Firestore
+# appends it to every ordering as the final tiebreaker, so naming it
+# explicitly adds no index requirement of its own - which is why the
+# index check below discounts it before deciding what a query needs.
 DOCUMENT_ID_FIELD = '__name__'
+
+# Where the composite index declarations live, relative to the
+# repository root. This suite is their only runtime reader: nothing under
+# app/ opens the file, and the deploy step that would install it does not
+# currently reach that command - so parsing it here, and refusing any
+# query shape it does not declare, is what keeps the declarations and the
+# code from drifting apart unnoticed.
+INDEX_DECLARATION_RELATIVE_PATH = os.path.join(
+    'infrastructure', 'firestore.indexes.json'
+)
+
+# Operators Firestore satisfies from the EQUALITY prefix of an index.
+# ``in`` belongs here because it is evaluated as a disjunction of
+# equality constraints and uses the same index entries as ``==``, and
+# the array operators because an array index entry is one per element,
+# which is again an equality match.
+EQUALITY_OPERATORS = (
+    '==',
+    'in',
+    'array_contains',
+    'array_contains_any',
+)
 
 # Every setting that app/core/config.py declares WITHOUT a default, and
 # nothing else. The six defaulted fields - SENTRY_DSN, ALGORITHM, the
@@ -182,9 +274,68 @@ REQUIRED_SETTINGS = {
 # no I/O at construction, so even a client built by some path that
 # bypassed the patched symbol could not reach a real project. The host
 # points at a port nothing serves, so such a client fails immediately
-# rather than reading or writing anything. ``setdefault`` leaves a real
-# emulator configuration in place if the environment already has one.
+# rather than reading or writing anything. ASSIGNED unconditionally, not
+# defaulted: a developer running a live emulator on the usual port must
+# not have the suite silently redirected onto it, where it would read and
+# write their data and pass or fail according to what was already there.
 EMULATOR_HOST_GUARD = 'localhost:0'
+
+# Where ``GOOGLE_APPLICATION_CREDENTIALS`` is pointed for the duration
+# of the run. The file deliberately does not exist:
+# ``google.auth.default()`` consults that variable FIRST and raises
+# ``DefaultCredentialsError`` immediately when the path is missing,
+# without falling through to the metadata server, so revoking ambient
+# credentials costs one assignment and no network traffic.
+#
+# It is assigned rather than defaulted, because the whole point is to
+# override a real credential the environment supplies - CI runners and
+# development containers both commonly set this variable, and a
+# ``setdefault`` would leave exactly the dangerous case in place.
+NEUTRALISED_CREDENTIALS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'no-google-credentials-in-tests.json',
+)
+
+# Metadata-server guards, covering the one path that would still resolve
+# a credential if some future code cleared the variable above: on a GCE
+# or GKE host, ``google.auth`` asks the instance metadata server for a
+# token. Both names it honours are pointed at a port nothing serves and
+# the probe timeout is dropped to zero, so the lookup fails at once
+# instead of minting a real token or stalling the suite.
+METADATA_HOST_GUARD = 'localhost:0'
+METADATA_IP_GUARD = '127.0.0.1'
+METADATA_TIMEOUT_GUARD = '0'
+
+# Every Google Cloud client this repository constructs AT IMPORT time,
+# as (module holding the constructor, constructor attribute, the app
+# module that builds one). Firestore is absent on purpose: it has its
+# own richer double and its own installer,
+# :func:`install_firestore_double`.
+#
+# The third element is what makes the installation verifiable rather
+# than hopeful. Each of these constructors is bound by a
+# ``from google.cloud.X import Y`` at the top of its app module, which
+# captures the OBJECT, so replacing the symbol after that module has
+# been imported would not reach it -
+# :func:`install_external_client_doubles` therefore checks and reports
+# instead of patching into the void.
+EXTERNAL_CLIENT_TARGETS = (
+    (
+        'google.cloud.vision',
+        'ImageAnnotatorClient',
+        'app.services.ai_vision',
+    ),
+    (
+        'google.cloud.documentai',
+        'DocumentProcessorServiceClient',
+        'app.services.document_processing',
+    ),
+    (
+        'google.cloud.storage',
+        'Client',
+        'app.db.cloud_storage',
+    ),
+)
 
 # Settings that a test is expected to drive directly - the window in
 # particular, which app/services/rating.py re-reads on every call - and
@@ -293,6 +444,33 @@ def _server_timestamp():
             moment = _LAST_TIMESTAMP + timedelta(microseconds=1)
         _LAST_TIMESTAMP = moment
         return moment
+
+
+def reset_server_timestamps():
+    """Forget the last server timestamp handed out.
+
+    ``_LAST_TIMESTAMP`` is process-wide state, so without this it
+    outlives the test that produced it and carries that test's clock into
+    every test that follows. The consequence is not theoretical: a test
+    that moves time forward - by patching the clock to prove that an
+    unreciprocated rating publishes once ``RATING_WINDOW_DAYS`` has
+    elapsed - leaves a reading in the FUTURE, and
+    :func:`_server_timestamp` would then keep nudging one microsecond
+    past it for the rest of the session. Later tests would receive
+    future-dated ``created_at`` values, making publication-window
+    behaviour depend on execution order.
+
+    Called before and after each test by
+    :func:`reset_firestore_double`, alongside clearing the store, so the
+    two halves of "a clean starting point" are reset together.
+
+    Held under ``_TIMESTAMP_LOCK`` because a lingering thread from a
+    concurrency test could otherwise be inside
+    :func:`_server_timestamp` at the same moment.
+    """
+    global _LAST_TIMESTAMP
+    with _TIMESTAMP_LOCK:
+        _LAST_TIMESTAMP = None
 
 
 def _resolve_value(value, moment):
@@ -546,6 +724,317 @@ def generate_document_id():
         A new document ID.
     """
     return uuid.uuid4().hex[:20]
+
+
+def load_declared_indexes(path=None):
+    """Parse the composite index declarations, or fail loudly.
+
+    Loud failure is the point. A declaration file that has gone missing,
+    stopped parsing or lost its shape is a DEPLOYMENT defect: the indexes
+    would not be created, and the queries that need them would fail in
+    production with ``FailedPrecondition`` on a public read path. Nothing
+    under ``app/`` opens this file, so without this parse the only place
+    that defect could surface is the deployment itself. Raising here
+    fails every test in the suite instead, which is the loudest signal
+    available at the time it can still be cheap.
+
+    Args:
+        path: Absolute path to the declaration file. Defaults to
+            ``infrastructure/firestore.indexes.json`` beside the
+            ``backend`` directory this file lives in.
+
+    Returns:
+        ``{collection_id: [((field_path, direction), ...), ...]}`` - one
+        tuple per declared index, fields in their declared order.
+
+    Raises:
+        RuntimeError: The file is missing, is not JSON, or does not have
+            the structure ``gcloud``/Firebase requires. The message names
+            the file and what was wrong with it.
+    """
+    location = path
+    if location is None:
+        location = os.path.join(
+            os.path.dirname(ensure_backend_on_sys_path()),
+            INDEX_DECLARATION_RELATIVE_PATH,
+        )
+    try:
+        with open(location) as handle:
+            document = json.load(handle)
+    except IOError as error:
+        raise RuntimeError(
+            'The Firestore index declarations at {0} could not be read '
+            '({1}). Every composite index the application depends on is '
+            'declared there, so a missing file means those indexes are '
+            'never created.'.format(location, error)
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            'The Firestore index declarations at {0} are not valid JSON '
+            '({1}). gcloud would refuse the file, so no index in it '
+            'would be created.'.format(location, error)
+        )
+    if not isinstance(document, dict) or 'indexes' not in document:
+        raise RuntimeError(
+            'The Firestore index declarations at {0} must be a JSON '
+            'object with an "indexes" array.'.format(location)
+        )
+    if not isinstance(document['indexes'], list):
+        raise RuntimeError(
+            '"indexes" in {0} must be an array.'.format(location)
+        )
+    declared = {}
+    for position, index in enumerate(document['indexes']):
+        collection_id, fields = _declared_index(location, position, index)
+        declared.setdefault(collection_id, []).append(fields)
+    return declared
+
+
+def _declared_index(location, position, index):
+    """Validate one declared index and normalise its fields.
+
+    Args:
+        location: Path of the declaration file, for error messages.
+        position: Index of this entry in the ``indexes`` array.
+        index: The entry itself.
+
+    Returns:
+        ``(collection_id, ((field_path, direction), ...))``.
+
+    Raises:
+        RuntimeError: The entry is not shaped the way the Firestore index
+            document requires.
+    """
+    label = '{0} index #{1}'.format(location, position)
+    if not isinstance(index, dict):
+        raise RuntimeError('{0} must be an object.'.format(label))
+    collection_id = index.get('collectionGroup')
+    if not isinstance(collection_id, str) or not collection_id:
+        raise RuntimeError(
+            '{0} must name a "collectionGroup".'.format(label)
+        )
+    fields = index.get('fields')
+    if not isinstance(fields, list) or not fields:
+        raise RuntimeError(
+            '{0} must declare a non-empty "fields" array.'.format(label)
+        )
+    normalised = []
+    for field in fields:
+        if not isinstance(field, dict):
+            raise RuntimeError(
+                '{0} has a field entry that is not an object.'.format(
+                    label
+                )
+            )
+        field_path = field.get('fieldPath')
+        if not isinstance(field_path, str) or not field_path:
+            raise RuntimeError(
+                '{0} has a field entry with no "fieldPath".'.format(
+                    label
+                )
+            )
+        order = field.get('order')
+        if order is None and field.get('arrayConfig'):
+            # An array index entry has one entry per element and can only
+            # serve a containment constraint, so it has no direction of
+            # its own. Recorded as ascending, which is how it sorts.
+            order = ASCENDING
+        if order not in (ASCENDING, DESCENDING):
+            raise RuntimeError(
+                '{0} field {1!r} must declare "order" as {2!r} or '
+                '{3!r} (or an "arrayConfig"), got {4!r}.'.format(
+                    label, field_path, ASCENDING, DESCENDING, order
+                )
+            )
+        normalised.append((field_path, order))
+    return collection_id, tuple(normalised)
+
+
+def _query_shape(filters, orders):
+    """Reduce a query to the parts that decide which index serves it.
+
+    Args:
+        filters: ``(field_path, op_string, value)`` triples.
+        orders: ``(field_path, direction)`` pairs.
+
+    Returns:
+        ``(equality, inequality, ordered)`` - the equality-constrained
+        field paths in first-seen order, the range-constrained ones, and
+        the explicit ordering with ``__name__`` discounted because
+        Firestore appends it to every ordering anyway.
+    """
+    equality = []
+    inequality = []
+    for field_path, op_string, _ in filters:
+        target = (
+            equality if op_string in EQUALITY_OPERATORS else inequality
+        )
+        if field_path not in target:
+            target.append(field_path)
+    ordered = [
+        (field_path, direction)
+        for field_path, direction in orders
+        if field_path != DOCUMENT_ID_FIELD
+    ]
+    return equality, inequality, ordered
+
+
+def _required_index_tail(inequality, ordered):
+    """The fields an index must carry after its equality prefix.
+
+    Firestore starts its scan at the position the equality filters pin
+    down and then walks the index, so the fields after that prefix have
+    to be the ordering the query asks for. A range-filtered field that is
+    not part of the ordering still has to appear, because the scan uses
+    the remaining index fields to satisfy the rest of the filters - but
+    its direction is then irrelevant, which is what ``None`` records.
+
+    Args:
+        inequality: Range-constrained field paths.
+        ordered: The explicit ordering, ``__name__`` already discounted.
+
+    Returns:
+        ``[(field_path, direction_or_None), ...]``.
+    """
+    tail = list(ordered)
+    named = set(field_path for field_path, _ in tail)
+    for field_path in inequality:
+        if field_path not in named:
+            tail.append((field_path, None))
+            named.add(field_path)
+    return tail
+
+
+def _index_serves(index_fields, equality, tail, reversed_scan):
+    """Report whether one declared index can serve one query shape.
+
+    Args:
+        index_fields: The index's fields, in declared order.
+        equality: Equality-constrained field paths.
+        tail: What :func:`_required_index_tail` requires after them.
+        reversed_scan: Match every constrained direction inverted, which
+            is how Firestore serves an ordering by walking an index
+            backwards. Only a WHOLLY inverted ordering can be served that
+            way, which is why this is one flag rather than per-field.
+
+    Returns:
+        ``True`` when the index serves the query.
+    """
+    prefix = index_fields[:len(equality)]
+    if sorted(field_path for field_path, _ in prefix) != sorted(equality):
+        return False
+    rest = index_fields[len(equality):]
+    if len(rest) < len(tail):
+        return False
+    for wanted, available in zip(tail, rest):
+        if wanted[0] != available[0]:
+            return False
+        if wanted[1] is None:
+            continue
+        expected = wanted[1]
+        if reversed_scan:
+            expected = (
+                DESCENDING if expected == ASCENDING else ASCENDING
+            )
+        if available[1] != expected:
+            return False
+    return True
+
+
+def describe_query_shape(collection_id, equality, tail):
+    """Render a query's index requirement the way an index reads.
+
+    Args:
+        collection_id: Collection the query runs against.
+        equality: Equality-constrained field paths.
+        tail: What :func:`_required_index_tail` requires after them.
+
+    Returns:
+        A string such as ``ratings (a ASCENDING, b DESCENDING)``.
+    """
+    parts = ['{0} {1}'.format(name, ASCENDING) for name in equality]
+    parts.extend(
+        '{0} {1}'.format(name, direction or 'ASCENDING or DESCENDING')
+        for name, direction in tail
+    )
+    return '{0} ({1})'.format(collection_id, ', '.join(parts))
+
+
+def require_declared_index(collection_id, filters, orders, declared=None):
+    """Refuse a query that production would refuse.
+
+    Firestore serves a query only from an index, and it creates two
+    automatic single-field indexes per field. The consequence a test
+    double must reproduce is that SOME shapes need a composite index
+    declared in advance, and a query needing one that does not exist
+    fails outright with ``FailedPrecondition`` rather than running
+    slowly. Without this check the suite is strictly more permissive than
+    production, and the failure it would hide surfaces first on a live
+    deployment.
+
+    The three rules, in the order they are applied:
+
+    * An EQUALITY-ONLY query with no explicit ordering needs nothing
+      declared. Firestore merges the single-field indexes to serve larger
+      equality queries, which is why ``listings``' filter-by-make-and-
+      model search and ``auth``'s lookup by email are served as they are.
+    * A query touching exactly ONE field is served by that field's
+      automatic index, whatever it does with it - a range on it, an
+      ordering by it, or both.
+    * Anything else - a range or an ordering combined with a constraint
+      on a DIFFERENT field - needs a declared composite index whose
+      leading fields are exactly the equality-constrained ones and whose
+      remaining fields continue with the ordering, forwards or wholly
+      reversed. Trailing extra index fields are allowed, because a longer
+      index still serves a query that only needs its prefix.
+
+    KNOWN COLLATERAL, RECORDED DELIBERATELY
+    ---------------------------------------------------------------
+    ``app/api/listings.py`` combines equality filters on ``make``,
+    ``model`` or ``year`` with a range on ``price``, and no index for
+    that shape is declared for the ``listings`` collection. Such a query
+    genuinely fails in production, so this check reports it rather than
+    hiding it. That is a PRE-EXISTING gap in a module the ratings feature
+    does not own: the equality-only and price-only searches still work,
+    and closing the gap means declaring the index for whichever
+    combinations that feature intends to support.
+
+    Args:
+        collection_id: Collection the query runs against.
+        filters: ``(field_path, op_string, value)`` triples.
+        orders: ``(field_path, direction)`` pairs.
+        declared: Index declarations to check against. Defaults to the
+            ones parsed from the repository.
+
+    Raises:
+        FailedPrecondition: No automatic or declared index serves the
+            shape. The message names the shape and where to declare it.
+    """
+    equality, inequality, ordered = _query_shape(filters, orders)
+    if not inequality and not ordered:
+        return
+    involved = set(equality) | set(inequality)
+    involved.update(field_path for field_path, _ in ordered)
+    if len(involved) <= 1:
+        return
+    tail = _required_index_tail(inequality, ordered)
+    available = (
+        DECLARED_COMPOSITE_INDEXES if declared is None else declared
+    )
+    for index_fields in available.get(collection_id, ()):
+        if _index_serves(index_fields, equality, tail, False):
+            return
+        if _index_serves(index_fields, equality, tail, True):
+            return
+    raise FailedPrecondition(
+        'The query requires a composite index that '
+        '{0} does not declare: {1}. Firestore rejects this with '
+        'FailedPrecondition in production, so declare the index there '
+        'or reshape the query.'.format(
+            INDEX_DECLARATION_RELATIVE_PATH,
+            describe_query_shape(collection_id, equality, tail),
+        )
+    )
 
 
 class FakeDocumentSnapshot:
@@ -1038,8 +1527,9 @@ class FakeQuery:
         Firestore excludes a document that lacks an ``order_by`` field
         from the result set entirely, and that is reproduced here rather
         than smoothed over: it is precisely why
-        ``app/services/rating.py`` orders its sweeps by ``__name__``
-        instead of by a data field.
+        ``app/services/rating.py`` orders its per-transaction read by
+        ``rater_id``, a field every rating carries, rather than by a
+        timestamp a record might still be awaiting.
 
         The document ID is appended as a final component because
         Firestore always breaks ties on ``__name__``, which is what makes
@@ -1156,9 +1646,23 @@ class FakeQuery:
     def _evaluate(self):
         """Run the query against current state.
 
+        The index requirement is checked FIRST, and here rather than in
+        ``where``/``order_by``, because that is where Firestore decides
+        it: a query is a value until something asks for its results, and
+        only the finished shape can be matched against an index.
+
         Returns:
             A list of :class:`FakeDocumentSnapshot` in query order.
+
+        Raises:
+            FailedPrecondition: No automatic or declared index serves
+                this query. See :func:`require_declared_index`.
         """
+        require_declared_index(
+            self._collection_id,
+            self._filters,
+            self._orders,
+        )
         rows = []
         for document_id, body in self._client.items(self._collection_id):
             if not self._passes(body, document_id):
@@ -1776,9 +2280,19 @@ class FakeFirestoreClient:
         return reference.id
 
     def reset(self):
-        """Discard all state, giving the next test an empty datastore."""
+        """Discard all state, giving the next test a pristine client.
+
+        Both kinds of state go, because both are mutable and both are
+        shared. The documents are the obvious one. ``project`` is the
+        easily missed one: :func:`firestore_client_factory` records
+        whatever project a caller constructs with, so a test that builds
+        a client for some other project would otherwise leave that label
+        on the shared double and any later assertion about what the
+        application requested would read the previous test's value.
+        """
         with self._lock:
             self._data = {}
+            self.project = REQUIRED_SETTINGS['GOOGLE_CLOUD_PROJECT']
 
     def raw(self):
         """Return a deep copy of the entire store.
@@ -1959,29 +2473,424 @@ def ensure_backend_on_sys_path():
 
 
 def seed_required_settings():
-    """Put the required settings into ``os.environ``.
+    """Impose the deterministic test settings on ``os.environ``.
 
     Must run before the first ``app.*`` import: ``app/core/config.py``
     evaluates ``Settings()`` at module scope and eight of its fields have
     no default.
 
-    ``setdefault`` rather than assignment, so a real environment - a
-    developer who sourced ``backend/.env``, or CI - keeps its own values
-    and these apply only where nothing is configured.
+    Every value is ASSIGNED, not defaulted. An earlier version used
+    ``setdefault`` so that a developer who had sourced ``backend/.env``
+    kept their own values, and that was the wrong trade: it made the
+    suite's behaviour a function of the ambient environment, which is the
+    definition of a non-hermetic test. Concretely, a real
+    ``ACCESS_TOKEN_EXPIRE_MINUTES`` changes what the ``access_token``
+    fixture mints; a real ``SECRET_KEY`` changes what signs it - and a
+    machine whose key was a published placeholder would now fail
+    Settings construction and take collection down with it; and a real
+    ``GOOGLE_CLOUD_PROJECT`` decides which project a client would name if
+    any neutralisation were ever bypassed. Worse, the failures are
+    environment-specific, so they reproduce on one machine and not on
+    another. Assigning makes a green run mean the same thing everywhere.
+
+    The values that are DELIBERATELY not touched are the ones a test is
+    entitled to drive: nothing here writes any ``RATING_*`` key, because
+    ``reset_firestore_double`` snapshots and restores those on the
+    ``settings`` object instead, and the fields are read from there.
+
+    The previous state of every name written is returned so
+    :func:`restore_seeded_settings` can put the process back as it was.
+    That matters because pytest is not always the whole process - it is
+    embedded in editors and in tooling - and a suite that permanently
+    rewrites its host's environment has escaped its own boundary.
 
     Returns:
-        The names of the variables this call actually set, which is empty
-        when the environment already supplied all of them.
+        A dict mapping every variable this call wrote to its previous
+        value, or to ``None`` where the variable was absent.
     """
-    seeded = []
-    for name, value in REQUIRED_SETTINGS.items():
-        if name not in os.environ:
+    previous = {}
+    seeded = dict(REQUIRED_SETTINGS)
+    # Points at a port nothing serves. Any client built by a path that
+    # somehow bypassed the neutralisation below therefore uses anonymous
+    # credentials and fails immediately, instead of resolving real
+    # credentials and reading or writing a real project. This is
+    # assigned, not defaulted: a developer with a live emulator on 8080
+    # must not have the suite silently redirected onto it.
+    seeded['FIRESTORE_EMULATOR_HOST'] = EMULATOR_HOST_GUARD
+    for name, value in seeded.items():
+        previous[name] = os.environ.get(name)
+        os.environ[name] = value
+    return previous
+
+
+def restore_seeded_settings(previous):
+    """Undo :func:`seed_required_settings`.
+
+    Args:
+        previous: The mapping it returned - variable name to prior value,
+            or to ``None`` for a variable that did not exist.
+    """
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
             os.environ[name] = value
-            seeded.append(name)
-    if 'FIRESTORE_EMULATOR_HOST' not in os.environ:
-        os.environ['FIRESTORE_EMULATOR_HOST'] = EMULATOR_HOST_GUARD
-        seeded.append('FIRESTORE_EMULATOR_HOST')
-    return seeded
+
+
+def _blocked_socket_operation(*args, **kwargs):
+    """Refuse an outbound network connection during a test run.
+
+    Installed over ``socket.socket.connect`` and ``connect_ex``. The
+    Firestore double and the client patches below mean no test needs a
+    socket at all - ``fastapi.testclient.TestClient`` speaks ASGI
+    in-process - so a connection attempt is evidence that something
+    escaped the neutralisation, and the useful response is to name it
+    loudly at the moment it happens rather than to let the run hang on a
+    timeout or, far worse, succeed against a real service.
+
+    Raises:
+        RuntimeError: Always.
+    """
+    target = args[1] if len(args) > 1 else kwargs.get('address')
+    raise RuntimeError(
+        'Network access is blocked during tests, and something tried to '
+        'connect to {0!r}. The Firestore double and the Google client '
+        'patches in tests/conftest.py are meant to remove every reason '
+        'to open a socket, so this is a real finding: identify what '
+        'built a live client and neutralise it there rather than '
+        'relaxing this guard.'.format(target)
+    )
+
+
+def install_network_guard():
+    """Block outbound TCP for the duration of the run.
+
+    Belt to the client patches' braces. Those patches stop the clients
+    this application is KNOWN to construct; this stops the ones nobody
+    predicted - a transitive dependency phoning home, a metadata-server
+    probe from ``google.auth``, a retry loop against a half-configured
+    endpoint. Any of those makes a suite slow, flaky and dependent on
+    the machine it runs on, and one of them reaching a real Google
+    project would make it dangerous.
+
+    Only ``connect``/``connect_ex`` on the socket object are replaced,
+    which is the single chokepoint every higher-level client and
+    ``socket.create_connection`` funnels through. Socket CREATION,
+    binding and listening are untouched, so nothing that merely
+    constructs a socket breaks.
+
+    Returns:
+        A callable that restores the original methods.
+    """
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+    socket.socket.connect = _blocked_socket_operation
+    socket.socket.connect_ex = _blocked_socket_operation
+
+    def restore():
+        socket.socket.connect = original_connect
+        socket.socket.connect_ex = original_connect_ex
+
+    return restore
+
+
+class BlockedGoogleClient:
+    """Stand-in for a Google Cloud client this suite never exercises.
+
+    Three clients besides Firestore are constructed AT MODULE IMPORT by
+    code in the application's import graph:
+    ``google.cloud.vision.ImageAnnotatorClient`` in
+    ``app/services/ai_vision.py``, ``DocumentProcessorServiceClient`` in
+    ``app/services/document_processing.py``, and
+    ``google.cloud.storage.Client`` in ``app/db/cloud_storage.py``. Since
+    ``app/main.py`` imports the listings router, which imports the first
+    two, ``import app.main`` constructs them - and each resolves
+    application default credentials eagerly. Where credentials happen to
+    be present that SUCCEEDS, so an unguarded run does not fail safely:
+    it builds real clients bound to a real project.
+
+    Replacing the classes is therefore structural rather than hopeful.
+    Construction is recorded and does nothing; any attempt to USE one
+    raises, because no test in this suite has any business calling a
+    Vision, Document AI or Storage method, and a test that starts to
+    should say so explicitly rather than reach a network.
+    """
+
+    #: Every construction, as ``(label, args, kwargs)``, so a test can
+    #: assert what the application asked for. Shared by every subclass on
+    #: purpose - one ordered record of everything that was built.
+    constructions = []
+
+    #: Overridden per client by :func:`_blocked_client_class`. Declared
+    #: here so that reading it can never fall through to ``__getattr__``,
+    #: which raises rather than returning a default.
+    label = 'Google Cloud'
+
+    def __init__(self, *args, **kwargs):
+        BlockedGoogleClient.constructions.append(
+            (self.label, args, kwargs)
+        )
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            'The {0} client is neutralised during tests, so {1!r} cannot '
+            'be called. Patch the specific behaviour your test needs '
+            'instead of reaching a live Google Cloud service.'.format(
+                self.label, name
+            )
+        )
+
+
+def _blocked_client_class(label):
+    """Build a :class:`BlockedGoogleClient` subclass that names itself.
+
+    Args:
+        label: Human-readable client name for error messages.
+
+    Returns:
+        A new subclass carrying ``label``.
+    """
+    return type(
+        'Blocked{0}Client'.format(label.replace(' ', '')),
+        (BlockedGoogleClient,),
+        {'label': label},
+    )
+
+
+# Every import-time Google Cloud client in the application's import
+# graph, as ``(module path, attribute, label)``. Firestore is absent on
+# purpose: it is replaced by the faithful double rather than blocked,
+# because the whole suite depends on its behaviour.
+IMPORT_TIME_GOOGLE_CLIENTS = (
+    ('google.cloud.vision', 'ImageAnnotatorClient', 'Vision'),
+    (
+        'google.cloud.documentai',
+        'DocumentProcessorServiceClient',
+        'Document AI',
+    ),
+    ('google.cloud.storage', 'Client', 'Cloud Storage'),
+)
+
+
+def install_google_client_guards():
+    """Replace every import-time Google client but Firestore.
+
+    Runs BEFORE the first ``app.*`` import, for the same reason the
+    Firestore patch does: ``from google.cloud.vision import
+    ImageAnnotatorClient`` binds the class by value, so a module that has
+    already imported it keeps the real one and no later patch can reach
+    it.
+
+    A client whose module is not installed is skipped rather than
+    reported: the guard exists to remove a capability, and a package that
+    is absent has already removed it.
+
+    Returns:
+        A callable that restores every replaced attribute.
+    """
+    restorers = []
+    for module_path, attribute, label in IMPORT_TIME_GOOGLE_CLIENTS:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        original = getattr(module, attribute, None)
+        if original is None:
+            continue
+        setattr(module, attribute, _blocked_client_class(label))
+        restorers.append((module, attribute, original))
+
+    def restore():
+        for module, attribute, original in restorers:
+            setattr(module, attribute, original)
+
+    return restore
+
+
+def neutralise_google_credentials():
+    """Revoke ambient Google credentials for this process, and verify it.
+
+    This is a SECURITY boundary for the suite, not a convenience. Every
+    Google Cloud constructor in this repository resolves credentials
+    eagerly through ``google.auth.default()``, and an environment that
+    supplies application default credentials - a mounted service-account
+    key, a GKE workload identity, a developer who ran ``gcloud auth``
+    - makes those constructions succeed against a REAL project. A suite
+    that merely replaces the client symbols is then one stray import away
+    from holding a live, authenticated client, so the credentials
+    themselves are revoked as an independent second layer.
+
+    ``google.auth.default()`` consults ``GOOGLE_APPLICATION_CREDENTIALS``
+    before anything else and raises as soon as the path does not exist,
+    so pointing it at a file that is not there is both immediate and
+    total - no network call, no fallback chain. The metadata-server
+    variables are guarded as well, for the case where later code clears
+    that variable on a host whose metadata server would answer.
+
+    Assignment, deliberately, not ``setdefault``: an ambient real
+    credential is precisely what must be displaced.
+
+    The result is then CHECKED rather than assumed, in the same spirit as
+    :func:`install_firestore_double` - a guard that silently failed to
+    take effect is worse than no guard, because it reads as protection.
+
+    Returns:
+        The names of the environment variables this call set.
+
+    Raises:
+        RuntimeError: Credentials still resolve, so the process can still
+            authenticate against Google Cloud.
+    """
+    guards = {
+        'GOOGLE_APPLICATION_CREDENTIALS': NEUTRALISED_CREDENTIALS_FILE,
+        'GCE_METADATA_HOST': METADATA_HOST_GUARD,
+        'GCE_METADATA_IP': METADATA_IP_GUARD,
+        'GCE_METADATA_TIMEOUT': METADATA_TIMEOUT_GUARD,
+    }
+    for name, value in guards.items():
+        os.environ[name] = value
+    import google.auth
+    from google.auth.exceptions import DefaultCredentialsError
+    try:
+        credentials, project = google.auth.default()
+    except DefaultCredentialsError:
+        return sorted(guards)
+    raise RuntimeError(
+        'Google application default credentials still resolve after '
+        'neutralisation, to {0} for project {1!r}. The test suite must '
+        'not be able to authenticate against Google Cloud. Check that '
+        'nothing re-set GOOGLE_APPLICATION_CREDENTIALS after '
+        'tests/conftest.py was imported.'.format(
+            type(credentials).__name__, project
+        )
+    )
+
+
+class InertExternalClient:
+    """Stand-in for a Google Cloud client the tests never exercise.
+
+    Vision, Document AI and Cloud Storage are all constructed at import
+    time by modules this feature does not touch, and no test in this
+    suite has any business calling them. The double therefore does the
+    one thing that is unambiguously correct: it constructs, and it
+    refuses everything else.
+
+    That refusal is the point. A permissive stub whose methods returned
+    plausible values would let a test appear to exercise an external
+    service while asserting nothing, which is the failure mode this
+    whole bootstrap exists to prevent. Raising instead means the first
+    line of any test that reaches an external service names the service
+    and says what to do about it.
+
+    One consequence is deliberate and documented rather than incidental:
+    ``app/db/cloud_storage.py`` calls ``.bucket(...)`` on its client AT
+    IMPORT time, so importing that module inside the suite raises. That
+    module is reference-only for this feature, nothing in the
+    ``app.main`` import graph reaches it, and a loud refusal is the
+    correct answer for a test that would otherwise hold a live storage
+    handle.
+    """
+
+    def __init__(self, label, *args, **kwargs):
+        """Record what was asked for, and build nothing.
+
+        Args:
+            label: Dotted name of the constructor being stood in for,
+                used in the error message raised on any use.
+            *args: Positional constructor arguments, recorded verbatim.
+            **kwargs: Keyword constructor arguments, recorded verbatim.
+        """
+        self.label = label
+        self.args = args
+        self.kwargs = kwargs
+
+    def __getattr__(self, name):
+        """Return a callable that refuses, for any attribute.
+
+        Defined as ``__getattr__`` rather than ``__getattribute__`` so
+        the recorded attributes above remain readable by a test that
+        wants to assert what the application asked for.
+
+        Args:
+            name: Attribute the caller looked up.
+
+        Returns:
+            A callable that always raises ``RuntimeError``.
+        """
+        def refuse(*args, **kwargs):
+            """Refuse an external-service call, explaining why."""
+            raise RuntimeError(
+                'The test suite is isolated from external services, so '
+                '{0}.{1}() cannot be called. Patch the specific '
+                'collaborator your test needs, or assert against the '
+                'in-memory Firestore double instead.'.format(
+                    self.label, name
+                )
+            )
+        return refuse
+
+    def __repr__(self):
+        """Return a debugging representation naming the stand-in."""
+        return '<InertExternalClient {0}>'.format(self.label)
+
+
+def external_client_factory(label):
+    """Build a constructor replacement for one external client.
+
+    Args:
+        label: Dotted name of the constructor being replaced, carried
+            into the error message any use of the result raises.
+
+    Returns:
+        A callable accepting any arguments and returning an
+        :class:`InertExternalClient`.
+    """
+    def build(*args, **kwargs):
+        """Return an inert client, recording every argument."""
+        return InertExternalClient(label, *args, **kwargs)
+    return build
+
+
+def install_external_client_doubles():
+    """Replace every import-time external client constructor.
+
+    Covers Vision, Document AI and Cloud Storage;
+    :func:`install_firestore_double` covers Firestore, which needs a
+    faithful double rather than an inert one.
+
+    Each symbol is replaced on the module the consuming code imports it
+    FROM, before that consumer is imported, because
+    ``from google.cloud.vision import ImageAnnotatorClient`` binds the
+    object and a later replacement would not reach it. Whether that
+    ordering actually held is therefore checked rather than assumed: any
+    consumer already in ``sys.modules`` is reported as an error, since
+    such a module is holding a real, credentialed client and every test
+    that followed would run against it while appearing to pass.
+
+    Returns:
+        The dotted names of the constructors that were replaced.
+
+    Raises:
+        RuntimeError: A consuming ``app.*`` module was imported before
+            this ran.
+    """
+    replaced = []
+    premature = []
+    for module_name, attribute, consumer in EXTERNAL_CLIENT_TARGETS:
+        if consumer in sys.modules:
+            premature.append(consumer)
+        module = __import__(module_name, fromlist=[attribute])
+        label = '{0}.{1}'.format(module_name, attribute)
+        setattr(module, attribute, external_client_factory(label))
+        replaced.append(label)
+    if premature:
+        raise RuntimeError(
+            'These modules were imported before the external-client '
+            'doubles were installed, so each holds a real Google Cloud '
+            'client: {0}. Ensure nothing imports app.* before '
+            'tests/conftest.py runs.'.format(', '.join(premature))
+        )
+    return replaced
 
 
 def install_firestore_double():
@@ -2033,9 +2942,12 @@ def install_firestore_double():
 # slash, no control character, outside the reserved ``__*__`` namespace -
 # and each names its role, so a failure message points at the party it
 # concerns instead of at an opaque hash.
+# There is deliberately no separate "unverified" ID: an unverified
+# caller has to BE one of the transaction's parties for a 403 to be
+# attributable to the verification gate rather than to the participant
+# gate, so :func:`unverified_user` reuses DEFAULT_BUYER_ID.
 DEFAULT_BUYER_ID = 'test-buyer-000000000001'
 DEFAULT_SELLER_ID = 'test-seller-00000000001'
-DEFAULT_UNVERIFIED_ID = 'test-unverified-0000001'
 DEFAULT_ADMIN_ID = 'test-admin-000000000001'
 DEFAULT_OUTSIDER_ID = 'test-outsider-000000001'
 DEFAULT_TRANSACTION_ID = 'test-transaction-000001'
@@ -2156,21 +3068,40 @@ def verified_seller(**overrides):
 
 
 def unverified_user(**overrides):
-    """Build an unverified user - the R1 negative case.
+    """Build an unverified BUYER of the default transaction - the R1
+    negative case.
 
-    A participant of the transaction in every other respect, so a test
-    using this isolates the verification gate rather than tripping the
-    participant gate by accident.
+    The identity is the load-bearing detail, and it is why this builder
+    shares ``DEFAULT_BUYER_ID`` with :func:`verified_buyer` rather than
+    carrying an ID of its own. R1 - "only verified users may rate" - is
+    proven by a caller who fails the verification gate and passes every
+    other gate, so that the refusal can only be attributed to
+    verification. A caller with a distinct ID is not a party to the
+    default transaction, so it fails the R2 participant gate as well and
+    the test would still see 403 with no rating written after the
+    verification gate had been deleted outright. That is a false
+    positive on the requirement the test exists to protect, so the two
+    predicates are separated here instead.
+
+    Pair it with :func:`completed_transaction`, whose ``buyer_id``
+    defaults to the same ID. Seed this user INSTEAD of
+    :func:`verified_buyer`, not alongside it: both write the same user
+    document, and the last write would decide the verification flag.
+
+    For a caller that fails both gates - to prove the guards are
+    evaluated verification-first - pass the outsider identity
+    explicitly: ``unverified_user(user_id=DEFAULT_OUTSIDER_ID)``.
 
     Args:
         **overrides: Any :func:`build_user` keyword.
 
     Returns:
-        A ``User`` whose ``is_verified`` is ``False``.
+        A ``User`` whose ``is_verified`` is ``False`` and who is the
+        buyer of the transaction the fixtures build by default.
     """
     return build_user(**_merged(
         {
-            'user_id': DEFAULT_UNVERIFIED_ID,
+            'user_id': DEFAULT_BUYER_ID,
             'role': 'buyer',
             'is_verified': False,
         },
@@ -2613,15 +3544,32 @@ def reset_firestore_double():
     classes in this suite: those cannot receive fixtures as method
     arguments, but autouse fixtures wrap their tests all the same.
 
-    Two kinds of state are reset. The datastore is cleared before and
-    after each test, so no test can depend on - or be broken by -
-    another's writes, and in particular so that two tests may write the
-    same deterministic rating ID in sequence. The rating tunables on the
-    ``settings`` singleton are snapshotted and restored, because
-    ``app/services/rating.py`` re-reads ``RATING_WINDOW_DAYS`` on every
-    call precisely so that a test can drive the publication window by
-    assigning to it - and an assignment left in place would silently
-    change the meaning of every test that ran afterwards.
+    EVERY piece of mutable state this module shares between tests is
+    reset here, and the list is exhaustive on purpose - a single
+    survivor is enough to make a suite order-dependent, and an
+    order-dependent suite fails in CI for reasons nobody can reproduce
+    locally.
+
+    * The datastore is cleared, so no test can depend on - or be broken
+      by - another's writes, and in particular so that two tests may
+      write the same deterministic rating ID in sequence.
+    * ``fake_db.project`` is restored by the same call, since
+      :func:`firestore_client_factory` records whatever a caller
+      constructed with.
+    * The server-timestamp cursor is forgotten, so a test that moved the
+      clock forward to exercise the publication window cannot leave
+      later tests receiving future-dated timestamps - see
+      :func:`reset_server_timestamps`.
+    * The rating tunables on the ``settings`` singleton are snapshotted
+      and restored, because ``app/services/rating.py`` re-reads
+      ``RATING_WINDOW_DAYS`` on every call precisely so that a test can
+      drive the publication window by assigning to it - and an
+      assignment left in place would silently change the meaning of
+      every test that ran afterwards.
+
+    Both halves run before AND after each test, so a test is protected
+    from its predecessors even when one of them died part-way through its
+    own teardown.
 
     Yields:
         The shared :class:`FakeFirestoreClient`, for a test that wants it
@@ -2633,10 +3581,12 @@ def reset_firestore_double():
         for name in MUTABLE_RATING_SETTINGS
     )
     fake_db.reset()
+    reset_server_timestamps()
     try:
         yield fake_db
     finally:
         fake_db.reset()
+        reset_server_timestamps()
         for name, value in saved.items():
             setattr(settings, name, value)
 
@@ -2652,14 +3602,75 @@ def firestore_double():
     return fake_db
 
 
+@pytest.fixture(scope='session', autouse=True)
+def restore_process_state():
+    """Leave the process exactly as the run found it.
+
+    The bootstrap below deliberately mutates process-global state - three
+    environment variables' worth of settings plus the emulator guard, two
+    ``socket`` methods, and three class attributes on ``google.cloud``
+    modules - because every one of those has to be in place before the
+    first ``app.*`` import, which happens while this module is still being
+    imported. Mutating globals that early is the only way to be early
+    enough; leaving them mutated afterwards is a separate choice, and the
+    wrong one. pytest is frequently embedded in a longer-lived process
+    (an editor's test runner, a tooling harness), so a suite that
+    permanently rewrote its host's environment, blocked its sockets and
+    stubbed its Google clients would have escaped its own boundary and
+    would silently change the behaviour of whatever ran next.
+
+    Session-scoped and autouse, so it wraps the entire run whatever is
+    collected, and the teardown runs even when tests fail.
+
+    Yields:
+        ``None``. The value is of no interest; the finalizer is the point.
+    """
+    try:
+        yield
+    finally:
+        _restore_google_client_guards()
+        _restore_network_guard()
+        restore_seeded_settings(_SEEDED_SETTINGS)
+
+
 # ---------------------------------------------------------------------
 # Bootstrap. This runs as pytest imports this module, which is BEFORE
-# any test module is imported, and the order of these three calls is the
-# load-bearing part: the path has to resolve before anything can be
-# imported, the settings have to exist before app.core.config is
-# imported, and the Firestore client has to be neutralised before
-# app.db.firestore is imported.
+# any test module is imported, and the ORDER is the load-bearing part:
+#
+#   1. the path has to resolve before anything can be imported;
+#   2. the settings have to be imposed before app.core.config is
+#      imported, because it evaluates Settings() at module scope;
+#   3. the ambient credentials have to be revoked before any client
+#      constructor can consult them, and that revocation is verified
+#      while the network is still reachable so the check is meaningful;
+#   4. the network has to be blocked and the Vision, Document AI and
+#      Cloud Storage classes replaced before app.* is imported, because
+#      three modules in app/main.py's import graph CONSTRUCT those
+#      clients at module scope and each resolves credentials eagerly.
+#      The guards run first so they capture the REAL classes for the
+#      session-end restore; the inert doubles are installed last so they
+#      are the constructors any test observes, and their own
+#      already-imported-consumer check proves the ordering held;
+#   5. and the Firestore client has to be replaced before
+#      app.db.firestore is imported.
+#
+# The index declarations are loaded here rather than lazily so that a
+# missing or malformed declaration file fails the whole run at collection
+# time with one clear message, instead of surfacing as a puzzling
+# FailedPrecondition inside an unrelated test. That parse IS this
+# repository's deployment-contract check for the file: it has no other
+# runtime reader.
+#
+# The undo-capable steps return what is needed to reverse them, and
+# `restore_process_state` above puts the process back when the session
+# ends.
 # ---------------------------------------------------------------------
 ensure_backend_on_sys_path()
-seed_required_settings()
+DECLARED_COMPOSITE_INDEXES = load_declared_indexes()
+_SEEDED_SETTINGS = seed_required_settings()
+neutralise_google_credentials()
+_restore_network_guard = install_network_guard()
+_restore_google_client_guards = install_google_client_guards()
+install_external_client_doubles()
+
 install_firestore_double()

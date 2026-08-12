@@ -1,8 +1,20 @@
-from stripe import Stripe
+import stripe
 from app.core.config import settings
 from typing import Dict, Any
 
-stripe = Stripe(settings.STRIPE_API_KEY)
+# The credential seat stripe 7.9.0 actually exposes. There is no
+# ``Stripe`` class in that release - the package is configured by
+# assigning the key on the module - so ``from stripe import Stripe``
+# raised ImportError while this module was being imported. Every call
+# below already goes through the module (``stripe.Charge.create``,
+# ``stripe.Refund.create``, ``stripe.error.StripeError``), so binding the
+# key here is all that was ever needed.
+#
+# This is the module ``app/api/transactions.py`` imports ``process_payment``
+# from, so an ImportError here is not contained to payments: it propagated
+# through that router and, before this repair, cost the application its
+# entire transactions surface.
+stripe.api_key = settings.STRIPE_API_KEY
 
 def process_payment(token: str, amount: float, currency: str) -> Dict[str, Any]:
     try:

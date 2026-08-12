@@ -66,10 +66,11 @@ by exact string; a mismatch there raises no error, it just yields an
 index that silently serves nothing. ``frontend/src/schema/rating.ts``
 mirrors every name 1:1 in camelCase.
 """
+import logging
 import unicodedata
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from google.cloud import firestore
 from pydantic import (
@@ -83,6 +84,8 @@ from pydantic import (
 )
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # The bound the whole feature votes within, declared once so the request
 # model and the persisted model cannot drift apart. ``strict=True`` is
@@ -100,6 +103,51 @@ RatingScore = conint(
 # are legitimate in prose. ``\r`` is not listed because line endings are
 # normalised to ``\n`` first.
 _ALLOWED_CONTROL_CHARACTERS = ('\n', '\t')
+
+# Characters that cannot appear in a value this module calls plain text.
+#
+# This is the enforcement of a claim the module makes about itself. The
+# stored review is documented as carrying no markup semantics of any kind,
+# and normalisation alone does not make that true: it composes Unicode and
+# strips control characters, and leaves ``<script>alert(1)</script>``
+# exactly as it arrived. React escapes it on today's only render path, so
+# the claim held by accident rather than by construction - and an accident
+# is not a control. The moment any consumer is added that does not escape
+# by default (an HTML email, a PDF receipt, a CSV opened in a spreadsheet,
+# ``dangerouslySetInnerHTML``), the stored value becomes the injection.
+#
+# So the value is REJECTED rather than rewritten. Stripping tags would be
+# the wrong remedy twice over: it silently edits somebody's review, and it
+# is a sanitiser - an allow-list of what to remove - which is exactly the
+# kind of control that gets bypassed. Refusing is unambiguous, is
+# reportable to the author, and cannot be worked around by a novel
+# encoding.
+#
+# The set is exactly the two TAG DELIMITERS, and nothing wider. Without a
+# ``<`` or a ``>`` in the stored value, no element, comment, CDATA section
+# or processing instruction can be formed from it in HTML, XHTML, XML or
+# SVG - which is the property that has to hold, and it holds whether or not
+# the consumer escapes.
+#
+# Three characters are deliberately NOT in the set, because each would
+# refuse ordinary prose to guard against a different consumer's bug:
+#
+# * ``&`` is permitted. An entity reference in an HTML text node decodes to
+#   TEXT and is never re-parsed as markup, so ``&lt;script&gt;`` cannot
+#   become an element on its own; only a literal ``<`` can, and that is
+#   already refused. Rejecting ``&`` would protect only against a consumer
+#   that decodes entities twice - a distinct defect in that consumer - at
+#   the cost of refusing "A/C & heat both work", which is what a review of
+#   a car actually says.
+# * Quotes and apostrophes are permitted, for the same reason: they matter
+#   only inside an unquoted HTML attribute, which is a consumer defect, and
+#   they are unavoidable in prose.
+#
+# The cost of the rule is that "0-60 in >6s" must be written "over 6s". The
+# error message names the offending character so that is discoverable
+# rather than mysterious, and it is a small price for a stored value that
+# cannot become markup anywhere.
+_MARKUP_CHARACTERS = ('<', '>')
 
 # Headroom the RAW submitted review is allowed over the bound that
 # actually applies to it, expressed as a multiple of
@@ -134,6 +182,17 @@ _ALLOWED_CONTROL_CHARACTERS = ('\n', '\t')
 # for one letter), so a raw string up to four times the bound can still
 # normalise into range, while anything beyond that is not prose that got
 # longer in transit - it is a payload.
+#
+# MIRRORED CLIENT-SIDE, and that is what makes this two-bound design a
+# contract rather than a server-only nicety.
+# ``frontend/src/schema/rating.ts`` declares the same factor, derives the
+# same ceiling, and ports ``as_plain_text``'s normalisation as
+# ``normalizeReviewText`` so its Zod field applies these two bounds in
+# this order against the same string. Before it did, the client bounded
+# the RAW text at the semantic limit and was strictly stricter than the
+# server: it refused reviews this module would have accepted, and its
+# character counter and this bound disagreed about what "2000
+# characters" means. Change either side and change both.
 REVIEW_RAW_LENGTH_FACTOR = 4
 
 # The raw ceiling itself. Bound at import, from the same setting the
@@ -186,6 +245,37 @@ DocumentId = constr(
     strict=True,
     min_length=1,
     max_length=DOCUMENT_ID_MAX_LENGTH,
+    regex=_DOCUMENT_ID_PATTERN,
+)
+
+# A rating's document ID, which is NOT a plain ``DocumentId``: it is the
+# COMPOSITE ``"{transaction_id}_{rater_id}"`` that
+# ``app/services/rating.py:_rating_document_id`` builds, so it can be as
+# long as both components plus the joining underscore.
+#
+# It needs a contract of its own because reusing the component bound for
+# the composite is an off-by-a-factor-of-two that only shows up in
+# production. ``DocumentId`` admits a 128-character transaction ID and a
+# 128-character rater ID, both legitimately creatable, whose rating key is
+# 257 characters. ``POST /api/ratings`` would create that document happily
+# and ``PATCH /api/ratings/{rating_id}/moderation`` would then refuse the
+# very key it had just minted with a 422 - a rating that exists, is
+# visible, and cannot be moderated. The service's own
+# ``_is_valid_rating_id`` mirrors this bound for the same reason, so a
+# reachable rating is not reported as "not found" one layer deeper.
+#
+# The grammar is otherwise identical. It is the same slash-free,
+# control-character-free rule, and the composite cannot collide with
+# Firestore's reserved ``__.*__`` namespace or with ``.``/``..`` while
+# each half is already refused those forms. 257 bytes is far inside
+# Firestore's own 1500-byte key limit, so nothing here trades one bound
+# for a worse one.
+RATING_ID_MAX_LENGTH = 2 * DOCUMENT_ID_MAX_LENGTH + 1
+
+RatingDocumentId = constr(
+    strict=True,
+    min_length=1,
+    max_length=RATING_ID_MAX_LENGTH,
     regex=_DOCUMENT_ID_PATTERN,
 )
 
@@ -301,7 +391,8 @@ def as_plain_text(
     receive text this function has not passed. It does not
     escape or rewrite the author's words - the stored value is plain
     text that every render path must output-encode - it removes what
-    prose cannot legitimately contain:
+    prose cannot legitimately contain, and REFUSES what would make the
+    plain-text claim false:
 
     * Unicode is composed (NFC), so visually identical strings compare
       and truncate consistently.
@@ -313,6 +404,12 @@ def as_plain_text(
       whitespace is trimmed.
     * Text that is empty once normalised becomes ``None``, so "no
       review" is one state rather than two.
+    * Text still containing a tag delimiter - ``<`` or ``>`` - is
+      REFUSED. This is what makes "the stored value carries no markup
+      semantics" a property of the data rather than a hope about its
+      consumers, and it is checked after the removals above so an
+      obfuscation such as ``<scr\\x00ipt>`` cannot slip a bracket through
+      by hiding it behind a stripped character.
 
     The length bound is applied HERE, to the normalised text, and not to
     the raw input: the normalised value is what gets persisted, read
@@ -323,6 +420,20 @@ def as_plain_text(
     larger ceiling declared on the fields below
     (``REVIEW_RAW_MAX_LENGTH``), whose only job is to keep an unbounded
     body away from this function.
+
+    THIS IS THE ONE REVIEW POLICY, AND THE CLIENT MIRRORS IT
+    -------------------------------------------------------------------
+    ``frontend/src/schema/rating.ts`` performs the SAME normalisation in
+    the same order before applying the same semantic bound, so a character
+    counter in the interface and this function agree on what "2000
+    characters" means. That agreement is the whole reason the order is
+    specified rather than incidental: applying a bound to raw text on one
+    side and to normalised text on the other makes the two disagree by
+    exactly the amount that normalisation removes, which is largest for
+    precisely the users least able to diagnose it - anyone typing a
+    diacritic-heavy language on a platform that emits decomposed Unicode.
+    The client is a convenience and this function is the authority; they
+    are written to reach the same verdict all the same.
 
     The same normalisation serves every field of author-supplied prose
     on a rating - the public review and the moderator's reason - because
@@ -340,7 +451,8 @@ def as_plain_text(
         The normalised text, or ``None`` when there is nothing left.
 
     Raises:
-        ValueError: The normalised text exceeds the applicable bound.
+        ValueError: The normalised text contains a markup character, or
+            exceeds the applicable bound.
     """
     if value is None:
         return None
@@ -356,6 +468,18 @@ def as_plain_text(
     text = text.strip()
     if not text:
         return None
+    # Checked AFTER the removals, so a bracket cannot be smuggled through
+    # behind a character that normalisation was going to strip anyway.
+    present = [
+        character for character in _MARKUP_CHARACTERS if character in text
+    ]
+    if present:
+        raise ValueError(
+            '{0} must be plain text and must not contain {1}'.format(
+                label,
+                ' or '.join(repr(character) for character in present),
+            )
+        )
     limit = int(
         settings.RATING_REVIEW_MAX_LENGTH if max_length is None
         else max_length
@@ -421,7 +545,20 @@ class Rating(BaseModel):
     # decision taken on a truthiness accident.
     is_published: StrictBool = False
     moderation_status: str = ModerationStatus.PENDING.value
+    # The POLICY CODE justifying a moderation decision, never free text and
+    # never anything derived from the score. The service constrains it to an
+    # allow-list (``MODERATION_REASON_CODES``), which is what makes
+    # sentiment-neutrality a property the system holds rather than one it
+    # asks its operators to remember: there is no expressible way to record
+    # "low score" as a reason. Machine-readable on purpose, so a moderation
+    # history can be audited by grouping rather than by reading prose.
     moderation_reason: Optional[str] = None
+    # The human specifics behind the code - which phrase was abusive, whose
+    # phone number appeared. Separate from the code precisely so the code
+    # can stay closed while the detail stays free, and OPERATIONAL: it
+    # reaches only the administrator response model, never a public or
+    # participant read.
+    moderation_note: Optional[str] = None
     # Permissive ANNOTATION by necessity, constrained by the validator
     # below. The write path assigns ``firestore.SERVER_TIMESTAMP``,
     # which is a sentinel object and not a ``datetime``; a strict
@@ -455,18 +592,39 @@ class Rating(BaseModel):
         cls,
         value: Optional[str],
     ) -> Optional[str]:
-        """Hold the moderator's reason to a bounded plain-text contract.
+        """Hold the moderator's reason code to a bounded plain-text contract.
 
-        The reason is staff-authored rather than public, but it is still
-        persisted on this document and still read back by the rating's
-        author, so it gets the same normalisation as the review and a
-        bound of its own. Whitespace-only text normalises to ``None``,
-        which keeps "no reason recorded" a single state rather than two.
+        The value is a policy code the service picks from an allow-list, so
+        this is a backstop rather than the constraint: it keeps a stored
+        document that predates the allow-list, or one written outside the
+        service, from carrying control characters or an unbounded string
+        into a response. Whitespace-only text normalises to ``None``, which
+        keeps "no reason recorded" a single state rather than two.
         """
         return as_plain_text(
             value,
             max_length=MODERATION_REASON_MAX_LENGTH,
             label='Moderation reason',
+        )
+
+    @validator('moderation_note')
+    def _validate_moderation_note(
+        cls,
+        value: Optional[str],
+    ) -> Optional[str]:
+        """Hold the operator's note to a bounded plain-text contract.
+
+        Staff-authored rather than public, but still persisted on this
+        document and still returned to an administrator, so it gets the
+        same normalisation as the review and a bound of its own: an
+        unbounded note is an unbounded write into a document Firestore
+        caps at 1 MiB, and a newline in it forges a line in any log or
+        export that renders it.
+        """
+        return as_plain_text(
+            value,
+            max_length=MODERATION_REASON_MAX_LENGTH,
+            label='Moderation note',
         )
 
     @validator('created_at', 'updated_at', always=True)
@@ -486,6 +644,125 @@ class Rating(BaseModel):
             'Timestamp must be a datetime, the Firestore server '
             'timestamp sentinel, or absent'
         )
+
+
+class RatingView(BaseModel):
+    """One rating as an API RESPONSE. The least-data public projection.
+
+    Deliberately a different model from :class:`Rating`, because a
+    persistence record and a response are answerable to different
+    questions, and using one object for both got both wrong at once.
+
+    WHAT IT OMITS, AND WHY THAT IS THE POINT
+    -------------------------------------------------------------------
+    ``moderation_status`` and ``moderation_reason`` are absent. They are
+    OPERATIONAL state: they record that a moderator acted and the policy
+    basis they cited, written for the people who run the platform. Serving
+    them on a public read publishes the moderation queue - a reader can
+    see which reviews were withheld and read the internal note explaining
+    why - and serving them to a participant hands the same information to
+    the person most motivated to argue with it. Neither read needs them:
+    the visibility decision has ALREADY been applied by
+    ``app/services/rating.py:_visible_projection`` before a view is built,
+    so a withheld review arrives with ``review`` empty, which is the only
+    fact a reader acts on. An author still sees their own words in full
+    through the per-transaction read, so nothing vanishes unexplained.
+
+    The moderation fields are reachable only through
+    :class:`ModeratedRatingView`, which the admin-only moderation endpoint
+    returns. That is the "deliberately specified user-facing explanation"
+    boundary: an administrator asked for the state and gets it; nobody
+    else is told.
+
+    WHAT IT KEEPS, ALSO DELIBERATELY
+    -------------------------------------------------------------------
+    ``transaction_id``, ``rater_id``, ``ratee_id``, ``direction`` and
+    ``vehicle_listing_id`` are retained. This is a decision rather than an
+    oversight, and it is worth stating because it looks like a leak:
+
+    * ``rater_id`` is what makes a rating ATTRIBUTABLE, which is the point
+      of a reputation system - an unattributable score cannot be weighed
+      for context, and the specification's authenticity requirement is
+      precisely that a rating comes from somebody who actually transacted.
+    * ``ratee_id`` and ``direction`` are the subject of the read; a caller
+      asking for the ratings a user received already knows who that is.
+    * ``vehicle_listing_id`` exists on the record so a rating can be shown
+      with context - "rated after buying this car" - without a second
+      document read. Removing it defeats the field.
+    * ``transaction_id`` is the evidence the rating is anchored to a real
+      exchange, and it is also the first half of ``id``.
+
+    That last point decides it: the document ID IS
+    ``"{transaction_id}_{rater_id}"`` and ``id`` is returned, so blanking
+    the two fields while returning the value they compose would cost the
+    interface real capability and conceal nothing. All of these are opaque
+    Firestore identifiers - never names, emails or contact details - and
+    none addresses a document a caller can read without passing that
+    endpoint's own authorization.
+
+    TIMESTAMPS ARE REQUIRED HERE AND OPTIONAL ON :class:`Rating`
+    -------------------------------------------------------------------
+    That asymmetry is the second reason this model exists. ``Rating`` must
+    tolerate ``firestore.SERVER_TIMESTAMP``, an unserialisable sentinel,
+    because the write path constructs a model from the body it is about to
+    write; and it must tolerate absence, because a stored document is not
+    typed. A RESPONSE has neither excuse: the service substitutes a real
+    UTC datetime on every value it hands back, and the official client
+    (``frontend/src/schema/rating.ts``) declares both fields as a required
+    ``z.date()`` and throws on null. Typing them ``Optional[Any]`` on the
+    response made a response the server may legally emit and the client
+    will always reject - the worst kind of contract, because both sides
+    are behaving as specified. Requiring a real ``datetime`` here means
+    such a response cannot be constructed in the first place.
+    """
+
+    id: str
+    transaction_id: str
+    vehicle_listing_id: str
+    rater_id: str
+    ratee_id: str
+    direction: str
+    score: RatingScore
+    review: Optional[str] = None
+    is_published: StrictBool
+    created_at: datetime
+    updated_at: datetime
+
+    @validator('direction')
+    def _validate_direction(cls, value: Any) -> str:
+        """Constrain ``direction`` to the two derived values."""
+        return enum_value(value, RatingDirection, 'rating direction')
+
+
+class ModeratedRatingView(RatingView):
+    """One rating as an ADMINISTRATOR's response. F010-4.
+
+    :class:`RatingView` plus the two moderation fields, returned by
+    ``PATCH /api/ratings/{rating_id}/moderation`` and by nothing else.
+
+    The endpoint is gated on ``role == 'admin'``, so this is the one place
+    moderation state crosses the API boundary - and it crosses it to the
+    caller who just set it, which is the only audience for whom the state
+    and its policy basis are the answer to the question asked. Every other
+    read returns :class:`RatingView`.
+
+    ``moderation_reason`` is a POLICY CODE and never anything derived from
+    the score - the service constrains it to an allow-list, so a
+    score-based justification is not expressible. ``moderation_note``
+    carries the human specifics behind that code. Both exist so a withheld
+    review carries its justification on the record, which is what makes
+    the sentiment-neutrality of the decision auditable rather than merely
+    asserted.
+    """
+
+    moderation_status: str
+    moderation_reason: Optional[str] = None
+    moderation_note: Optional[str] = None
+
+    @validator('moderation_status')
+    def _validate_moderation_status(cls, value: Any) -> str:
+        """Constrain ``moderation_status`` to its three states."""
+        return enum_value(value, ModerationStatus, 'moderation status')
 
 
 class RatingCreate(BaseModel):
@@ -650,6 +927,98 @@ class RatingCreate(BaseModel):
         the request boundary, so no submission path can bypass it.
         """
         return as_plain_text(value)
+
+
+def to_rating_view(rating: Rating) -> RatingView:
+    """Project one persisted rating into its public API response.
+
+    The single place the persistence model becomes a response, so the
+    field set a caller receives is decided once rather than at each
+    endpoint. Fields absent from :class:`RatingView` are dropped here
+    simply by not being named - there is no blank-out step that a later
+    field could be forgotten from.
+
+    Args:
+        rating: The rating as stored, already passed through the
+            service's visibility projection.
+
+    Returns:
+        The response projection.
+
+    Raises:
+        ValueError: The rating carries no usable ``created_at`` or
+            ``updated_at``. Deliberately loud rather than substituted: a
+            fabricated "now" would be presented to a reader as the moment
+            somebody rated them, and the alternative of emitting null is
+            a response the official client refuses. Every path that
+            produces a response stamps both values, so this reports a
+            genuine data fault rather than a routine case.
+    """
+    return RatingView(
+        id=rating.id,
+        transaction_id=rating.transaction_id,
+        vehicle_listing_id=rating.vehicle_listing_id,
+        rater_id=rating.rater_id,
+        ratee_id=rating.ratee_id,
+        direction=rating.direction,
+        score=rating.score,
+        review=rating.review,
+        is_published=rating.is_published,
+        created_at=rating.created_at,
+        updated_at=rating.updated_at,
+    )
+
+
+def to_rating_views(ratings: Any) -> List[RatingView]:
+    """Project many persisted ratings, skipping any that cannot be shown.
+
+    A list read must not fail whole because one stored document is
+    unstampable. Such a record is dropped from the page rather than
+    substituted or raised, which is the same treatment the service already
+    gives a document whose body cannot satisfy :class:`Rating` - the read
+    answers with what it can prove, and the unusable record stays visible
+    to an operator through the log rather than to a reader as a fiction.
+
+    Args:
+        ratings: Iterable of ratings as stored.
+
+    Returns:
+        The response projections, in the order given.
+    """
+    views: List[RatingView] = []
+    for rating in ratings:
+        try:
+            views.append(to_rating_view(rating))
+        except ValueError:
+            logger.error(
+                'Omitting rating %s from a response: it carries no usable '
+                'created_at/updated_at, so it cannot be represented as a '
+                'response and needs repair.',
+                getattr(rating, 'id', '<unknown>'),
+            )
+    return views
+
+
+def to_moderated_rating_view(rating: Rating) -> ModeratedRatingView:
+    """Project one persisted rating into the administrator's response.
+
+    Args:
+        rating: The rating as stored, in its new moderation state.
+
+    Returns:
+        The response projection, carrying the moderation state and its
+        recorded policy basis.
+
+    Raises:
+        ValueError: The rating carries no usable timestamps; see
+            :func:`to_rating_view`.
+    """
+    return ModeratedRatingView(
+        **to_rating_view(rating).dict(),
+        moderation_status=rating.moderation_status,
+        moderation_reason=rating.moderation_reason,
+        moderation_note=rating.moderation_note,
+    )
 
 
 class RatingAggregate(BaseModel):

@@ -1,6 +1,12 @@
 import React from 'react';
 
 import { RATING_MAX } from '../schema/rating';
+// Both imports are dependency-free: `../schema/rating` needs only `zod`, and
+// `../utils/formatting` now formats through the platform's `Intl` rather than
+// through `date-fns`, which was declared in neither the manifest nor the
+// lockfile and so could not be resolved by the clean `npm ci` install CI
+// performs. This component is mounted on the profile page and on the seller
+// block of a listing, so an unresolvable import here failed the whole bundle.
 import { formatRating } from '../utils/formatting';
 
 /**

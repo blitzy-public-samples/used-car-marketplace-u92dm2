@@ -36,8 +36,15 @@ echo "Updating Google Cloud Storage buckets..."
 gsutil rsync -r frontend/build gs://used-car-marketplace-frontend
 
 # Configure Google Cloud Firestore
+# The declaration lives at infrastructure/firestore.indexes.json, beside the
+# Terraform that provisions the database itself. This script runs from the
+# repository root, so the bare filename this line used to pass resolved to
+# nothing and the composite indexes the ratings collection needs were never
+# created - which is not a loud failure: a query needing an undeclared
+# composite index fails at request time, in production, long after deployment
+# reported success.
 echo "Configuring Google Cloud Firestore..."
-gcloud firestore indexes create firestore.indexes.json
+gcloud firestore indexes create infrastructure/firestore.indexes.json
 
 # Update DNS settings
 echo "Updating DNS settings..."

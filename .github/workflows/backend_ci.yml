@@ -18,17 +18,26 @@ jobs:
       with:
         python-version: '3.9'
 
+    # Every Python step runs from backend/, because that is where the
+    # manifest, the `app` package and the test suite live. Without the
+    # working directory these three steps run at the repository root,
+    # where `requirements.txt` does not exist (the install fails), where
+    # `flake8 .` also walks the frontend, and where `pytest` cannot
+    # import `app.*` because only backend/ is the package root.
     - name: Install dependencies
+      working-directory: backend
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
     - name: Run linting checks
+      working-directory: backend
       run: |
         pip install flake8
         flake8 .
 
     - name: Run unit tests
+      working-directory: backend
       run: |
         pip install pytest
         pytest

@@ -64,6 +64,14 @@ interface StarRatingInputProps {
    * `null` is a first-class state rather than a stand-in for zero: it renders
    * every star as an outline and echoes "No score selected", so the pre-choice
    * condition is visually and audibly distinct from any real score.
+   *
+   * A number the scale cannot represent — `0`, `6`, `4.5`, a stale score from a
+   * differently bounded scale — is treated as exactly that same "nothing is
+   * selected" state, coherently in every channel: no glyph is filled, no option
+   * is `aria-checked`, the echo says "No score selected", and the first option
+   * still carries the group's tab stop. The component never renders a value it
+   * cannot honestly represent, and never announces one thing while showing
+   * another.
    */
   value: number | null;
 
@@ -89,10 +97,18 @@ interface StarRatingInputProps {
 
 /**
  * The selectable scores, ascending, derived from the shared bounds rather than
- * hardcoded. `RATING_MIN`/`RATING_MAX` mirror the server's `settings.RATING_MIN`
- * and `settings.RATING_MAX`, which bound the Pydantic field that authoritatively
- * validates the submission — so widening the scale server-side widens this
- * control with no edit here.
+ * hardcoded.
+ *
+ * `RATING_MIN`/`RATING_MAX` are one half of a FIXED cross-stack contract:
+ * `settings.RATING_MIN` and `settings.RATING_MAX` are declared `const=True`, so
+ * the server accepts no other pair and an environment that tries to override one
+ * fails at import. That is what lets this control trust the numbers. It is
+ * deliberately NOT true that "widening the scale server-side widens this control
+ * with no edit here" — this file is compiled into a separate artefact that cannot
+ * read a server environment variable, so a server-only change could only ever
+ * leave the two disagreeing: an extra star the server answers with 422, or a
+ * missing one a rater cannot choose. Changing the scale means editing both sides
+ * and shipping them together.
  *
  * Computed once at module scope: the bounds are module constants, so the result
  * is invariant and there is nothing to recompute per render.
@@ -141,22 +157,44 @@ const OPTION_BASE_CLASSES = [
 /**
  * State-dependent classes for one option.
  *
- * Colour is chosen for contrast, not decoration. Against the white page these
- * clear WCAG 1.4.11's 3:1 minimum for a control's state indicator, which the
- * lighter steps of the same scales do not: `yellow-600` reaches roughly 3.0:1
- * and `gray-500` roughly 4.8:1, where `yellow-500` manages only about 1.9:1 and
- * `gray-300` about 1.6:1. No design source overrides these minimums for this
- * project, so they are met rather than deferred.
+ * COLOUR IS CHOSEN FOR MEASURED CONTRAST, NOT FOR DECORATION. A filled star is
+ * the state indicator of a control, so WCAG 1.4.11 holds it to 3:1 against the
+ * white page, and the figures below are computed rather than eyeballed —
+ * relative luminance per WCAG's own formula, against `#ffffff`:
  *
- * The hover tone is identical for every option — including options below the
- * current score — so hovering communicates "this is interactive" and never
- * "this score is better". Selected and unselected options differ only in the
- * resting tone that pairs with the glyph.
+ *   yellow-500 #eab308 → 1.92:1   FAILS
+ *   yellow-600 #ca8a04 → 2.94:1   FAILS — close enough to look fine and still short
+ *   yellow-700 #a16207 → 4.92:1   PASSES, and is the resting tone below
+ *   yellow-800 #854d0e → 6.85:1   PASSES, hover
+ *   yellow-900 #713f12 → 8.67:1   PASSES, pressed
+ *   gray-500   #6b7280 → 4.83:1   PASSES, unselected resting tone
+ *   gray-300   #d1d5db → 1.47:1   FAILS
  *
- * Disabled options drop to a muted neutral with a `not-allowed` cursor. Inactive
- * controls are explicitly exempt from the contrast minimums, and the muting is
- * uniform across all five, so a disabled group reveals nothing about the score
- * it would have accepted.
+ * `yellow-600` was previously the resting tone for a filled star and measures
+ * 2.94:1 — under the threshold, by a margin small enough that it reads as
+ * acceptable on a good display and disappears on a poor one or for a reader with
+ * low vision. It is exactly the kind of near-miss the measurement exists to
+ * catch, so the scale is stepped one further to `yellow-700`. No design source
+ * overrides these minimums for this project, so they are met rather than
+ * deferred, and each tone is a Tailwind default-scale token rather than a
+ * hand-picked hex.
+ *
+ * The hover and pressed tones are identical for every option — including options
+ * below the current score — so pointer feedback communicates "this is
+ * interactive" and never "this score is better". Selected and unselected options
+ * differ only in the resting tone that pairs with the glyph.
+ *
+ * FOUR STATES, NOT THREE. `hover:` says "this is interactive", the base focus
+ * ring says "you are here", `disabled:` says "not now", and `active:` says "your
+ * press registered" — the feedback between pressing a star and the selection
+ * committing. Tailwind emits `active` after `hover`, so the pressed tone wins
+ * while the pointer is down, and a disabled option is never `:active` at all, so
+ * the disabled branch below needs no pressed variant to override.
+ *
+ * Disabled options drop to a muted neutral with a `not-allowed` cursor, and carry
+ * neither hover nor pressed variants. Inactive controls are explicitly exempt
+ * from the contrast minimums, and the muting is uniform across all five, so a
+ * disabled group reveals nothing about the score it would have accepted.
  */
 const optionStateClasses = (isFilled: boolean, isDisabled: boolean): string => {
   if (isDisabled) {
@@ -164,8 +202,8 @@ const optionStateClasses = (isFilled: boolean, isDisabled: boolean): string => {
   }
 
   return isFilled
-    ? 'text-yellow-600 hover:text-yellow-700'
-    : 'text-gray-500 hover:text-yellow-700';
+    ? 'text-yellow-700 hover:text-yellow-800 active:text-yellow-900'
+    : 'text-gray-500 hover:text-yellow-800 active:text-yellow-900';
 };
 
 const StarRatingInput: React.FC<StarRatingInputProps> = ({
@@ -188,26 +226,55 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   /**
+   * The selected score, or `null` — ONE validated value that every channel reads.
+   *
+   * `value` is typed `number | null`, so a caller can legitimately hand over
+   * something the scale cannot represent: a stale score from a widened scale, an
+   * uninitialised `0`, a fractional average passed to the wrong component. This
+   * is the single place that judgement is made, and everything downstream —
+   * `aria-checked`, the glyph fill, the textual echo and the tab-stop fallback —
+   * derives from the result.
+   *
+   * That centralisation is the fix for a real incoherence rather than a tidiness
+   * preference. When each channel decided for itself, a `value` of 6 produced a
+   * control that contradicted itself in three directions at once: the tab stop
+   * fell back to the first option, `score <= value` filled ALL FIVE glyphs, the
+   * echo announced "6 out of 5", and `aria-checked` was false everywhere. A
+   * sighted user saw a full five-star selection, a screen-reader user was told
+   * nothing was selected, and the text said something impossible. Now an
+   * unrepresentable value is one state — "nothing is selected" — expressed
+   * identically in all four channels.
+   *
+   * `Number.isInteger` is checked as well as membership because a non-integer can
+   * never be a member and the intent is to reject it explicitly rather than by
+   * accident.
+   */
+  const selectedScore =
+    value !== null && Number.isInteger(value) && SCORES.includes(value)
+      ? value
+      : null;
+
+
+  /**
    * The option that holds the group's single tab stop.
    *
    * A radio group is one Tab stop: the selected option is what Tab reaches, and
-   * arrow keys move within the group. Before anything is selected, the first
+   * arrow keys move within the group. Before anything is selected — including
+   * when the controlled value is one this scale cannot represent — the first
    * option carries it.
    *
-   * The `SCORES.includes` guard is load-bearing, not defensive noise. `value` is
-   * typed `number | null`, so a caller can legitimately pass a value outside the
-   * scale — a stale score from a widened scale, or an uninitialised `0`. Under a
-   * bare `value === score` test that case gives the group NO element with
-   * `tabIndex={0}`, making the whole control unreachable by keyboard and failing
-   * WCAG 2.1.1. Falling back to the first option guarantees exactly one tab stop
-   * for every possible value of the prop.
+   * The fallback is load-bearing, not defensive noise. Under a bare
+   * `value === score` test an unrepresentable value gives the group NO element
+   * with `tabIndex={0}`, making the whole control unreachable by keyboard and
+   * failing WCAG 2.1.1. Falling back to the first option guarantees exactly one
+   * tab stop for every possible value of the prop.
    *
-   * `aria-checked` is deliberately NOT derived from this fallback: it reports the
-   * true `value`, so an out-of-range score correctly presents as "nothing
-   * selected" rather than silently claiming the first option is chosen.
+   * `aria-checked` is deliberately NOT derived from this fallback: it reports
+   * `selectedScore`, so an unrepresentable score presents as "nothing selected"
+   * rather than silently claiming the first option is chosen.
+
    */
-  const activeScore =
-    value !== null && SCORES.includes(value) ? value : RATING_MIN;
+  const activeScore = selectedScore ?? RATING_MIN;
 
   /**
    * Commits a score and moves focus onto it.
@@ -299,9 +366,16 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
    * No live region: each option already announces its own state through
    * `aria-checked` as focus moves across the group, so announcing this sentence
    * as well would say the same thing twice on every keystroke.
+   *
+   * Reads `selectedScore`, never the raw prop, so it can only ever state a score
+   * this scale represents. Reading `value` produced sentences such as "10 out of
+   * 5" and "0 out of 5" — a redundant channel that contradicts both the stars and
+   * `aria-checked` is worse than no redundant channel at all.
    */
   const scoreEcho =
-    value === null ? 'No score selected' : `${value} out of ${RATING_MAX}`;
+    selectedScore === null
+      ? 'No score selected'
+      : `${selectedScore} out of ${RATING_MAX}`;
 
   return (
     <div className="flex flex-col gap-2">
@@ -316,7 +390,10 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
         className="flex items-center gap-1"
       >
         {SCORES.map((score, index) => {
-          const isFilled = value !== null && score <= value;
+          // Filled from `selectedScore`, so the stars agree with `aria-checked`
+          // and with the textual echo for every possible value of the prop.
+
+          const isFilled = selectedScore !== null && score <= selectedScore;
 
           return (
             <button
@@ -337,7 +414,8 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
                */
               type="button"
               role="radio"
-              aria-checked={value === score}
+              aria-checked={score === selectedScore}
+
               /*
                * Names the option by the value it selects — "Rate 3 out of 5" —
                * so the choice is unambiguous when announced out of visual

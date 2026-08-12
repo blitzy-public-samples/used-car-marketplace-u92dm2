@@ -1,3 +1,4 @@
+import logging
 from typing import List
 from celery import Celery
 from celery.schedules import crontab
@@ -5,10 +6,30 @@ from app.core.config import settings
 from app.db.firestore import db
 from app.services.ai_vision import analyze_vehicle_photo
 from app.services.document_processing import process_maintenance_document
-from app.services.payment import process_refund
-from app.services.rating import publish_if_window_elapsed
+# ``create_refund`` is the refund function ``app/services/payment.py``
+# actually defines. This module previously imported ``process_refund``,
+# which does not exist there, so the module raised ImportError before any
+# task in it could be registered - including the rating window sweep.
+from app.services.payment import create_refund
+from app.services.rating import publish_expired_ratings
 
-celery_app = Celery('used_car_marketplace', broker=settings.CELERY_BROKER_URL)
+
+logger = logging.getLogger(__name__)
+
+# Transport used when no broker is configured. Celery requires a broker URL
+# at construction, and ``CELERY_BROKER_URL`` is an OPTIONAL setting because
+# no broker is provisioned for this deployment. The in-memory transport is
+# enough to DEFINE and import the tasks below, and deliberately not enough
+# to run them anywhere real - which is honest, because nothing in this
+# codebase dispatches a task. The rating feature's correctness does not
+# depend on a worker: its read paths publish opportunistically instead.
+DEFAULT_CELERY_BROKER_URL = 'memory://'
+
+celery_app = Celery(
+    'used_car_marketplace',
+    broker=settings.CELERY_BROKER_URL or DEFAULT_CELERY_BROKER_URL,
+)
+
 
 @celery_app.task
 def process_new_listing_photos(listing_id: str, photo_urls: List[str]) -> None:
@@ -54,8 +75,33 @@ def process_maintenance_documents(listing_id: str, document_urls: List[str]) -> 
             'manual_review_required': True
         })
 
+# The ``@celery_app.on_after_configure.connect`` decorator that used to sit
+# under ``@celery_app.task`` here, and on ``process_scheduled_refunds``
+# below, has been removed. It could not work and must not be restored as
+# it stood, for two independent reasons.
+#
+# First, it made the module UNIMPORTABLE. Celery requires a signal receiver
+# to accept keyword arguments, and neither function did, so ``connect``
+# raised ``ValueError: Signal receiver must accept keyword arguments``
+# while the module was still being imported - taking the rating window
+# sweep hosted here down with it. That failure was previously masked by an
+# earlier ImportError on the same import chain.
+#
+# Second, and the reason ``**kwargs`` is NOT the fix: ``on_after_configure``
+# fires when the Celery configuration is finalised, and it calls the
+# receiver - which here is the task's own body. Merely reading the app's
+# configuration would therefore have run this listing sweep and, worse,
+# ``process_scheduled_refunds``, issuing real Stripe refunds as a side
+# effect of configuring an application. Verified empirically against the
+# pinned celery 5.3.6: the receiver body executes on configuration access.
+#
+# ``on_after_configure`` is for a SETUP function that registers periodic
+# work (``sender.add_periodic_task(...)``), never for the work itself.
+# Nothing is lost by removing it: no schedule is declared anywhere in this
+# codebase, no task is ever dispatched, and both functions remain
+# registered Celery tasks.
+
 @celery_app.task
-@celery_app.on_after_configure.connect
 def update_listing_status():
     active_listings = db.collection('listings').where('status', '==', 'active').get()
     
@@ -65,83 +111,98 @@ def update_listing_status():
                 'status': 'inactive'
             })
 
+# See the note above ``update_listing_status`` for why this task no longer
+# doubles as an ``on_after_configure`` receiver. It matters most here: this
+# body issues refunds.
 @celery_app.task
-@celery_app.on_after_configure.connect
 def process_scheduled_refunds():
     # HUMAN ASSISTANCE NEEDED
     # This function needs review for production readiness due to confidence level below 0.8
     refund_scheduled_transactions = db.collection('transactions').where('status', '==', 'refund_scheduled').get()
     
     for transaction in refund_scheduled_transactions:
-        refund_result = process_refund(transaction.id)
+        # ``create_refund`` is the collaborator this module has: it takes
+        # the stripe charge reference and the amount off the transaction
+        # document, and reports the outcome as a dict rather than as an
+        # object. Both halves matter - the previous code named a function
+        # that does not exist AND read ``.success``/``.error_message`` as
+        # attributes off the dict that function returns, so it could not
+        # have worked even once the import resolved.
+        transaction_data = transaction.to_dict() or {}
+        refund_result = create_refund(
+            transaction_data.get('stripe_payment_intent_id'),
+            transaction_data.get('amount'),
+        )
         
-        if refund_result.success:
+        if refund_result.get('success'):
             db.collection('transactions').document(transaction.id).update({
                 'status': 'refunded'
             })
         else:
+            refund_error = refund_result.get('error')
             db.collection('transactions').document(transaction.id).update({
                 'status': 'refund_failed',
-                'refund_error': refund_result.error_message
+                'refund_error': refund_error
             })
-            log_failed_refund(transaction.id, refund_result.error_message)
+            log_failed_refund(transaction.id, refund_error)
 
 
 @celery_app.task
-def publish_expired_ratings() -> List[str]:
+def publish_expired_rating_window() -> int:
     """Publish unreciprocated ratings whose rating window has closed.
 
     A rating is created unpublished under the double-blind reveal, so a
     counterparty who simply never answers would otherwise suppress a
     verdict indefinitely. This sweep is what closes that gap.
 
-    Every policy decision stays in ``app/services/rating.py``: this task
-    only enumerates candidates and hands each one over, so the deadline
-    arithmetic, the transactional flip of ``is_published`` and the
-    running-mean aggregate all exist in exactly one place.
+    A THIN DELEGATION, AND THAT IS THE POINT
+    -------------------------------------------------------------------
+    Every decision belongs to ``app/services/rating.py`` and none of it is
+    restated here: the query shape, the cursor walk, the deadline
+    arithmetic against ``settings.RATING_WINDOW_DAYS``, the transactional
+    flip of ``is_published`` beside the running-mean aggregate, and the
+    per-record error policy. This function chooses nothing but when to
+    ask.
+
+    An earlier revision enumerated the candidates itself, with a single
+    unbounded ``.where(...).get()`` over every unpublished rating and no
+    per-record handling. Both halves of that were faults rather than
+    style. The read loaded the entire unpublished set into the worker at
+    once, so a backlog grew into a memory and time cost with no ceiling;
+    and with no handling around each record, the FIRST document that could
+    not publish - a transient datastore fault, or a body that cannot be
+    proved against its transaction - aborted the whole pass, stranding
+    every rating behind it indefinitely. The service's entry point is
+    bounded by ``settings.RATING_SWEEP_SCAN_LIMIT``, walks a cursor so no
+    record starves behind a run of not-yet-due ones, and absorbs a failed
+    record at the severity its cause deserves before continuing.
+
+    Correctness does not depend on this task running, and that is
+    deliberate: no task in this codebase is ever dispatched, there is no
+    ``.delay()``/``apply_async`` call anywhere and no broker is
+    provisioned, so ``app/services/rating.py`` publishes opportunistically
+    on the read paths instead. This task is the conventional home for the
+    sweep, not its guarantee.
+
+    Named ``publish_expired_rating_window`` rather than after the service
+    function it calls, so the task and the service entry point remain
+    distinguishable in a traceback and in a schedule.
 
     Returns:
-        The IDs of the ratings this pass published, in the order they
-        were published. Empty when nothing was due.
+        How many ratings this pass published. Zero when nothing was due.
+        The service reports the IDs it moved; this returns the count,
+        because a task result is stored by the broker and a number is the
+        useful, bounded form of it. The IDs are logged rather than
+        returned.
     """
-    # Window-expiry half of the double-blind publication model. It is
-    # deliberately NOT what the feature's correctness depends on: no task
-    # in this codebase is ever dispatched, no .delay()/apply_async call
-    # exists anywhere, CELERY_BROKER_URL is absent from settings and no
-    # broker is provisioned, so this task cannot run as things stand.
-    # services/rating.py publishes opportunistically on read instead;
-    # this task is the conventional home for the sweep, not its guarantee.
-    published: List[str] = []
+    published = publish_expired_ratings()
+    logger.info(
+        'Scheduled rating window sweep published %d rating(s): %s',
+        len(published),
+        ', '.join(published) if published else 'none',
+    )
+    return len(published)
 
-    # One equality filter and nothing else. The two composite indexes
-    # declared for `ratings` are prefixed by ratee_id and by
-    # transaction_id, so neither can serve a collection-wide sweep, and a
-    # second filter or an order_by here would need an index that is not
-    # declared - which fails outright at runtime rather than degrading.
-    # This shape is served by the automatic single-field index.
-    unpublished_ratings = db.collection('ratings').where(
-        'is_published', '==', False
-    ).get()
-
-    for snapshot in unpublished_ratings:
-        # The document ID is the authority, never a stored `id`: it IS
-        # the deterministic natural key the uniqueness guarantee rests
-        # on. Injected the way api/transactions.py does it, because the
-        # service trusts only this field and re-reads everything else
-        # under its own lock.
-        rating = snapshot.to_dict() or {}
-        rating['id'] = snapshot.id
-
-        # Delegation, not duplication: publish_if_window_elapsed owns
-        # the deadline comparison against settings.RATING_WINDOW_DAYS
-        # and the transaction that flips is_published and moves the
-        # deferred aggregate together. It is idempotent, so a rating
-        # already published is skipped rather than counted twice, and
-        # publication turns on window expiry alone.
-        if publish_if_window_elapsed(rating):
-            published.append(snapshot.id)
-
-    return published
 
 # Helper functions (to be implemented)
 def aggregate_photo_results(results):

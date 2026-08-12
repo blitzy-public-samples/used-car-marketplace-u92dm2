@@ -18,16 +18,27 @@ jobs:
       with:
         node-version: '14.x'
 
+    # Every npm step runs from frontend/, because that is where
+    # package.json, package-lock.json and every tool configuration live.
+    # Run from the repository root - where there is no package manifest at
+    # all - `npm ci` exits before installing anything and each later step
+    # fails for the same reason.
     - name: Install dependencies
+      working-directory: frontend
       run: npm ci
 
     - name: Run linting
+      working-directory: frontend
       run: npm run lint
 
+    # `--run` because `npm test` is `vitest`, which WATCHES by default and
+    # would never return on a CI runner.
     - name: Run unit tests
-      run: npm test
+      working-directory: frontend
+      run: npm test -- --run
 
     - name: Build application
+      working-directory: frontend
       run: npm run build
 
     - name: Deploy to staging

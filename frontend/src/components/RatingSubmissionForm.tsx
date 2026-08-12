@@ -1,10 +1,25 @@
-import React, { useEffect, useId, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { ZodError } from 'zod';
 
 import StarRatingInput from './StarRatingInput';
-import { fetchRatingEligibility, submitRating } from '../services/rating';
-import { sanitizeUserInput, validateRatingInput } from '../utils/validation';
-import { RATING_MAX, RATING_MIN, REVIEW_MAX_LENGTH } from '../schema/rating';
+import {
+  CONTRACT_ERROR_MESSAGE,
+  RatingContractError,
+  describeRequestFailure,
+  fetchRatingEligibility,
+  readServerDetail,
+  submitRating,
+} from '../services/rating';
+import { validateRatingInput } from '../utils/validation';
+
+import {
+  RATING_MAX,
+  RATING_MIN,
+  REVIEW_MAX_LENGTH,
+  normalizeReviewText,
+  textLength
+
+} from '../schema/rating';
 import type { EligibilityDecision, Rating } from '../schema/rating';
 
 /**
@@ -173,46 +188,62 @@ const UNAVAILABLE_MESSAGE = 'You cannot rate this transaction right now.';
  * renders, which is the whole reason this helper exists rather than a table of
  * locally invented copy keyed by status code.
  *
- * WHY THE NARROWING IS WRITTEN OUT BY HAND
+ * THE READING ITSELF BELONGS TO `../services/rating`, VIA `readServerDetail`.
+ * Two reasons, and the second is the one that bit. First, one owner: the service
+ * already needs the same extraction to build its sanitised log line, and two
+ * hand-rolled readers of one wire shape drift apart. Second, FastAPI emits `detail`
+ * in TWO shapes and a local reader only ever handled one. A refusal raised by the
+ * router is a string; a request Pydantic rejected before any handler ran is an
+ * ARRAY of issue objects — `[{loc, msg, type}]` — because the backend registers no
+ * custom `RequestValidationError` handler. Reading only the string case meant every
+ * 422 degraded to axios's own "Request failed with status code 422", so a score
+ * outside the scale or an over-long review told the user nothing about what to
+ * change. `readServerDetail` handles both and reports the issue messages.
+ *
+ * What remains here is the FALLBACK ORDER, which is a presentation decision and so
+ * belongs to the component: the server's words first, then the error's own message
+ * — which for a `RatingContractError` or a transport failure is genuinely
+ * informative and names the endpoint — and only then the generic copy.
+ *
+ * WHAT IS DELIBERATELY NOT RENDERED: AN ARBITRARY `error.message`
  * -----------------------------------------------------------------------------
- * `tsconfig.json` sets `strict: true`, so under TypeScript 5.1 a `catch` binding
- * is `unknown` and the shape has to be proven before it can be read. The obvious
- * shortcut — casting the error to the unchecked escape-hatch type and reading
- * `response.data.detail` off it — is rejected by this project's lint gate
- * (`@typescript-eslint/no-explicit-any`, fatal under `--max-warnings 0`), and
- * importing axios purely for `isAxiosError` would add a dependency this
- * component otherwise does not need.
+ * This used to fall back to `error.message` for any `Error`, reasoning that it
+ * was "more informative than the generic fallback". It was more informative to a
+ * developer and worse for everyone else, because the messages that reach that
+ * branch are internal: a `RatingContractError` message once carried an endpoint
+ * label and a `ZodError` issue list, and an axios transport failure carries
+ * strings like `"Request failed with status code 500"` or `"Network Error"`.
+ * Rendering those put the shape of the API on screen in front of somebody who was
+ * rating a car, and told them nothing they could do about it.
  *
- * So the property is proven present with `in`, then read through a narrow
- * structural assertion that describes only the path being walked, with every
- * level optional and the leaf typed `unknown`. The `typeof detail === 'string'`
- * test is what actually admits the value; the assertion merely gets the compiler
- * to the point where that test can be applied.
+ * So there are now exactly three outcomes, in order of who authored the words:
  *
- * The empty-string guard matters: a `detail` of `''` is present but says
- * nothing, and rendering it would leave a visibly blank error region.
+ * 1. The server's `detail`, which is prose written for a user and is the only
+ *    message that can explain a specific refusal — "Only verified users can
+ *    submit ratings", "You have already rated this transaction".
+ * 2. `CONTRACT_ERROR_MESSAGE` for a `RatingContractError`, which is a real defect
+ *    but not one a user can act on beyond retrying. The endpoint and the schema
+ *    detail stay on the error's `diagnostics` and in the developer console.
+ * 3. The caller's stable fallback for everything else, including any transport
+ *    failure.
  *
  * @param error The rejection value, of genuinely unknown shape.
- * @param fallback Returned when no usable message can be found.
- * @returns The server's message, else the error's own message, else `fallback`.
+ * @param fallback Returned when no user-facing message can be found.
+ * @returns The server's message, else a stable user-facing sentence.
  */
 const extractDetail = (error: unknown, fallback: string): string => {
-  if (typeof error === 'object' && error !== null && 'response' in error) {
-    const { response } = error as {
-      response?: { data?: { detail?: unknown } };
-    };
-    const detail = response?.data?.detail;
+  const detail = readServerDetail(error);
 
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail;
-    }
+  if (detail !== null) {
+    return detail;
   }
 
-  // A transport failure, or a 2xx response that did not match the contract
-  // (`../services/rating` throws for that case), carries a real message but no
-  // HTTP body. It is still more informative than the generic fallback.
-  if (error instanceof Error && error.message.length > 0) {
-    return error.message;
+  // A 2xx response that did not match the contract. The constant is used rather
+  // than `error.message` even though they are equal today, so that this
+  // component's rendering does not silently start displaying internals again if
+  // that message is ever made specific for developers.
+  if (error instanceof RatingContractError) {
+    return CONTRACT_ERROR_MESSAGE;
   }
 
   return fallback;
@@ -228,16 +259,19 @@ const extractDetail = (error: unknown, fallback: string): string => {
  * so it can never contradict the schema that produced the failure or the
  * character counter rendered beside the textarea.
  *
- * The review case is the one worth explaining, because it can fire on a review
- * that the counter showed as within the limit. Text is sanitised before it is
- * validated, and sanitising can LENGTHEN a string — `5 < 6` becomes `5 &lt; 6` —
- * so a review at the very edge of the bound can cross it once it has been made
- * safe to display. The bound then applies to the text that would actually be
- * stored, which is the correct place to apply it, and the message says "once it
- * has been prepared for display" rather than accusing the user of miscounting.
+ * The review case is a BACKSTOP rather than an expected path, and it is worth
+ * saying why. The bound is applied to the sanitised text — the value that is
+ * actually sent and stored — and sanitising to plain text can only ever shorten a
+ * string, so a review the counter showed as within the limit cannot be refused
+ * here for length. The branch is kept because a programmatic value change can
+ * still reach the submit handler, and because a schema failure should never fall
+ * through to a message about something else.
  *
- * Zod's own message is the last resort rather than the first, and the unstyled
- * `error.message` — a JSON dump of every issue — is never rendered.
+ * Zod's own wording is never rendered at all, and neither is the unstyled
+ * `error.message`, which is a JSON dump of every issue. Every field this schema
+ * declares has copy of its own below, and anything outside that set is an
+ * internal divergence answered with the stable fallback rather than with a
+ * sentence written for a developer.
  *
  * @param error The validation failure raised while building the payload.
  * @returns One sentence naming what to change.
@@ -256,14 +290,20 @@ const describeValidationFailure = (error: ZodError): string => {
   }
 
   if (field === 'review') {
-    return `Your review must be ${REVIEW_MAX_LENGTH} characters or fewer once it has been prepared for display. Please shorten it.`;
+    return `Your review must be ${REVIEW_MAX_LENGTH} characters or fewer. Please shorten it.`;
   }
 
   if (field === 'transactionId') {
     return 'This transaction cannot be rated because its reference is not valid.';
   }
 
-  return issue.message.length > 0 ? issue.message : SUBMISSION_FAILURE_MESSAGE;
+  // Unreachable for a well-formed payload: the three branches above cover every
+  // field `RatingCreateSchema` declares. So arriving here means the schema and
+  // this component have diverged, which is an internal defect - and `issue.message`
+  // for an unexpected path is Zod's own developer wording ("Expected date,
+  // received string"). The stable sentence is shown instead, and the issue paths
+  // reach the developer console through `describeSubmissionForLog`.
+  return SUBMISSION_FAILURE_MESSAGE;
 };
 
 /**
@@ -279,6 +319,35 @@ const describeSubmissionFailure = (error: unknown): string =>
     : extractDetail(error, SUBMISSION_FAILURE_MESSAGE);
 
 /**
+ * Reduce a submission failure to what is safe AND useful to log.
+ *
+ * Two kinds of failure reach the submit handler's `catch`, and they need
+ * different log records rather than one compromise.
+ *
+ * A `ZodError` was raised by `validateRatingInput` before any request was made,
+ * so there is no axios `config` to redact and no request metadata to report; what
+ * a developer needs is which field was refused. Only the issue PATH and CODE are
+ * recorded — never `issue.message` and never the offending value — so a review
+ * body cannot be copied into a log by a validation failure.
+ *
+ * Everything else did reach the network and arrives as an axios error carrying
+ * the bearer token in `config.headers` and the request body in `config.data`, so
+ * it goes through the client's own `describeRequestFailure` allow-list.
+ *
+ * @param error The rejection value from the submit handler.
+ * @returns A flat record of primitives, safe to pass to a log sink.
+ */
+const describeSubmissionForLog = (error: unknown): Record<string, unknown> =>
+  error instanceof ZodError
+    ? {
+        validation: error.issues.map((issue) => ({
+          path: issue.path.join('.'),
+          code: issue.code,
+        })),
+      }
+    : describeRequestFailure(error);
+
+/**
  * The one piece of copy for an over-long review, in one place.
  *
  * Defined once because it is rendered from two independent triggers — reactively
@@ -289,11 +358,12 @@ const describeSubmissionFailure = (error: unknown): string =>
  * The actual length is quoted rather than only the limit, because "your review is
  * 2001 characters" tells the reader how much to cut while "too long" does not.
  *
- * @param length The current review length, in characters.
+ * @param length The current review length in characters, measured after
+ *   normalisation — the same figure the counter shows.
  * @returns One sentence naming the overage and the bound.
  */
 const describeOverLengthReview = (length: number): string =>
-  `Your review is ${length} characters. Shorten it to ${REVIEW_MAX_LENGTH} characters or fewer before submitting.`;
+  `Your review is ${length} characters once formatting is removed. Shorten it to ${REVIEW_MAX_LENGTH} characters or fewer before submitting.`;
 
 /**
  * Name the counterparty's ROLE from the server's decision, for display only.
@@ -375,6 +445,16 @@ const TEXTAREA_CLASSES = [
  * to a flat neutral: inactive controls are exempt from the contrast minimums,
  * and pairing it with `cursor-not-allowed` gives two independent signals.
  *
+ * FOUR INTERACTIVE STATES, NOT THREE. `hover:` says "this is interactive",
+ * `focus:` says "you are here", `disabled:` says "not now" — and `active:` says
+ * "your press registered". That last one is the feedback a pointer user gets
+ * between pressing and the request starting, and without it a slow submit feels
+ * like a button that did nothing. `blue-800` is a step darker than the hover tone
+ * so the two are distinguishable, and Tailwind emits `active` after `hover` so
+ * the pressed tone wins while the pointer is down. `disabled:hover:bg-gray-400`
+ * keeps the disabled treatment authoritative; `:active` cannot apply to a
+ * disabled button at all, so no `disabled:active:` override is needed.
+ *
  * `motion-safe:` scopes the colour transition to
  * `@media (prefers-reduced-motion: no-preference)`, so a reader who has asked
  * for reduced motion gets an instant change instead.
@@ -382,9 +462,29 @@ const TEXTAREA_CLASSES = [
 const BUTTON_CLASSES = [
   'inline-flex items-center justify-center rounded-md',
   'bg-blue-600 px-4 py-2 text-base font-semibold text-white shadow-sm',
-  'hover:bg-blue-700',
+  'hover:bg-blue-700 active:bg-blue-800',
   'focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-600',
   'disabled:cursor-not-allowed disabled:bg-gray-400 disabled:hover:bg-gray-400',
+  'motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out',
+].join(' ');
+
+/**
+ * Classes for the "Check again" button that appears when the eligibility request
+ * itself failed.
+ *
+ * A secondary treatment — bordered rather than filled — so it reads as a recovery
+ * action beside the primary submit control rather than competing with it. The
+ * border is `blue-600` for the same 3:1 non-text-contrast reason the textarea's
+ * border is `gray-500`, and it carries the same four interactive states as the
+ * submit button, including the `active:` pressed tone.
+ */
+const RETRY_BUTTON_CLASSES = [
+  'inline-flex items-center justify-center self-start rounded-md',
+  'border border-blue-600 px-3 py-1.5 text-sm font-semibold text-blue-700',
+  'hover:bg-blue-50 active:bg-blue-100',
+  'focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-600',
+  'disabled:cursor-not-allowed disabled:border-gray-400 disabled:text-gray-500',
+  'disabled:hover:bg-transparent',
   'motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out',
 ].join(' ');
 
@@ -429,6 +529,22 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   /**
+   * Whether the eligibility REQUEST failed, as opposed to succeeding with an
+   * ineligible decision.
+   *
+   * Tracked separately because the two demand different affordances, and
+   * conflating them is what made a transient network failure permanent. An
+   * ineligible decision is an answer: the server has told the user why, and
+   * asking again will say the same thing. A failed request is the absence of an
+   * answer — a timeout, a 5xx, a dropped connection — and the only useful
+   * response is to try once more. Without this flag the form could not tell which
+   * state it was in, so it offered no retry and left every control disabled
+   * forever; the reader was told "we could not check" and given no way to act on
+   * it, which is the WCAG failure this component exists to avoid.
+   */
+  const [eligibilityFailed, setEligibilityFailed] = useState(false);
+
+  /**
    * One generated base, suffixed per element.
    *
    * `useId` rather than a hardcoded string because two of these forms can share
@@ -441,56 +557,106 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   const counterId = `${baseId}-counter`;
   const statusId = `${baseId}-status`;
 
-  useEffect(() => {
-    /**
-     * Guards against a state update after unmount, and against a slow response
-     * for a previous `transactionId` overwriting a newer one. Flipped by the
-     * cleanup below, which React runs both on unmount and before re-running the
-     * effect for a changed id.
-     */
-    let active = true;
+  /**
+   * Sequence number of the most recently STARTED eligibility request.
+   *
+   * A boolean `active` flag scoped to the effect was enough while the effect was
+   * the only thing that could issue this request. It is not enough now that a
+   * retry button can issue one too: two in-flight requests would both believe
+   * they were current, and the slower one — quite possibly the one for the
+   * previous `transactionId`, or the failure the user just retried past — would
+   * land last and win. A monotonic counter gives every request an identity, and a
+   * response is applied only while its own number is still the latest. The
+   * effect's cleanup bumps the counter, so an unmount or a changed id invalidates
+   * everything already in flight and no state is set after unmount.
+   */
+  const eligibilityRequestRef = useRef(0);
 
+  /**
+   * Ask the server whether this caller may rate this transaction.
+   *
+   * Used for the initial load and for every retry, deliberately the same
+   * function: a retry that differed from the first attempt in any way would be a
+   * second code path to keep correct.
+   */
+  const loadEligibility = useCallback(async () => {
+    const requestId = eligibilityRequestRef.current + 1;
+    eligibilityRequestRef.current = requestId;
+
+    const isCurrent = () => eligibilityRequestRef.current === requestId;
+
+    setIsLoadingEligibility(true);
+    setErrorMessage(null);
+
+    try {
+      const decision = await fetchRatingEligibility(transactionId);
+
+      if (isCurrent()) {
+        setEligibility(decision);
+        /*
+         * Cleared HERE, on success, and deliberately not at the start of the
+         * request. Clearing it up front looks tidier and silently breaks the
+         * retry control: `eligibilityFailed` is what mounts that button, so
+         * setting it false in the same batched update that sets the loading flag
+         * unmounts the button for the whole duration of the retry — its
+         * "Checking..." label and its `disabled` prop become unreachable dead
+         * code, and the user watches the control disappear instead of watching it
+         * work. Keeping the flag until an answer arrives means the button stays
+         * put, disabled and labelled, and vanishes only once there is genuinely
+         * nothing left to retry.
+         */
+        setEligibilityFailed(false);
+      }
+    } catch (error) {
+      // Sanitised: `describeRequestFailure` emits the endpoint, the status or
+      // transport code and the server's detail, and never the axios error
+      // object, whose `config` carries the bearer token this request was sent
+      // with.
+      console.error(
+        'Failed to fetch rating eligibility',
+        describeRequestFailure(error)
+      );
+
+      if (isCurrent()) {
+        setEligibilityFailed(true);
+        setErrorMessage(extractDetail(error, ELIGIBILITY_FAILURE_MESSAGE));
+      }
+    } finally {
+      // In `finally` so the controls leave their loading state on both paths.
+      // Only the success branch enables them; a failure leaves `eligibility`
+      // null, which keeps them disabled while the error explains why and the
+      // retry control offers a way out.
+      if (isCurrent()) {
+        setIsLoadingEligibility(false);
+      }
+    }
+  }, [transactionId]);
+
+  useEffect(() => {
     // A different transaction is a different rating, so nothing from the
     // previous one may survive: a stale confirmation or a stale reason shown
     // against the wrong transaction would be worse than showing nothing. Each
     // of these is already at its initial value on first mount, so React bails
     // out of the re-render and this costs nothing in the common case.
-    setIsLoadingEligibility(true);
     setEligibility(null);
     setSubmittedRating(null);
-    setErrorMessage(null);
     setScore(null);
     setReview('');
+    // A new transaction starts from "no failure yet", so the retry control does
+    // not carry over from the previous one. `loadEligibility` no longer clears
+    // this flag itself — see the note there — so the reset belongs here, where
+    // per-transaction state is reset anyway.
+    setEligibilityFailed(false);
 
-    const loadEligibility = async () => {
-      try {
-        const decision = await fetchRatingEligibility(transactionId);
-
-        if (active) {
-          setEligibility(decision);
-        }
-      } catch (error) {
-        console.error('Failed to fetch rating eligibility:', error);
-
-        if (active) {
-          setErrorMessage(extractDetail(error, ELIGIBILITY_FAILURE_MESSAGE));
-        }
-      } finally {
-        // In `finally` so the controls leave their loading state on both paths.
-        // Only the success branch enables them; a failure leaves `eligibility`
-        // null, which keeps them disabled while the error explains why.
-        if (active) {
-          setIsLoadingEligibility(false);
-        }
-      }
-    };
 
     loadEligibility();
 
     return () => {
-      active = false;
+      // Invalidates whatever is in flight, so a late response cannot set state
+      // after unmount or against a newer transaction.
+      eligibilityRequestRef.current += 1;
     };
-  }, [transactionId]);
+  }, [transactionId, loadEligibility]);
 
   const isEligible = eligibility !== null && eligibility.eligible;
   const hasSubmitted = submittedRating !== null;
@@ -517,7 +683,28 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * The handler still re-checks both. A form can be submitted by pressing Enter
    * inside a text control, which does not consult the button at all.
    */
-  const isReviewOverLimit = review.length > REVIEW_MAX_LENGTH;
+  /**
+   * The review's length, measured exactly the way the server measures it.
+   *
+   * TWO steps, and both matter. `normalizeReviewText` is the schema's faithful
+   * port of the server's normaliser, so nothing the server strips - decomposed
+   * (NFD) Unicode from macOS and iOS, CRLF line endings, zero-width characters,
+   * runs of blank lines - is charged to the author; measuring the raw text
+   * instead made this form refuse submissions the server would have accepted,
+   * and a reviewer writing with diacritics lost roughly half of a stated 2000
+   * characters. `textLength` then counts CODE POINTS rather than UTF-16 code
+   * units, because `String.length` is wrong for exactly the text people write:
+   * every emoji is one code point stored as a surrogate pair, so a counter using
+   * `.length` would tell someone who wrote 1200 emoji they had used 2400 of
+   * their 2000 characters.
+   *
+   * `RatingCreateSchema` applies the same two steps in the same order, so this
+   * flag, the counter, the reactive over-limit message and the submit guard all
+   * measure one string.
+   */
+  const reviewLength = textLength(normalizeReviewText(review));
+
+  const isReviewOverLimit = reviewLength > REVIEW_MAX_LENGTH;
 
   const canSubmit =
     isEligible &&
@@ -579,15 +766,17 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     }
 
     /**
-     * Measured on the RAW text, which is exactly what the counter displays, so
-     * the two can never disagree about whether the review is too long. The
-     * textarea's `maxLength` stops this being reachable by typing, but it does
-     * not constrain a programmatic value change, so the check is real rather
-     * than defensive decoration. Returning here means the request is never
-     * sent: a refusal this local should not cost a round trip.
+     * Measured on the NORMALISED text, which is exactly what the counter
+     * displays and exactly what `RatingCreateSchema` and the server bound, so
+     * none of the four can disagree about whether the review is too long. The
+     * textarea's `maxLength` caps the RAW text at a much larger ceiling, so this
+     * is the real gate rather than defensive decoration. Returning here means
+     * the request is never sent: a refusal this local should not cost a round
+     * trip.
+
      *
      * It deliberately stores NOTHING. The message is already on screen, derived
-     * from `review.length` by `alertMessage`, and storing a second copy is what
+     * from `reviewLength` by `alertMessage`, and storing a second copy is what
      * makes it go stale: a stored "your review is 2001 characters" survives the
      * user fixing the review and then sits, visibly false, above a counter
      * reading "6 / 2000". Derived state cannot rot, so the derivation is left as
@@ -603,39 +792,88 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       const trimmed = review.trim();
 
       /**
-       * Sanitised before it goes anywhere, satisfying the DOMPurify obligation
-       * in `documentation/Technical Specifications.md` L676-L679. Doing it here
-       * as well as inside `validateRatingInput` is intentional belt and braces
-       * rather than an oversight: DOMPurify is idempotent, so the second pass
-       * cannot corrupt the first, and the reviewable guarantee is that no path
-       * out of this component forwards unsanitised free text.
+       * The review is forwarded as the user typed it, trimmed, and is sanitised
+       * by `validateRatingInput` — which now sanitises BEFORE it validates, so
+       * the value the schema approves is the value that goes on the wire.
+       * Sanitising here as well would be worse than redundant: it would make this
+       * component a second owner of the content policy, and the double pass would
+       * have to be reasoned about every time that policy changed. The reviewable
+       * guarantee is unchanged and structural — the submitted payload is the
+       * value `validateRatingInput` returns, so no path out of this component can
+       * forward unsanitised free text.
        *
        * Omitted entirely when there is nothing to say. `review` is optional on
        * the wire, so an empty string would send a present-but-blank review
        * where the correct statement is that no review was written.
        */
-      const safeReview =
-        trimmed.length > 0 ? sanitizeUserInput(trimmed) : undefined;
-
-      /**
-       * The returned value is what gets submitted, never the raw object built
-       * above. The schema strips unrecognised keys, so it is also the last
-       * structural guarantee that no `raterId`, `rateeId` or `direction` can
-       * reach the wire from here.
-       */
       const payload = validateRatingInput({
         transactionId,
         score,
-        review: safeReview,
+        review: trimmed.length > 0 ? trimmed : undefined,
       });
 
       const created = await submitRating(payload);
 
+      /**
+       * The rating is persisted. Commit the success state BEFORE telling anyone
+       * else about it, and never inside the same `try` as the request.
+       *
+       * `onSubmitted` belongs to the parent screen, which typically re-reads an
+       * eligibility decision or a reputation aggregate from the network. Those
+       * reads can fail — and when the callback ran inside this `try`, their
+       * failure was caught by the handler for the SUBMISSION and reported as
+       * "Your rating could not be submitted", above a form that then invited the
+       * user to submit again. The rating had been created; a second attempt would
+       * have been refused with a 409, because one rating per rater per transaction
+       * is enforced by the datastore. So the user was told a truthful action had
+       * failed and offered a remedy that could only fail too.
+       *
+       * The callback is therefore isolated in its own `try`. Its failure is a
+       * defect in the parent's refresh, so it is logged for a developer and not
+       * shown to the user: the thing the user asked for succeeded, and the state
+       * this component renders — `submittedRating` — already says so.
+       */
       setSubmittedRating(created);
-      onSubmitted?.(created);
+
+      try {
+        /*
+         * The prop is declared to return `void`, but TypeScript admits an
+         * `async` function wherever a `void`-returning one is expected — and a
+         * parent whose refresh is a network read will very likely write one. An
+         * unawaited rejection escapes a surrounding `try` entirely and surfaces
+         * as an unhandled promise rejection, so a returned promise is caught
+         * explicitly rather than assumed absent. It is deliberately not awaited:
+         * the submission is complete and this component must not keep the submit
+         * button disabled while somebody else's refresh finishes.
+         */
+        const settled: unknown = onSubmitted?.(created);
+
+        if (settled instanceof Promise) {
+          settled.catch((callbackError: unknown) => {
+            console.error(
+              'A rating was submitted but the parent refresh failed',
+              describeSubmissionForLog(callbackError),
+            );
+          });
+        }
+      } catch (callbackError) {
+        console.error(
+          'A rating was submitted but the parent refresh failed',
+          describeSubmissionForLog(callbackError),
+        );
+      }
     } catch (error) {
-      console.error('Failed to submit rating:', error);
+      // Scrubbed record only, for the same reason as the eligibility load above:
+      // the bearer token is on the axios error's `config.headers` and the request
+      // body is on `config.data`, so the error object itself must never be
+      // written down. A local `ZodError` is reported as field paths instead -
+      // see `describeSubmissionForLog`.
+      console.error('Failed to submit rating', describeSubmissionForLog(error));
+
+
       setErrorMessage(describeSubmissionFailure(error));
+
+      return;
     } finally {
       // In `finally` so a failure re-enables the button for another attempt.
       setIsSubmitting(false);
@@ -669,12 +907,25 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
      * quoted: the window is a server setting (`RATING_WINDOW_DAYS`) that is not
      * published to this client, and a hardcoded figure would be free to drift
      * away from the real one.
+     *
+     * The two reveal paths are stated as two paths, because they do not have the
+     * same outcome. This used to promise that "both ratings become visible
+     * together" — true of the reciprocal path, where the counterparty's
+     * submission publishes both records atomically, and false of the other one:
+     * when the window closes on an unanswered rating, only this rating is
+     * published, and there is no second rating to reveal. A user who was told to
+     * expect the counterparty's rating and then found their own published alone
+     * would reasonably conclude the other side had been suppressed. So the
+     * sentence names what happens in each case instead of describing one case as
+     * though it were both.
+
      */
     const recorded = `Your ${submittedRating.score}-star rating has been recorded.`;
 
     statusMessage = submittedRating.isPublished
       ? `${recorded} It is now visible on their profile.`
-      : `${recorded} It stays private until the other party submits their rating or the rating window closes, and then both ratings become visible together.`;
+      : `${recorded} It stays private for now. If the other party rates you too, both ratings become visible at the same time; if they never do, yours becomes visible on its own once the rating window closes.`;
+
   } else if (isLoadingEligibility) {
     statusMessage = 'Checking whether you can rate this transaction...';
   } else if (eligibility !== null && !eligibility.eligible) {
@@ -719,7 +970,7 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * as it stands right now.
    */
   const alertMessage = isReviewOverLimit
-    ? describeOverLengthReview(review.length)
+    ? describeOverLengthReview(reviewLength)
     : errorMessage ?? '';
 
   const counterpartyLabel = describeCounterparty(eligibility);
@@ -742,12 +993,20 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
         confirmation. Someone deciding how candid to be deserves to know before
         they write that the other side cannot read it and retaliate.
 
+        The wording is precise about WHO cannot see it and about the two reveal
+        paths, because the earlier "shown to anyone ... until the other one
+        arrives or the rating window closes" was wrong twice over: the author can
+        always retrieve their own rating, and an expiring window reveals only the
+        one rating that exists rather than a pair.
+
         Deliberately NOT inside a live region: it never changes, and a static
         sentence in a live region is announced again on every unrelated update.
       */}
       <p className="mt-1 text-sm text-gray-600">
-        Both sides of a completed sale rate each other. Neither rating is shown
-        to anyone until the other one arrives or the rating window closes.
+        Both sides of a completed sale rate each other. Yours stays hidden from
+        the other party, and off their public profile, until they submit theirs —
+        then both are revealed together. If they never submit one, yours is
+        revealed on its own when the rating window closes.
       </p>
 
       {counterpartyLabel.length > 0 ? (
@@ -783,6 +1042,36 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       <p role="alert" className="mt-1 text-sm font-semibold text-red-700">
         {alertMessage}
       </p>
+
+      {/*
+        The way out of a failed eligibility CHECK.
+
+        Rendered only when the request itself failed — never when the server
+        answered that the caller is ineligible, because that answer will not change
+        on a second ask and offering to re-ask would imply otherwise. A failed
+        check is the opposite case: the form knows nothing, every control is
+        disabled, and without this button that state is permanent for as long as
+        the screen stays mounted. A network blip would cost the user their ability
+        to rate at all.
+
+        A real `<button type="button">`, so it is reachable by Tab, operated by
+        Enter and Space, and reported as a button — and typed `button` explicitly
+        because it sits inside a `<section>` that also contains a form. Its label
+        changes while a check is in flight, which is the accessible half of its
+        disabled state: a control that only greys out reports nothing about why.
+        The adjacent assertive region already carries the reason it appeared, so
+        the button needs no `aria-describedby` of its own.
+      */}
+      {eligibilityFailed && !hasSubmitted ? (
+        <button
+          type="button"
+          onClick={loadEligibility}
+          disabled={isLoadingEligibility}
+          className={`mt-3 ${RETRY_BUTTON_CLASSES}`}
+        >
+          {isLoadingEligibility ? 'Checking...' : 'Check again'}
+        </button>
+      ) : null}
 
       {/*
         The controls are gone once a rating exists, and nothing replaces them.
@@ -823,11 +1112,17 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
               onChange={handleReviewChange}
               disabled={controlsDisabled}
               /*
-               * First line of defence only. It stops typing past the bound, but
-               * it does not constrain a programmatic value change, so the
-               * explicit check in the submit handler is the real gate.
+               * NO `maxLength`. The attribute counts UTF-16 code units, so it
+               * cannot express the server's bound of 2000 NFC-composed code
+               * points: it would stop someone writing emoji at half the real
+               * limit, silently, mid-word, with the counter beside it still
+               * reading under the limit — a client-side rule quietly refusing
+               * text the server would accept. The bound is carried instead by the
+               * counter below, by the reactive over-limit message, by the submit
+               * button's disabled state and by the explicit check in the submit
+               * handler, all of which measure with `textLength`.
                */
-              maxLength={REVIEW_MAX_LENGTH}
+
               /*
                * `rows` rather than a CSS height so the field grows with the
                * reader's font size instead of clipping its own text.
@@ -848,7 +1143,7 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
               field unusable with a screen reader.
             */}
             <p id={counterId} className={counterClasses}>
-              {`${review.length} / ${REVIEW_MAX_LENGTH} characters`}
+              {`${reviewLength} / ${REVIEW_MAX_LENGTH} characters`}
               {isReviewOverLimit ? ' (over the limit)' : ''}
             </p>
           </div>
@@ -875,4 +1170,3 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
 };
 
 export default RatingSubmissionForm;
-

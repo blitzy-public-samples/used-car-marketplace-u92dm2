@@ -1,13 +1,34 @@
 import axios, { AxiosInstance } from 'axios';
-import { getAuthToken } from 'app/utils/auth';
+/*
+ * The bearer token comes from `./rating`, which owns the project's single
+ * reader. This module previously imported `getAuthToken` from
+ * `app/utils/auth` — a module that does not exist, since `src/app` is not a
+ * directory in this project — so the import was an unresolvable specifier that
+ * made this entire module fail to type-check and, after `npm ci`, fail to load.
+ * Every method here was unreachable as a result, including the three that
+ * predate the rating feature.
+ *
+ * Creating `app/utils/auth` was not the fix: it is explicitly out of scope, and
+ * inventing a module to satisfy a broken import adds a file whose only purpose
+ * is to have been imported. Re-implementing the reader here was also rejected —
+ * two copies of "where the token lives" drift the moment the storage key or its
+ * guards change. So this module delegates to `./rating`, which it already
+ * imports for the mappers below, and which reads the token from the key
+ * `./auth` writes on login.
+ *
+ * `describeRequestFailure` comes from the same place and for the same reason. It
+ * is the project's one answer to "what of a failed request is safe to write to a
+ * log", and the answer has to be one answer: a per-module judgement about whether
+ * an error object still has a bearer token on it only has to be got wrong once.
+ */
 import {
-  toEligibilityDecision,
-  toRating,
-  toRatingCreateWire,
-  toUserRatingsResponse,
-  type EligibilityDecisionWire,
-  type RatingWire,
-  type UserRatingsResponseWire
+  describeRequestFailure,
+  fetchRatingEligibility as fetchRatingEligibilityRequest,
+  fetchUserRatings as fetchUserRatingsRequest,
+  fetchUserReputation as fetchUserReputationRequest,
+  readAuthToken,
+  submitRating as submitRatingRequest
+
 } from './rating';
 import type {
   EligibilityDecision,
@@ -17,15 +38,91 @@ import type {
   UserRatingsResponse
 } from '../schema/rating';
 
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+const RAW_API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+
+/**
+ * Resolve the base URL for every call in this module, refusing an unusable value.
+ *
+ * axios accepts `undefined` or `''` as a `baseURL` and then routes every path
+ * relative to whatever origin served the page, so an unset variable does not
+ * produce an error — it produces requests that quietly go somewhere else. Under
+ * the dev server that "somewhere else" answers with the SPA's index document and
+ * a 200, so a caller sees a successful response whose body is HTML and fails much
+ * later, somewhere unrelated. Refusing here names the cause once, at the first
+ * call.
+ *
+ * Mirrors `resolveApiBaseUrl` in `./rating`, which validates the same variable for
+ * the rating endpoints. The shape is replicated rather than shared because this
+ * module already imports the wire mappers FROM `./rating`, so importing a helper
+ * back would close a cycle between the two.
+ *
+ * The trailing slash is trimmed, not rejected: every path below starts with `/`,
+ * and a hand-written value ending in `/` is the commonest way this variable is
+ * written.
+ *
+ * @returns The base URL, without a trailing slash.
+ * @throws {Error} The variable is unset, blank, or not an absolute http(s) URL.
+ */
+const resolveApiBaseUrl = (): string => {
+  const raw = (RAW_API_BASE_URL ?? '').trim();
+
+  if (raw === '') {
+    throw new Error(
+      'REACT_APP_API_BASE_URL is not set, so API requests have no server ' +
+        'to reach. Set it to the API root including its /api path, for ' +
+        'example http://localhost:8000/api',
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      'REACT_APP_API_BASE_URL must be an absolute URL including its ' +
+        'scheme, for example http://localhost:8000/api',
+    );
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      'REACT_APP_API_BASE_URL must use http or https, for example ' +
+        'http://localhost:8000/api',
+    );
+  }
+
+  return raw.replace(/\/+$/, '');
+};
+
 
 const createApiInstance = (): AxiosInstance => {
   const instance = axios.create({
-    baseURL: API_BASE_URL,
+    baseURL: resolveApiBaseUrl(),
   });
 
-  instance.interceptors.request.use(async (config) => {
-    const token = await getAuthToken();
+  /*
+   * Attach the bearer token to every outgoing request.
+   *
+   * The token is read through `readAuthToken` from `./rating`, which returns the
+   * value `./auth` stores under the `authToken` key on a successful login and
+   * tolerates every context in which browser storage is absent or throws. This
+   * module previously imported a `getAuthToken` from `app/utils/auth`, a module
+   * that does not exist — `src/app` is not a directory in this project — so the
+   * whole module, including all four rating methods below, could not be
+   * imported. Creating that module is out of scope, and duplicating the reader
+   * here would give the storage key a second spelling that could drift, so the
+   * one working helper is shared instead.
+   *
+   * Synchronous, because reading `localStorage` is. The previous `await` existed
+   * only because the missing helper was declared to return a promise; nothing
+   * about the request pipeline changes, since the header is still set before the
+   * config is handed on and an absent token still yields an unauthenticated
+   * request that the server answers with a 401 the caller can act on.
+   */
+
+  instance.interceptors.request.use((config) => {
+
+    const token = readAuthToken();
     if (token) {
       config.headers['Authorization'] = `Bearer ${token}`;
     }
@@ -37,7 +134,19 @@ const createApiInstance = (): AxiosInstance => {
     (error) => {
       // HUMAN ASSISTANCE NEEDED
       // Add more specific error handling based on your application's requirements
-      console.error('API request failed:', error);
+      //
+      // What is NOT outstanding here is the redaction. This used to log the raw
+      // error, which carries the `config` the request was made with — and the
+      // interceptor above has already written `Authorization: Bearer <token>`
+      // into those headers, so the token was being published to the browser
+      // console and to anything mirroring it (CWE-532). It also carried the
+      // request body and the response body. `describeRequestFailure` builds a
+      // fresh object from four primitives by allow-list instead, and it is
+      // shared with `./rating` so there is one answer to "what is safe to log"
+      // rather than one per module. The error is still rejected with in full,
+      // because the caller needs the status and the server's `detail`.
+      console.error('API request failed', describeRequestFailure(error));
+
       return Promise.reject(error);
     }
   );
@@ -81,68 +190,68 @@ export const uploadPhoto = async (photo: File): Promise<string> => {
  * through `fetchRatingEligibility`; they never make it, and a request this
  * module is willing to send may still legitimately be refused.
  *
- * BASE PATH: `REACT_APP_API_BASE_URL` IS EXPECTED TO INCLUDE `/api`
- * Every path below omits the `/api` segment, matching the three methods above,
- * which call `'/listings'` and `'/upload'` against a backend that mounts them
- * under `prefix='/api/listings'`. `REACT_APP_API_BASE_URL` must therefore
- * already carry the prefix — for example `http://localhost:8000/api` — and with
- * that base these paths resolve to the endpoints the ratings router declares
- * relative to its own `prefix='/api/ratings'`:
+ * EVERY ONE OF THEM DELEGATES TO `./rating`, AND THAT IS THE WHOLE DESIGN
+ * -----------------------------------------------------------------------------
+ * Each function below is a one-line call into the identically named function in
+ * `./rating`. Nothing here builds a request, interpolates a path, maps a wire
+ * shape or interprets a response, because `./rating` already does all four and
+ * doing them twice is how two copies of one contract drift apart.
  *
- *   POST /api/ratings                               submitRating
- *   GET  /api/ratings/user/{user_id}                 fetchUserRatings,
- *                                                    fetchUserReputation
- *   GET  /api/ratings/eligibility/{transaction_id}   fetchRatingEligibility
+ * These are not cosmetic wrappers, and the difference they remove is real. This
+ * module previously issued its own requests and called `./rating`'s mappers
+ * directly, WITHOUT the `decode` wrapper those mappers are normally used behind.
+ * So the same malformed response produced a `RatingContractError` naming the
+ * endpoint when a caller used `./rating`, and a bare `ZodError` or `TypeError`
+ * when the very same caller used this module — two different error types, and
+ * only one of them documented, for one failure. A caller cannot write a correct
+ * `catch` against that. Delegation makes both paths one path.
  *
- * `./rating` uses the identical convention on purpose: the two modules must
- * agree or one of them would 404 at run time. The ratings router declares its
- * paths relative to its prefix precisely to avoid the double-prefix defect the
- * other three routers carry (their `@router.post('/listings')` under
- * `prefix='/api/listings'` resolves to `/api/listings/listings`), so do NOT add
- * a second `ratings` segment here to "match" them.
+ * The four names are preserved because they are this module's published surface
+ * and existing screens import them from here. What changed is where the work
+ * happens, not what a caller may call.
  *
- * THE snake_case <-> camelCase BOUNDARY HAS ONE OWNER, AND IT IS `./rating`
- * The wire is snake_case because FastAPI serialises the Pydantic models as
- * declared, while `../schema/rating` is camelCase. Each request body is built by
- * a `to*Wire` mapper and each response adapted by a `to*` mapper imported from
- * `./rating`, which also converts the ISO-8601 strings the wire carries into the
- * real `Date` values the schemas declare. That mapping is deliberately NOT
- * reimplemented here — two copies of one boundary drift apart on the next field
- * rename — and every mapper validates against its own Zod schema internally, so
- * these methods return parsed, guaranteed-shaped data without repeating the
- * parse. Returning a raw `response.data` while claiming a camelCase return type
- * would be a silent lie that yields `undefined` at every call site.
+ * WHAT DELEGATION MEANS FOR THE THINGS THAT USED TO BE DOCUMENTED HERE
+ * -----------------------------------------------------------------------------
+ * All of it still holds, and all of it now has exactly one owner in `./rating`:
  *
- * Each interpolated path segment goes through `encodeURIComponent`: an ID
- * containing a `/` would otherwise be read as extra path structure and address a
- * different route entirely.
+ *   - PATHS. `REACT_APP_API_BASE_URL` is expected to include the `/api` prefix,
+ *     matching the three methods above which call `'/listings'` and `'/upload'`
+ *     against a backend that mounts them under `prefix='/api/listings'`. With
+ *     that base, `./rating`'s paths resolve to `POST /api/ratings`,
+ *     `GET /api/ratings/user/{user_id}` and
+ *     `GET /api/ratings/eligibility/{transaction_id}`. Every interpolated
+ *     segment is encoded there.
+ *   - THE snake_case <-> camelCase BOUNDARY. The wire is snake_case because
+ *     FastAPI serialises the Pydantic models as declared, while
+ *     `../schema/rating` is camelCase, and `./rating` owns the adaptation in both
+ *     directions — including the ISO-8601-to-`Date` conversion and the Zod
+ *     validation that makes the returned values trustworthy rather than merely
+ *     typed.
+ *   - AUTHENTICATION. `./rating` attaches the same bearer token from the same
+ *     storage key through its own request interceptor, so a delegated call is
+ *     authenticated exactly as a direct one is.
+ *   - ERRORS ARE NEVER SWALLOWED. No `try`/`catch` is added on either side of the
+ *     delegation, so a refusal keeps its status and its `detail`:
  *
- * ERRORS ARE NEVER SWALLOWED
- * None of these methods carries a `try`/`catch`, and that is the point. A
- * failure falls through to the response interceptor above, which logs and then
- * rejects with the ORIGINAL error, so `error.response.status` and
- * `error.response.data.detail` reach the caller intact. The router reuses each
- * domain exception's own human-readable text as `HTTPException.detail` so those
- * strings match the `reason` an `EligibilityDecision` carries, which is what
- * lets the submission form render the server's own words verbatim:
+ *       401  no credentials
+ *       403  the rater is not verified, or is not a party to the transaction
+ *       404  no such transaction or user
+ *       409  already rated, or the transaction is not completed
+ *       422  score out of range, review too long, or a self-rating
  *
- *   401  no credentials
- *   403  the rater is not verified, or is not a party to the transaction
- *   404  no such transaction or user
- *   409  already rated, or the transaction is not completed
- *   422  score out of range, review too long, or a self-rating
- *
- * There is consequently no client-side status-to-message table — a second source
- * of wording for one decision drifts away from the first — and no `catch` that
- * returns `null` or `{ success: false }`, both of which destroy that message.
+ *     There is consequently no client-side status-to-message table — a second
+ *     source of wording for one decision drifts away from the first — and no
+ *     `catch` that returns `null` or `{ success: false }`, both of which destroy
+ *     that message.
  *
  * WHAT IS ABSENT, AND WHY
+ * -----------------------------------------------------------------------------
  * There is no `updateRating`, `editRating` or `deleteRating`, and no PUT or
  * DELETE call. Reputation records are append-only: a submitted score is never
  * rewritten, and a correction is a moderation-state transition that records a
  * policy basis and leaves the original score and words intact. Moderation and
- * the per-transaction read are served by `./rating`; the four methods below are
- * the surface this module owns.
+ * the per-transaction read are served by `./rating` only; the four methods below
+ * are the surface this module publishes.
  *
  * No method below reads, branches on, filters by, sorts by or defaults from a
  * `score`. Moderation is sentiment-neutral because the FTC Rule on the Use of
@@ -176,17 +285,12 @@ export const uploadPhoto = async (photo: File): Promise<string> => {
  *   is not a party to the transaction; 404 no such transaction; 409 already
  *   rated, or the transaction is not completed; 422 score out of range or a
  *   self-rating. The server's message is on `error.response.data.detail`.
- * @throws {ZodError} When the created rating violates `RatingSchema`.
+ * @throws {RatingContractError} When the created rating cannot be interpreted as
+ *   `RatingSchema`. Identical to calling `./rating` directly, which is the point
+ *   of delegating rather than reimplementing.
  */
-export const submitRating = async (input: RatingCreate): Promise<Rating> => {
-  const api = createApiInstance();
-  const response = await api.post<RatingWire>(
-    '/ratings',
-    toRatingCreateWire(input)
-  );
-
-  return toRating(response.data);
-};
+export const submitRating = (input: RatingCreate): Promise<Rating> =>
+  submitRatingRequest(input);
 
 /**
  * Read the ratings one user has received, with their aggregate. F010-3.
@@ -199,50 +303,67 @@ export const submitRating = async (input: RatingCreate): Promise<Rating> => {
  * neither until it is revealed. A user with no ratings is a first-class state
  * rather than an error — an empty `items` beside `average: null, count: 0`.
  *
+ * `items` is ONE PAGE while `aggregate` covers every published rating, so
+ * `aggregate.count` may exceed `items.length`. `hasMore` and `nextCursor` on the
+ * result report that, and the `page` argument is how the remainder is reached.
+ * The page controls exist here as well as on `./rating` deliberately: two
+ * implementations of one endpoint that disagreed about whether page two is
+ * reachable would be a contract with two answers.
+ *
  * @param userId The user whose received ratings are wanted.
- * @returns The published ratings and the aggregate computed from them.
- * @throws {AxiosError} 404 when no such user exists.
- * @throws {ZodError} When the envelope violates `UserRatingsResponseSchema`.
+ * @param page Optional page controls. `limit` requests a page size, which the
+ *   server clamps rather than trusts; `after` is the `nextCursor` from a previous
+ *   page. Neither is sent when undefined, which asks for the default first page.
+ * @returns One page of published ratings, the aggregate over all of them, and the
+ *   continuation metadata.
+ * @throws {AxiosError} 404 when no such user exists; 422 when `after` is not a
+ *   well-formed rating identifier.
+ * @throws {RatingContractError} When the envelope cannot be interpreted as
+ *   `UserRatingsResponseSchema`.
  */
-export const fetchUserRatings = async (
-  userId: string
-): Promise<UserRatingsResponse> => {
-  const api = createApiInstance();
-  const response = await api.get<UserRatingsResponseWire>(
-    `/ratings/user/${encodeURIComponent(userId)}`
-  );
+export const fetchUserRatings = (
+  userId: string,
+  page?: { limit?: number; after?: string }
+): Promise<UserRatingsResponse> => fetchUserRatingsRequest(userId, page);
 
-  return toUserRatingsResponse(response.data);
-};
 
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * NOT a separate endpoint. It reads `GET /api/ratings/user/{user_id}` — the very
- * same single request `fetchUserRatings` issues, reused here rather than
- * duplicated — and returns only the `aggregate` half. There is no `/reputation`
- * path to call and deliberately no second request: the aggregate is
- * denormalised onto the user document precisely so that reading a reputation
- * costs one document read, which is what keeps a profile view inside the 200 ms
- * budget the SRS sets for 95% of API responses.
+ * NOT a separate endpoint, and not a second request either. It reads the same
+ * `GET /api/ratings/user/{user_id}` path with `aggregate_only=true`, which the
+ * server answers from the user document alone: one document read, an empty
+ * `items`, and the two numbers a badge needs.
+ *
+ * Requesting the mode is the point rather than an optimisation detail. Fetching
+ * the full envelope to keep two fields transfers a page of ratings — every
+ * review body, every identifier — and makes the server settle due publications
+ * and run a second query, all discarded on arrival. This surface renders beside
+ * every listing, so that waste is paid per card. The aggregate is denormalised
+ * onto the user document precisely so that reading a reputation costs ONE read,
+ * which is what keeps a profile view inside the 200 ms budget the SRS sets for
+ * 95% of API responses.
+ *
+ * The response shape is identical in both modes, so the same mapper decodes it.
  *
  * Reflects published ratings only, and includes every one of them whatever the
- * score.
+ * score. This mode does not settle due publications, so a rating past its
+ * window but not yet published is not counted — correctly, since the aggregate
+ * counts published ratings and publication is an action. The profile view
+ * settles, so nothing is stranded.
  *
  * @param userId The user whose reputation is wanted.
  * @returns The aggregate. `average` is null, with `count` 0, for a user who has
  *   never been rated — never 0, which would instead claim a genuine, earned
  *   one-star reputation.
  * @throws {AxiosError} 404 when no such user exists.
- * @throws {ZodError} When the envelope violates `UserRatingsResponseSchema`.
+ * @throws {RatingContractError} When the envelope cannot be interpreted as
+ *   `UserRatingsResponseSchema`.
  */
-export const fetchUserReputation = async (
+export const fetchUserReputation = (
   userId: string
-): Promise<RatingAggregate> => {
-  const { aggregate } = await fetchUserRatings(userId);
+): Promise<RatingAggregate> => fetchUserReputationRequest(userId);
 
-  return aggregate;
-};
 
 /**
  * Ask whether the caller may rate their counterparty on a transaction.
@@ -263,21 +384,24 @@ export const fetchUserReputation = async (
  *   is distinct from `eligible`: "you have had your say" and "you were never
  *   entitled to one" are different states a form must not conflate.
  * @throws {AxiosError} 401 unauthenticated; 404 no such transaction.
- * @throws {ZodError} When the decision violates `EligibilityDecisionSchema`.
+ * @throws {RatingContractError} When the decision cannot be interpreted as
+ *   `EligibilityDecisionSchema`.
  */
-export const fetchRatingEligibility = async (
+export const fetchRatingEligibility = (
   transactionId: string
-): Promise<EligibilityDecision> => {
-  const api = createApiInstance();
-  const response = await api.get<EligibilityDecisionWire>(
-    `/ratings/eligibility/${encodeURIComponent(transactionId)}`
-  );
-
-  return toEligibilityDecision(response.data);
-};
+): Promise<EligibilityDecision> => fetchRatingEligibilityRequest(transactionId);
 
 // HUMAN ASSISTANCE NEEDED
-// Define the VehicleListing interface based on your backend API structure
+// Define the VehicleListing interface based on your backend API structure.
+//
+// The index signature is not the definition this comment is asking for; it is
+// there because an interface with an empty body is equivalent to `{}`, which
+// `@typescript-eslint/no-empty-interface` reports as an error and `npm run lint`
+// fails on (`--max-warnings 0`). An index signature keeps the placeholder
+// honest — it says "any field, unknown type", which is exactly what is known
+// about this shape today — without weakening anything: `response.data` is `any`,
+// so every use site below is unaffected. Replace the whole thing with the real
+// field list when the listing contract is settled.
 interface VehicleListing {
-  // Add properties for the vehicle listing
+  [field: string]: unknown;
 }

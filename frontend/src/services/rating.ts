@@ -1,10 +1,12 @@
 import axios, { AxiosInstance } from 'axios';
 import {
   EligibilityDecisionSchema,
+  ModeratedRatingSchema,
   RatingAggregateSchema,
   RatingSchema,
   UserRatingsResponseSchema,
   type EligibilityDecision,
+  type ModeratedRating,
   type ModerationStatus,
   type Rating,
   type RatingAggregate,
@@ -90,6 +92,23 @@ import {
  * `catch` that returns `null` or `{ success: false }` — both patterns exist
  * elsewhere in this folder and both destroy the server's message.
  *
+ * The one failure the server has no words for is a response that does not match
+ * the contract, and that is `RatingContractError`. Its `message` is the fixed
+ * `CONTRACT_ERROR_MESSAGE`, and the internal detail lives on `diagnostics` and in
+ * the developer console instead — the interface renders `error.message`, so an
+ * endpoint label and a list of schema field paths would otherwise be shown to
+ * whoever was rating a car.
+ *
+ * NOTHING SENSITIVE IS EVER LOGGED
+ * -----------------------------------------------------------------------------
+ * An `AxiosError` carries the `config` it came from, and by then the request
+ * interceptor has written `Authorization: Bearer <token>` into its headers — so
+ * logging the error object itself publishes a live credential to the console and
+ * to anything mirroring it. Every log in this module therefore goes through
+ * `describeRequestFailure`, which builds a fresh four-primitive object by
+ * allow-list. The error is still REJECTED WITH in full, because the caller needs
+ * the status and the detail; it is simply never written down.
+ *
  * DOUBLE-BLIND PUBLICATION IS THE DESIGN, NOT A BUG TO WORK AROUND
  * -----------------------------------------------------------------------------
  * `fetchUserRatings` returns published ratings only, and the aggregate counts
@@ -122,19 +141,91 @@ import {
  * Base URL for every request issued by this module.
  *
  * Read through `process.env.REACT_APP_API_BASE_URL`, which is this project's
- * declared convention and is what `./api` reads. `vite.config.ts` serves it two
- * ways: `envPrefix: 'REACT_APP_'` publishes the variable on `import.meta.env`,
- * and a `define` entry statically replaces this exact member expression with the
- * loaded value. The `define` block is the one that matters here, and it names
- * this module explicitly. The read is therefore left bare — wrapping it in a
- * `typeof process` guard would be actively harmful, because the substitution
- * replaces only the inner expression and the surviving guard evaluates false in
- * a browser bundle, silently yielding no base URL at all.
+ * declared convention and is what `./api` reads.
+ *
+ * `vite.config.ts` guarantees that read, and the guarantee is unconditional: its
+ * `KNOWN_ENV_KEYS` list names this variable, so a `define` entry for this exact
+ * member expression is emitted WHETHER OR NOT the variable is set — with the
+ * loaded value when there is one and with the literal `undefined` when there is
+ * not. In a production build the expression is statically replaced; under the
+ * dev server Vite's client materialises the same dotted keys onto `globalThis`
+ * before any application module runs. Either way `process` is never touched as a
+ * bare global in a browser, which is what previously threw
+ * `ReferenceError: process is not defined` at import time and took down the
+ * whole entry graph rather than just the base URL.
+ *
+ * The read is therefore left bare, and wrapping it in a `typeof process` guard
+ * would be actively harmful: the build-time substitution replaces only the inner
+ * member expression, so the surviving guard evaluates false in a bundle and
+ * silently yields no base URL at all.
+ *
+ * `undefined` is a legitimate value, not a failure: axios then resolves every
+ * path below against the page's own origin. That is the correct behaviour for a
+ * deployment serving the API from the same host, and it is why nothing here
+ * throws on an unset variable.
  */
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+const RAW_API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
 
 /**
- * Path prefix shared by all five endpoints, relative to `API_BASE_URL`.
+ * Resolve the base URL, refusing a value no request could be routed with.
+ *
+ * axios accepts a `baseURL` of `undefined` or `''` without complaint and then
+ * treats every path as relative to whatever origin served the page. That failure
+ * is the dangerous kind: the requests do not error, they go somewhere else — in a
+ * development setup, straight back at the dev server, which answers the SPA's
+ * index document with a 200, so a caller sees a successful response whose body is
+ * HTML and reports a schema violation from a completely unrelated place. A
+ * malformed value behaves the same way. Throwing at the first call instead names
+ * the actual cause once.
+ *
+ * `frontend/vite.config.ts` validates the same variable at config load and
+ * refuses to build or serve without it, which is the earlier and better gate.
+ * This one exists because that gate does not cover every path to this module: a
+ * test importing it directly, or a consumer bundled by other means, reaches here
+ * without ever loading that config. The two are complementary rather than
+ * redundant, and both name the variable.
+ *
+ * A trailing slash is TRIMMED rather than rejected. Every path below begins with
+ * `/`, so `…/api/` would compose `…/api//ratings`; that resolves on most servers
+ * and is a needless difference between environments, and a trailing slash is the
+ * single commonest way this variable is written by hand.
+ *
+ * @returns The base URL, without a trailing slash.
+ * @throws {Error} The variable is unset, blank, or not an absolute http(s) URL.
+ */
+const resolveApiBaseUrl = (): string => {
+  const raw = (RAW_API_BASE_URL ?? '').trim();
+
+  if (raw === '') {
+    throw new Error(
+      'REACT_APP_API_BASE_URL is not set, so rating requests have no ' +
+        'server to reach. Set it to the API root including its /api path, ' +
+        'for example http://localhost:8000/api'
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      'REACT_APP_API_BASE_URL must be an absolute URL including its ' +
+        'scheme, for example http://localhost:8000/api'
+    );
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      'REACT_APP_API_BASE_URL must use http or https, for example ' +
+        'http://localhost:8000/api'
+    );
+  }
+
+  return raw.replace(/\/+$/, '');
+};
+
+/**
+ * Path prefix shared by all five endpoints, relative to the resolved base URL.
  */
 const RATINGS_PATH = '/ratings';
 
@@ -150,12 +241,20 @@ const AUTH_TOKEN_STORAGE_KEY = 'authToken';
 /**
  * Read the bearer token, tolerating every context in which storage is absent.
  *
- * `./api` obtains the token from `getAuthToken` in `app/utils/auth`, and
- * `./auth` from a `getItem` wrapper in `app/utils/storage`. Neither module
- * exists — `src/app` is not a directory in this project — and creating either is
- * out of scope, so their absence is already a compile error attributed to those
- * two files. Importing the same missing specifier from a new module would add a
- * new one, so the value is read here from the key `./auth` writes.
+ * The project's ONE token reader, and exported for that reason. `./auth`
+ * persists the token under `AUTH_TOKEN_STORAGE_KEY` on a successful login, so
+ * this is where a token is found rather than a name invented here.
+ *
+ * `./api` previously imported `getAuthToken` from `app/utils/auth`, a module
+ * that does not exist — `src/app` is not a directory in this project — and
+ * creating it is out of scope. So `./api` reads the token through this function
+ * instead. That direction is deliberate and non-circular: `./api` already
+ * imports the mappers below, and this module must never import `./api` back.
+ * Duplicating the reader in both files was rejected: two copies of "where the
+ * token lives" drift the moment the storage key or the guard changes, and the
+ * copy that drifts is the one nobody is looking at.
+
+
  *
  * Guarded twice, for two distinct failures. `localStorage` is undefined outside
  * a DOM, so an unguarded read would throw under a `node`-environment test or in
@@ -169,7 +268,7 @@ const AUTH_TOKEN_STORAGE_KEY = 'authToken';
  * throwing here, would replace a specific and actionable server response with an
  * opaque client-side crash.
  */
-const readAuthToken = (): string | null => {
+export const readAuthToken = (): string | null => {
   if (typeof localStorage === 'undefined') {
     return null;
   }
@@ -181,6 +280,158 @@ const readAuthToken = (): string | null => {
   }
 };
 
+/*
+ * -----------------------------------------------------------------------------
+ * FAILURE REPORTING — WHAT MAY BE READ FROM AN ERROR, AND WHAT MAY BE LOGGED
+ * -----------------------------------------------------------------------------
+ * Two different jobs, deliberately split into two exported functions, because
+ * conflating them is how a bearer token ends up in a log aggregator.
+ *
+ * `readServerDetail` extracts the message the server WROTE FOR A PERSON, which an
+ * interface renders verbatim. `describeRequestFailure` builds the one line that
+ * may be logged. Nothing anywhere in this feature logs an axios error object.
+ *
+ * That prohibition is concrete rather than precautionary. An `AxiosError` carries
+ * `config`, and `config` carries `headers` — including the
+ * `Authorization: Bearer …` header the request interceptor below just attached —
+ * and `data`, the request body, which on the submission path is the review the
+ * user wrote. `console.error('…', error)` serialises all of it into the browser
+ * console, and from there into any telemetry or session-replay tool that scrapes
+ * console output. So the log line is assembled from four approved parts and
+ * nothing else: the endpoint label the caller supplies, the HTTP status, axios's
+ * own transport `code`, and the server's `detail` string.
+ */
+
+/**
+ * Read the server's human-readable explanation out of a rejected request.
+ *
+ * The router reuses each domain exception's own message as `HTTPException.detail`
+ * precisely so those strings match the `reason` an `EligibilityDecision`
+ * carries, which is what lets an interface render the server's own words instead
+ * of a locally invented table of copy keyed by status code.
+ *
+ * BOTH SHAPES OF `detail` ARE HANDLED, because FastAPI emits two. A refusal
+ * raised by the router is a string ("Only verified users can submit ratings").
+ * A request Pydantic rejected before any handler ran is an ARRAY of issue
+ * objects — `[{loc, msg, type}]` — since no custom `RequestValidationError`
+ * handler is registered anywhere in the backend. Reading only the string case
+ * silently discards every 422: a score outside the scale or an over-long review
+ * would degrade to axios's own "Request failed with status code 422", which
+ * tells the user nothing about which field to fix.
+ *
+ * Each issue contributes its `msg`, duplicates are collapsed, and the results are
+ * joined. `loc` is deliberately not rendered: it is a JSON pointer written for a
+ * developer ("body", "score"), and the messages read as sentences without it.
+ *
+ * @param error Any rejection value, of genuinely unknown shape.
+ * @returns The server's message, or `null` when the error carries none — a
+ *   transport failure, or a response with no body.
+ */
+export const readServerDetail = (error: unknown): string | null => {
+  if (!axios.isAxiosError(error)) {
+    return null;
+  }
+
+  const detail: unknown = error.response?.data?.detail;
+
+  if (typeof detail === 'string') {
+    return detail.length > 0 ? detail : null;
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((issue) =>
+        typeof issue === 'object' && issue !== null
+          ? (issue as { msg?: unknown }).msg
+          : undefined
+      )
+      .filter(
+        (message): message is string =>
+          typeof message === 'string' && message.length > 0
+      );
+
+    const unique = Array.from(new Set(messages));
+
+    return unique.length > 0 ? unique.join('; ') : null;
+  }
+
+  return null;
+};
+
+
+/**
+ * Reduce a failed request to the metadata that is SAFE to log.
+ *
+ * The project's one redaction point for request failures, exported so `./api`
+ * and the rating components use this function rather than each deciding for
+ * itself what is safe — a decision that only has to be got wrong once.
+ *
+ * WHY A RAW AXIOS ERROR MUST NEVER REACH A LOG SINK
+ * ---------------------------------------------------------------------------
+ * An `AxiosError` carries its originating `config`, and by the time an error
+ * exists the request interceptor above has already written
+ * `Authorization: Bearer <token>` into `config.headers`. So
+ * `console.error('...', error)` publishes a live bearer token to the browser
+ * console and to every telemetry agent that mirrors it (CWE-532, insertion of
+ * sensitive information into log file). The same object also holds
+ * `config.data` — the request body — and `response.data`, which is the server's
+ * payload rather than anything a log needs.
+ *
+ * This builds a FRESH object from four primitives, by allow-list. Nothing is
+ * spread, no nested object is forwarded, and the original error is not a member
+ * of the result, so there is no path by which a header, a cookie or a body can
+ * appear in the output even if axios grows new fields.
+ *
+ * The four fields are what actually makes a failure diagnosable: which call was
+ * made, against which path, what the server said, and — for a failure that never
+ * reached a server — the axios code such as `ERR_NETWORK` or `ECONNABORTED`.
+ * The query string is stripped from the URL rather than kept: it carries nothing
+ * this feature needs (only `limit` and `after`), and a deployment that ever put
+ * a credential in a query would otherwise leak it here.
+ *
+ * @param error Any thrown value, axios or not.
+ * @returns A flat object of primitives, safe to pass to a log sink.
+ */
+export const describeRequestFailure = (
+  error: unknown
+): {
+  method: string;
+  url: string;
+  status: number | null;
+  code: string;
+  message: string;
+  detail?: string;
+} => {
+  const source = (
+    typeof error === 'object' && error !== null ? error : {}
+  ) as {
+    code?: unknown;
+    config?: unknown;
+    response?: unknown;
+    message?: unknown;
+  };
+  const config = (source.config ?? {}) as { method?: unknown; url?: unknown };
+  const response = (source.response ?? {}) as { status?: unknown };
+  const message = source.message;
+
+  const method =
+    typeof config.method === 'string' ? config.method.toUpperCase() : 'UNKNOWN';
+  const path = typeof config.url === 'string' ? config.url.split('?')[0] : '';
+  const detail = readServerDetail(error);
+
+  return {
+    method,
+    url: path.length > 0 ? path : 'unknown',
+    status: typeof response.status === 'number' ? response.status : null,
+    code: typeof source.code === 'string' ? source.code : 'none',
+    message:
+      typeof message === 'string' && message.length > 0
+        ? message
+        : 'Request failed',
+    ...(detail === null ? {} : { detail })
+  };
+};
+
 /**
  * Build an axios instance carrying the bearer token and preserving errors.
  *
@@ -190,14 +441,23 @@ const readAuthToken = (): string | null => {
  * imports the mappers below, so this module must never import `./api` back.
  *
  * The response interceptor is load-bearing for the whole feature's UX. It logs
- * and then rejects with the ORIGINAL error, unwrapped and unreplaced, which is
- * the only reason `error.response.data.detail` survives to be rendered verbatim
- * by the submission form. Constructing a new error here — however tidy the
- * message — would discard the server's own explanation of the refusal.
+ * REDACTED metadata and then rejects with the ORIGINAL error, unwrapped and
+ * unreplaced, which is the only reason `error.response.data.detail` survives to
+ * be rendered verbatim by the submission form. Constructing a new error here —
+ * however tidy the message — would discard the server's own explanation of the
+ * refusal.
+ *
+ * Logging and rejecting are deliberately different in what they carry. The
+ * rejection keeps everything, because the caller is code that needs the status
+ * and the detail; the log keeps only `describeRequestFailure`'s five primitives,
+ * because a log is a durable artefact that outlives the request and that people
+ * and telemetry agents read. The bearer token the request interceptor attached
+ * is on the error and must not be in that artefact.
+
  */
 const createRatingApiInstance = (): AxiosInstance => {
   const instance = axios.create({
-    baseURL: API_BASE_URL
+    baseURL: resolveApiBaseUrl()
   });
 
   instance.interceptors.request.use((config) => {
@@ -211,13 +471,31 @@ const createRatingApiInstance = (): AxiosInstance => {
   instance.interceptors.response.use(
     (response) => response,
     (error) => {
-      console.error('Rating API request failed:', error);
+      console.error('Rating API request failed', describeRequestFailure(error));
+
+
       return Promise.reject(error);
     }
   );
 
   return instance;
 };
+
+/**
+ * The one sentence a user is shown when a response cannot be interpreted.
+ *
+ * Fixed rather than composed, and exported so the components render this exact
+ * text and the tests assert against the same constant rather than a copy of it.
+ * It says what happened in terms of the user's situation and what to do about
+ * it, and it says nothing about endpoints, field names or schemas: a user cannot
+ * act on "expected date, received string at createdAt", and an attacker should
+ * not be handed a description of the API's shape by a malformed response.
+ *
+ * Stability is part of the contract. The string does not vary with the endpoint
+ * or the failure, so it cannot be used to probe which call broke or how.
+ */
+export const CONTRACT_ERROR_MESSAGE =
+  'We could not read the rating information the server sent. Please try again in a moment.';
 
 /**
  * Raised when a 2xx response cannot be interpreted as the contract it claims.
@@ -237,6 +515,21 @@ const createRatingApiInstance = (): AxiosInstance => {
  * and no default value: an aggregate or a rating that failed validation is not
  * something to render approximately.
  *
+ * THE MESSAGE IS FOR THE USER; THE DIAGNOSTICS ARE FOR THE DEVELOPER
+ * ---------------------------------------------------------------------------
+ * `message` is a fixed, user-safe sentence and carries NO internal detail. That
+ * is a deliberate split, because the interface renders `error.message`: the
+ * message used to be composed as `"<endpoint> returned a response that does not
+ * match the rating contract: <ZodError issue list>"`, so a contract breach put
+ * an endpoint label and a list of internal field paths on screen in front of
+ * whoever happened to be rating a car. That tells a user nothing they can act on
+ * and tells an attacker about the shape of the API.
+ *
+ * The detail is not discarded — discarding it would make a real breach
+ * undiagnosable. It is moved to `diagnostics`, and `decode` writes it to the
+ * developer console before throwing. So the information lives where developers
+ * read it and not where users do.
+ *
  * Carries no ES2022 `cause`. `tsconfig.json` targets ES2020, so the underlying
  * failure is exposed as an explicit `originalError` property instead. For a
  * validation failure that is the `ZodError`, whose `issues` name every offending
@@ -246,13 +539,23 @@ export class RatingContractError extends Error {
   /** Label of the endpoint whose response could not be interpreted. */
   readonly endpoint: string;
 
+  /**
+   * Developer-facing account of what did not match: the `ZodError` issue list,
+   * or the field-named reason a timestamp or envelope half was rejected.
+   *
+   * NEVER render this. `message` is the string for a user; this is the string
+   * for a console, a bug report or a test assertion.
+   */
+  readonly diagnostics: string;
+
   /** The underlying failure, typically a `ZodError` with per-field issues. */
   readonly originalError: unknown;
 
-  constructor(endpoint: string, reason: string, originalError?: unknown) {
-    super(`${endpoint} returned a response that does not match the rating contract: ${reason}`);
+  constructor(endpoint: string, diagnostics: string, originalError?: unknown) {
+    super(CONTRACT_ERROR_MESSAGE);
     this.name = 'RatingContractError';
     this.endpoint = endpoint;
+    this.diagnostics = diagnostics;
     this.originalError = originalError;
   }
 }
@@ -281,8 +584,16 @@ const describeDecodeFailure = (error: unknown): string => {
  * intact. The only thing that can throw inside here is the interpretation of a
  * response the server already considered a success.
  *
- * @param endpoint Human-readable label such as `POST /ratings`, used verbatim in
- *   the error message so a failure names where it came from.
+ * The endpoint label and the reason are written to the developer console HERE,
+ * which is what allows the thrown error's `message` to stay user-safe. A contract
+ * breach is a real defect and has to be diagnosable; it just does not have to be
+ * diagnosable from the screen of the person who was rating a car. The log carries
+ * no request metadata of its own, because a decode failure follows a SUCCESSFUL
+ * response — the interceptor has not run, and there is no axios error and so no
+ * `Authorization` header anywhere in scope.
+ *
+ * @param endpoint Human-readable label such as `POST /ratings`, recorded on the
+ *   error and in the developer log so a failure names where it came from.
  * @param decodeResponse Thunk performing the key mapping and schema validation.
  * @throws {RatingContractError} When the payload cannot be interpreted.
  */
@@ -290,7 +601,12 @@ const decode = <T>(endpoint: string, decodeResponse: () => T): T => {
   try {
     return decodeResponse();
   } catch (error) {
-    throw new RatingContractError(endpoint, describeDecodeFailure(error), error);
+    const diagnostics = describeDecodeFailure(error);
+    console.error('Rating API response did not match the contract', {
+      endpoint,
+      diagnostics
+    });
+    throw new RatingContractError(endpoint, diagnostics, error);
   }
 };
 
@@ -298,12 +614,17 @@ const decode = <T>(endpoint: string, decodeResponse: () => T): T => {
  * Convert one wire timestamp to a `Date`, or fail loudly.
  *
  * `../schema/rating` declares `createdAt`/`updatedAt` as a required `z.date()`,
- * and the server guarantees both on every response because it stamps a real UTC
- * datetime onto the model it returns — the value actually written to Firestore is
- * a server-side sentinel that cannot be serialised, so it is replaced before the
- * response is built. The Pydantic model nevertheless types both fields as
- * `Optional[Any]`, so "absent" is representable on the wire and is handled here
- * rather than assumed away.
+ * and the server's RESPONSE model agrees: `RatingView` types both as a required
+ * `datetime` and the projection that builds it refuses to emit a rating whose
+ * timestamps have not resolved. The value written to Firestore is a server-side
+ * sentinel that cannot be serialised, so it is replaced with a real UTC datetime
+ * before any response is built. Both sides of the boundary therefore require
+ * these fields, which is the alignment this helper depends on.
+ *
+ * It still validates rather than trusting, because a wire value is unvalidated
+ * until something has looked at it: an intermediary, an older deployment or a
+ * hand-written fixture can all present a payload the contract forbids, and this
+ * is where that is caught and named.
  *
  * Neither failure mode is papered over. `new Date(undefined)` yields an Invalid
  * Date, which `z.date()` rejects with a message that names neither the field nor
@@ -312,10 +633,35 @@ const decode = <T>(endpoint: string, decodeResponse: () => T): T => {
  * absent or unparseable value throws here, where the field can be named, and
  * `decode` adds the endpoint.
  *
- * @param value Raw wire value: an ISO 8601 string, or null/absent.
+ * THE WIRE FORMAT IS CHECKED BEFORE `new Date` IS ALLOWED NEAR IT, because
+ * `new Date(string)` is far more permissive than the contract. Outside the ISO
+ * formats it is implementation-defined, and every browser accepts input this
+ * server never sends: `new Date('1')` is the first of January 2001,
+ * `new Date('2024-05-01 12:00:00')` is accepted with a space separator and NO
+ * offset, so it is silently interpreted in the reader's local time zone. A
+ * `Date` built that way is a valid `Date` — `z.date()` accepts it, the rating
+ * renders, and only the displayed instant is wrong, by however many hours the
+ * reader happens to be from UTC. A timestamp that is quietly wrong is worse than
+ * one that fails, so the string must present as a date, a time and an EXPLICIT
+ * offset before it is parsed.
+ *
+ * Requiring the offset costs nothing against this server and is what makes the
+ * value unambiguous: `backend/app/services/rating.py` stamps
+ * `datetime.now(timezone.utc)` on the model it returns, and a timestamp read
+ * back from Firestore is an aware UTC datetime, so pydantic serialises both with
+ * a `+00:00` suffix. `Z` and a `±HH:MM`/`±HHMM` offset are accepted because all
+ * three are valid ISO 8601 spellings of the same fact; a naive local timestamp is
+ * not accepted, because there is no fact in it.
+ *
+ * @param value Raw wire value: an ISO 8601 timestamp with an offset, or
+ *   null/absent.
  * @param field Dotted field name used in the error message.
- * @throws {TypeError} When the value is absent, blank or not a valid timestamp.
+ * @throws {TypeError} When the value is absent, not an offset-qualified ISO 8601
+ *   timestamp, or not a real instant.
  */
+const ISO_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/;
+
 const toDate = (value: string | null | undefined, field: string): Date => {
   if (typeof value !== 'string' || value.trim().length === 0) {
     const received = value === null ? 'null' : typeof value;
@@ -324,7 +670,15 @@ const toDate = (value: string | null | undefined, field: string): Date => {
     );
   }
 
+  if (!ISO_TIMESTAMP_PATTERN.test(value)) {
+    throw new TypeError(
+      `${field} is not an ISO 8601 timestamp with a UTC offset: "${value}"`
+    );
+  }
+
   const parsed = new Date(value);
+  // Still checked after the pattern, which admits a well-formed impossibility
+  // such as "2024-02-31T00:00:00Z" or an hour of 25.
   if (Number.isNaN(parsed.getTime())) {
     throw new TypeError(`${field} is not a valid ISO 8601 timestamp: "${value}"`);
   }
@@ -362,13 +716,31 @@ const toDate = (value: string | null | undefined, field: string): Date => {
  */
 
 /**
- * `Rating` as it travels: the thirteen fields of the Pydantic model, in order.
+ * `Rating` as it travels: the eleven fields of `RatingView`, in order.
  *
- * `review` and `moderation_reason` are omittable-or-null because the server
- * returns the key carrying `null` when there is no value — review text is
- * withheld until moderation approves it, and the moderator's internal note is
- * redacted on every path. `created_at`/`updated_at` are declared the same way
- * because the Pydantic model types them `Optional[Any]`; see `toDate`.
+ * This mirrors the RESPONSE model — `RatingView` in
+ * `backend/app/schema/rating.py` — and deliberately not the persisted `Rating`
+ * document model. The two differ in exactly the two ways that matter here.
+ *
+ * `created_at`/`updated_at` are REQUIRED strings, not omittable-or-null. The
+ * stored document types them `Optional[Any]` because a write stamps
+ * `firestore.SERVER_TIMESTAMP`, a sentinel that carries no value until the
+ * server resolves it; the response model types them `datetime` and the
+ * projection refuses to emit a rating whose timestamps have not resolved. So a
+ * response either carries both or is not produced at all, and declaring them
+ * omittable here would model a payload the server cannot send while hiding the
+ * one it does.
+ *
+ * `moderation_status`, `moderation_reason` and `moderation_note` are ABSENT.
+ * Moderation state is operational: the visibility decision it drives has already
+ * been applied to `is_published` and to whether `review` carries text, so a
+ * public or participant reader needs none of it and is given none of it. Only
+ * the admin-only moderation endpoint returns those fields, under
+ * `ModeratedRatingWire` below.
+ *
+ * `review` remains omittable-or-null because the server returns the key carrying
+ * `null` when there is no value — the review was never written, or moderation has
+ * not approved the text.
  */
 export interface RatingWire {
   id: string;
@@ -380,34 +752,71 @@ export interface RatingWire {
   score: number;
   review?: string | null;
   is_published: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * `ModeratedRatingView` as it travels: `RatingWire` plus the moderation fields.
+ *
+ * Returned by `PATCH /api/ratings/{ratingId}/moderation` and by nothing else,
+ * because that endpoint is gated on `role === 'admin'` and its caller has just
+ * set the state they are reading back. Keeping this a separate interface from
+ * `RatingWire` is what makes the wider projection impossible to reach from a
+ * public read by accident: the read paths are typed to the narrow shape, so a
+ * mapper that leaked moderation state would not compile.
+ *
+ * `moderation_reason` is a POLICY CODE rather than prose, and never anything
+ * derived from the score. `moderation_note` carries the operator's specifics
+ * behind that code. Both are omittable-or-null: the server returns the key
+ * carrying `null` when nothing has been recorded.
+ */
+export interface ModeratedRatingWire extends RatingWire {
   moderation_status: string;
   moderation_reason?: string | null;
-  created_at?: string | null;
-  updated_at?: string | null;
+  moderation_note?: string | null;
 }
 
 /**
  * `RatingAggregate` as it travels.
  *
- * `average` is omittable-or-null because null is a first-class state meaning "no
- * ratings yet" (`Optional[float] = None` on the server), not an error and not a
- * synonym for zero.
+ * `average` is NULLABLE BUT NOT OMITTABLE, and the distinction is the whole
+ * point of the field. `null` is a first-class state meaning "no ratings yet"
+ * (`Optional[float] = None` on the server) — an ABSENT key means something else
+ * entirely, and there is no legitimate response in which it happens: FastAPI
+ * serialises the declared model, so `average` is always present, carrying null
+ * when there is no reputation yet.
+ *
+ * Declaring it omittable would therefore not model the server; it would model a
+ * malformed payload, and would let `toRatingAggregate` collapse a missing key
+ * into `null` and render "No ratings yet" for a user who may well have a
+ * reputation. Requiring the key turns that payload into a named contract failure
+ * instead.
  */
 export interface RatingAggregateWire {
-  average?: number | null;
+  average: number | null;
   count: number;
 }
 
 /**
  * Envelope returned by `GET /api/ratings/user/{userId}`.
  *
- * The two halves travel together because they must agree: the list a reader can
- * see has to account for the average they are shown. Both cover published
+ * The two data halves travel together because they must agree: the list a reader
+ * can see has to account for the average they are shown. Both cover published
  * ratings only.
+ *
+ * `items` is ONE PAGE while `aggregate` covers every published rating, so
+ * `aggregate.count` may legitimately exceed `items.length`. `has_more` and
+ * `next_cursor` are what make that difference legible rather than looking like a
+ * contradiction: the first says the remainder exists, the second says how to
+ * reach it. Both are declared required because the server sends both on every
+ * page — `next_cursor` carrying `null` on the last one.
  */
 export interface UserRatingsResponseWire {
   items: RatingWire[];
   aggregate: RatingAggregateWire;
+  next_cursor?: string | null;
+  has_more: boolean;
 }
 
 /**
@@ -440,16 +849,23 @@ export interface RatingCreateWire {
 }
 
 /**
- * Body of `PATCH /api/ratings/{ratingId}/moderation`. Exactly two keys.
+ * Body of `PATCH /api/ratings/{ratingId}/moderation`. Exactly three keys.
  *
  * The router's model sets `extra = 'forbid'`, so any additional key — notably a
  * `score` or `review`, which the append-only contract never permits editing — is
  * refused with a 422 naming the offending field rather than silently ignored.
- * `moderation_reason` is cleared when omitted.
+ *
+ * `moderation_reason` is the POLICY CODE the server checks against its allow-list,
+ * and `moderation_note` is the operator's free-text account of the specifics
+ * behind that code. They are two fields rather than one on purpose: the code is
+ * what decides, the note decides nothing, and separating them is what keeps a
+ * justification from being written as prose that nobody can check. Either is
+ * cleared when omitted.
  */
 export interface ModerationWire {
   moderation_status: ModerationStatus;
   moderation_reason?: string;
+  moderation_note?: string;
 }
 
 /*
@@ -479,10 +895,18 @@ export interface ModerationWire {
 /**
  * Adapt one wire rating to the domain model.
  *
- * All thirteen fields are mapped; none is dropped and none is left under its
- * snake_case name. Exported so `./api` can apply the identical adaptation.
+ * All eleven fields of `RatingView` are mapped; none is dropped and none is left
+ * under its snake_case name. Exported so `./api` can apply the identical
+ * adaptation.
  *
- * @param wire Raw rating object from any of the four endpoints that return one.
+ * No moderation field is read here even if one is present on the object. The read
+ * endpoints do not send them, and a mapper that opportunistically forwarded
+ * whatever it found would carry operational state into a public projection the
+ * moment a server change started including it. `toModeratedRating` is the one
+ * place that state is admitted, and it is reachable only from the admin-only
+ * moderation call.
+ *
+ * @param wire Raw rating object from any of the three endpoints that return one.
  * @returns The validated, camelCase rating with real `Date` timestamps.
  * @throws {TypeError} When a timestamp is absent or unparseable.
  * @throws {ZodError} When any field violates `RatingSchema`.
@@ -498,10 +922,51 @@ export const toRating = (wire: RatingWire): Rating =>
     score: wire.score,
     review: wire.review ?? null,
     isPublished: wire.is_published,
-    moderationStatus: wire.moderation_status,
-    moderationReason: wire.moderation_reason ?? null,
     createdAt: toDate(wire.created_at, 'Rating.created_at'),
     updatedAt: toDate(wire.updated_at, 'Rating.updated_at')
+  });
+
+/**
+ * Adapt one wire MODERATED rating to the domain model.
+ *
+ * The fourteen fields of `ModeratedRatingView`: everything `toRating` maps, plus
+ * the three moderation fields. Used by `moderateRating` alone.
+ *
+ * The base fields are mapped literally rather than by delegating to `toRating`
+ * and spreading its result, because `toRating` returns a value already parsed
+ * against the narrow schema and re-parsing it against the wider one would
+ * validate the same data twice while making the field list harder to audit. One
+ * schema sees this payload once.
+ *
+ * `moderationReason` is carried through verbatim as the policy code the server
+ * recorded, and `moderationNote` as the operator's account of it. Neither is
+ * interpreted here: nothing in this module reads, branches on or renders a
+ * decision from either, and no code exists for a low score, so sentiment-neutral
+ * moderation is preserved by there being no mechanism to violate it.
+ *
+ * @param wire Raw moderated rating object from the moderation endpoint.
+ * @returns The validated, camelCase rating including its moderation state.
+ * @throws {TypeError} When a timestamp is absent or unparseable.
+ * @throws {ZodError} When any field violates `ModeratedRatingSchema`.
+ */
+export const toModeratedRating = (
+  wire: ModeratedRatingWire
+): ModeratedRating =>
+  ModeratedRatingSchema.parse({
+    id: wire.id,
+    transactionId: wire.transaction_id,
+    vehicleListingId: wire.vehicle_listing_id,
+    raterId: wire.rater_id,
+    rateeId: wire.ratee_id,
+    direction: wire.direction,
+    score: wire.score,
+    review: wire.review ?? null,
+    isPublished: wire.is_published,
+    createdAt: toDate(wire.created_at, 'ModeratedRating.created_at'),
+    updatedAt: toDate(wire.updated_at, 'ModeratedRating.updated_at'),
+    moderationStatus: wire.moderation_status,
+    moderationReason: wire.moderation_reason ?? null,
+    moderationNote: wire.moderation_note ?? null
   });
 
 /**
@@ -514,15 +979,33 @@ export const toRating = (wire: RatingWire): Rating =>
  * and a zero would instead claim a genuine, earned one-star reputation, the worst
  * possible thing to show someone who has simply never been rated.
  *
+ * The presence check is what stops that preservation from becoming a lie. `null`
+ * and "the key was not there" are different facts, and `wire.average ?? null`
+ * erases the difference: a truncated or reshaped payload would then render as a
+ * confident "No ratings yet" on somebody's profile. So an absent key is refused
+ * here, where the field can be named, and `decode` adds the endpoint. The
+ * remaining rules — a finite average inside the scale, a non-negative whole
+ * count, and the count/average bi-implication — are `RatingAggregateSchema`'s,
+ * mirroring the server's own paired validators.
+ *
  * @param wire Raw aggregate object.
  * @returns The validated aggregate, with `average: null` preserved as null.
- * @throws {ZodError} When either field violates `RatingAggregateSchema`.
+ * @throws {TypeError} When the aggregate or its `average` key is absent.
+ * @throws {ZodError} When either field, or the pair, violates
+ *   `RatingAggregateSchema`.
  */
-export const toRatingAggregate = (wire: RatingAggregateWire): RatingAggregate =>
-  RatingAggregateSchema.parse({
-    average: wire.average ?? null,
+export const toRatingAggregate = (wire: RatingAggregateWire): RatingAggregate => {
+  if (typeof wire !== 'object' || wire === null || !('average' in wire)) {
+    throw new TypeError(
+      'RatingAggregate.average is required: expected a number, or null for a user with no ratings yet'
+    );
+  }
+
+  return RatingAggregateSchema.parse({
+    average: wire.average,
     count: wire.count
   });
+};
 
 /**
  * Adapt one wire eligibility decision to the domain model.
@@ -563,9 +1046,17 @@ export const toEligibilityDecision = (
  * an empty list would render a user's reputation as "no ratings yet" on the
  * strength of a malformed response.
  *
- * @param wire Raw `{ items, aggregate }` envelope.
- * @returns The validated envelope: published ratings and their aggregate.
- * @throws {TypeError} When `items` is not an array or `aggregate` is missing.
+ * The page metadata is mapped alongside them. `has_more` is checked for presence
+ * rather than defaulted, for the same reason as the two data halves: defaulting an
+ * absent flag to `false` would tell a reader that a page containing part of
+ * someone's reputation was all of it. `next_cursor` legitimately arrives null on
+ * the last page, so absent and null both collapse to null.
+ *
+ * @param wire Raw `{ items, aggregate, next_cursor, has_more }` envelope.
+ * @returns The validated envelope: one page of published ratings, the aggregate
+ *   over all of them, and how to reach the rest.
+ * @throws {TypeError} When `items` is not an array, or `aggregate` or `has_more`
+ *   is missing.
  * @throws {ZodError} When any rating or the aggregate fails validation.
  */
 export const toUserRatingsResponse = (
@@ -583,9 +1074,18 @@ export const toUserRatingsResponse = (
     );
   }
 
+  if (typeof wire.has_more !== 'boolean') {
+    throw new TypeError(
+      'UserRatingsResponse.has_more is required: expected a boolean saying ' +
+        'whether another page of ratings exists'
+    );
+  }
+
   return UserRatingsResponseSchema.parse({
     items: wire.items.map((item) => toRating(item)),
-    aggregate: toRatingAggregate(wire.aggregate)
+    aggregate: toRatingAggregate(wire.aggregate),
+    nextCursor: wire.next_cursor ?? null,
+    hasMore: wire.has_more
   });
 };
 
@@ -638,26 +1138,35 @@ export const toRatingCreateWire = (input: RatingCreate): RatingCreateWire => {
 /**
  * Build the moderation `PATCH` body. F010-4.
  *
- * Two keys at most, because the router's model forbids extras and because the
- * append-only contract has nothing else to say: a state and, when there is one,
- * the policy basis for reaching it. The original score and words are untouched by
- * this request and there is no shape here capable of altering them.
+ * Three keys at most, because the router's model forbids extras and because the
+ * append-only contract has nothing else to say: a state, the policy code that
+ * justifies reaching it, and optionally the operator's account of the specifics.
+ * The original score and words are untouched by this request and there is no
+ * shape here capable of altering them.
  *
- * The reason must cite a POLICY violation — abuse, personally identifying
- * information, profanity. A low score is never itself a violation, and this
- * mapper cannot see the score at all, which is the structural half of the
- * guarantee that moderation stays sentiment-neutral as 16 CFR Part 465 requires.
+ * The reason is a POLICY CODE from the server's allow-list — `abuse`,
+ * `personal_information`, `profanity` and the rest — and is forwarded verbatim
+ * rather than composed here, because the allow-list has one owner and a client
+ * copy of it would be the one that drifted. A low score is never itself a
+ * violation, no code expresses one, and this mapper cannot see the score at all:
+ * that is the structural half of the guarantee that moderation stays
+ * sentiment-neutral as 16 CFR Part 465 requires. The note is where the human
+ * specifics belong, and it justifies nothing on its own.
  *
  * @param moderationStatus Target state; the union is enforced by the caller's type.
- * @param moderationReason Policy basis. Omitted from the body when undefined,
+ * @param moderationReason Policy code. Omitted from the body when undefined,
  *   which the server reads as clearing any recorded reason. The server refuses a
- *   rejection that carries none, surfacing as a 422 — that rule has one owner and
- *   is deliberately not duplicated here.
- * @returns The one- or two-key snake_case body.
+ *   rejection that carries none, and refuses a code outside its allow-list, both
+ *   surfacing as a 422 — those rules have one owner and are deliberately not
+ *   duplicated here.
+ * @param moderationNote Operator note recording the specifics behind the code.
+ *   Omitted when undefined, which clears any recorded note.
+ * @returns The one-, two- or three-key snake_case body.
  */
 export const toModerationWire = (
   moderationStatus: ModerationStatus,
-  moderationReason?: string
+  moderationReason?: string,
+  moderationNote?: string
 ): ModerationWire => {
   const body: ModerationWire = {
     moderation_status: moderationStatus
@@ -665,6 +1174,10 @@ export const toModerationWire = (
 
   if (moderationReason !== undefined) {
     body.moderation_reason = moderationReason;
+  }
+
+  if (moderationNote !== undefined) {
+    body.moderation_note = moderationNote;
   }
 
   return body;
@@ -730,17 +1243,45 @@ export const submitRating = async (input: RatingCreate): Promise<Rating> => {
  * neither. A user with no ratings is a first-class state and not an error — an
  * empty `items` beside `average: null, count: 0`.
  *
+ * ONE PAGE, AND THE PAGE IS REPORTED
+ * ---------------------------------------------------------------------------
+ * `items` is a single page while `aggregate` covers every published rating, so
+ * `aggregate.count` may exceed `items.length`. The response says so: `hasMore`
+ * reports that a remainder exists and `nextCursor` is the value to pass back as
+ * `after` to read it. Paging is therefore the caller's to drive, and it is
+ * driveable — a reputation summary computed from records the response gave no way
+ * to fetch would be exactly the discrepancy this metadata exists to remove.
+ *
  * @param userId The user whose received ratings are wanted.
- * @returns The published ratings and the aggregate computed from them.
- * @throws {AxiosError} 404 when no such user exists.
+ * @param page Optional page controls. `limit` requests a page size, which the
+ *   server clamps into a serviceable range rather than trusting; `after` is the
+ *   `nextCursor` from a previous page, and omitting it starts at the newest
+ *   rating. Neither is sent when undefined, which asks for the server's default
+ *   first page.
+ * @returns One page of published ratings, the aggregate over all of them, and the
+ *   continuation metadata.
+ * @throws {AxiosError} 404 when no such user exists; 422 when `after` is not a
+ *   well-formed rating identifier.
  * @throws {RatingContractError} When the envelope cannot be interpreted.
  */
 export const fetchUserRatings = async (
-  userId: string
+  userId: string,
+  page?: { limit?: number; after?: string }
 ): Promise<UserRatingsResponse> => {
   const api = createRatingApiInstance();
+  const params: Record<string, string | number> = {};
+
+  if (page?.limit !== undefined) {
+    params.limit = page.limit;
+  }
+
+  if (page?.after !== undefined) {
+    params.after = page.after;
+  }
+
   const response = await api.get<UserRatingsResponseWire>(
-    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`
+    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`,
+    { params }
   );
 
   return decode(`GET ${RATINGS_PATH}/user/{userId}`, () =>
@@ -751,15 +1292,29 @@ export const fetchUserRatings = async (
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * NOT a separate endpoint. It reads `GET /api/ratings/user/{userId}` — the same
- * single request `fetchUserRatings` issues — and returns only the `aggregate`
- * half. There is no `/reputation` path to call and deliberately no second
- * request: the aggregate is denormalised onto the user document precisely so that
- * reading a reputation costs one document read, which is what keeps a profile
- * view inside the 200 ms budget the SRS sets for 95% of API responses.
+ * NOT a separate endpoint, and not a second request either. It reads the same
+ * `GET /api/ratings/user/{userId}` path with `aggregate_only=true`, which the
+ * server answers from the user document alone: one document read, an empty
+ * `items`, and the two numbers a badge needs.
+ *
+ * Asking for the mode is the point of this function rather than an optimisation
+ * detail. Fetching the full envelope to keep two fields transfers a page of
+ * ratings — every review body, every identifier — and makes the server settle
+ * due publications and run a second query, all discarded on arrival. This
+ * surface renders beside every listing, so that waste is paid per card. The
+ * aggregate is denormalised onto the user document precisely so a reputation
+ * costs ONE read, which is what holds the 200 ms budget the SRS sets for 95% of
+ * API responses; requesting the whole envelope would spend the saving it exists
+ * to make.
+ *
+ * The response shape is identical in both modes, so it is decoded by the same
+ * mapper and no schema knows which mode produced it.
  *
  * Reflects published ratings only, and includes every one of them whatever the
- * score.
+ * score. Because this mode does not settle, a rating that has become due but has
+ * not yet been published is not counted here - correctly, since the aggregate
+ * counts published ratings and publication is an action. The profile view
+ * settles, so nothing is stranded.
  *
  * @param userId The user whose reputation is wanted.
  * @returns The aggregate. `average` is null, with `count` 0, for a user who has
@@ -770,9 +1325,16 @@ export const fetchUserRatings = async (
 export const fetchUserReputation = async (
   userId: string
 ): Promise<RatingAggregate> => {
-  const { aggregate } = await fetchUserRatings(userId);
+  const api = createRatingApiInstance();
+  const response = await api.get<UserRatingsResponseWire>(
+    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`,
+    { params: { aggregate_only: true } }
+  );
 
-  return aggregate;
+  return decode(
+    `GET ${RATINGS_PATH}/user/{userId}?aggregate_only=true`,
+    () => toUserRatingsResponse(response.data).aggregate
+  );
 };
 
 /**
@@ -850,27 +1412,37 @@ export const fetchRatingEligibility = async (
  * identifying information, profanity — and never by the score. The aggregate
  * continues to count every published rating whatever its value.
  *
+ * This is the ONLY call that resolves with a `ModeratedRating`. Every read path
+ * resolves with the narrower `Rating`, which carries no moderation state at all,
+ * because the visibility decision that state drives has already been applied to
+ * what a reader receives. The wider shape is reachable here and nowhere else.
+ *
  * @param ratingId The rating to transition.
  * @param moderationStatus Target state: `pending`, `approved` or `rejected`.
- * @param moderationReason The policy basis. Required in practice for a rejection,
- *   which the server enforces; omitting it clears any recorded reason.
- * @returns The updated rating.
+ * @param moderationReason The policy code justifying the transition. Required in
+ *   practice for a rejection, which the server enforces; omitting it clears any
+ *   recorded reason.
+ * @param moderationNote Optional operator note recording the specifics behind the
+ *   code; omitting it clears any recorded note.
+ * @returns The updated rating, including its moderation state.
  * @throws {AxiosError} 401 unauthenticated; 403 the caller is not an
- *   administrator; 404 no such rating; 422 a rejection carrying no policy basis.
+ *   administrator; 404 no such rating; 422 a rejection carrying no policy basis,
+ *   or a reason outside the server's allow-list.
  * @throws {RatingContractError} When the updated rating cannot be interpreted.
  */
 export const moderateRating = async (
   ratingId: string,
   moderationStatus: ModerationStatus,
-  moderationReason?: string
-): Promise<Rating> => {
+  moderationReason?: string,
+  moderationNote?: string
+): Promise<ModeratedRating> => {
   const api = createRatingApiInstance();
-  const response = await api.patch<RatingWire>(
+  const response = await api.patch<ModeratedRatingWire>(
     `${RATINGS_PATH}/${encodeURIComponent(ratingId)}/moderation`,
-    toModerationWire(moderationStatus, moderationReason)
+    toModerationWire(moderationStatus, moderationReason, moderationNote)
   );
 
   return decode(`PATCH ${RATINGS_PATH}/{ratingId}/moderation`, () =>
-    toRating(response.data)
+    toModeratedRating(response.data)
   );
 };

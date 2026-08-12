@@ -1,5 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.schema.transaction import Transaction
+# Required because both handlers annotate ``current_user: User``, and a
+# parameter annotation is evaluated at function-definition time: without
+# the name bound here the module raises ``NameError`` while being
+# imported, which stops app/main.py - and therefore every API surface -
+# from loading at all, so this router contributes no route.
+from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
 from app.services.payment import process_payment

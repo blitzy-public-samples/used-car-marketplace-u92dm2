@@ -270,10 +270,15 @@ const RatingList: React.FC<RatingListProps> = ({
                  * `<time>` carries the machine-readable value in `dateTime`
                  * while the text content stays the human-readable string from
                  * the project's shared `formatDate`. That helper is the only
-                 * sanctioned route to a formatted date here — it owns the
-                 * project's single date-formatting dependency, so importing
-                 * that library directly from this file would add an
-                 * undeclared-package error the shared helper already absorbs.
+                 * sanctioned route to a formatted date here, so every date in
+                 * the application reads the same way. It now formats through
+                 * the platform's `Intl.DateTimeFormat` and pulls in no package
+                 * at all: it previously reached for `date-fns`, which is
+                 * declared in neither the manifest nor the lockfile, so this
+                 * component could not be bundled by a clean install. Importing
+                 * any date library directly from here would reintroduce
+                 * exactly that.
+
                  */
                 <time
                   dateTime={submittedAt.toISOString()}

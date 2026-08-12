@@ -1,6 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
 from app.schema.listing import VehicleListing
+# Every handler below annotates ``current_user: User``, and Python
+# evaluates a parameter annotation when the function is DEFINED, so
+# without this import the module raises
+# ``NameError: name 'User' is not defined`` while being imported - which
+# takes the whole composition root down with it and leaves this router
+# registering no path at all. The name was always intended: it is the
+# response shape app/api/auth.py returns from get_current_user.
+from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
 from app.services.ai_vision import analyze_vehicle_photo

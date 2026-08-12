@@ -224,7 +224,15 @@ async def initialize_db() -> None:
     neither moved, deferred nor duplicated into here. Firestore is also
     schemaless: no schema to create, no migration to apply, no schema
     version to check. The composite indexes are declared in
-    ``infrastructure/firestore.indexes.json`` and installed by the
-    deploy script, not from application code.
+    ``infrastructure/firestore.indexes.json`` and installed as a
+    deployment step, not from application code.
+
+    That separation leaves the declaration file with no runtime reader,
+    which is why the test suite parses it and refuses any query shape it
+    does not declare: index drift then fails a test run instead of
+    surfacing as ``FailedPrecondition`` against a real deployment.
+    ``scripts/deploy.sh`` is where the installation belongs, and it does
+    not currently reach that step - repairing it is out of this feature's
+    scope, so the check is the guarantee that the file stays correct.
     """
     return None
