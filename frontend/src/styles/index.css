@@ -1,0 +1,13 @@
+/*
+ * Tailwind CSS entry point.
+ *
+ * tsconfig.json declares a "@styles/*" path alias pointing at src/styles,
+ * which did not exist, and the repository contained no stylesheet at all.
+ * Import this file once from the application entry point (src/index.tsx) so
+ * the PostCSS/Tailwind pipeline configured in postcss.config.js and
+ * tailwind.config.js actually produces CSS.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

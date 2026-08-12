@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!--
+  Vite entry point.
+
+  package.json declares `start: vite` and `build: tsc && vite build`, but the
+  only HTML in the repository was public/index.html, which is a Create React
+  App template (%PUBLIC_URL% placeholders, no module script). Vite resolves its
+  entry from an index.html at the project root, so neither the dev server nor
+  the build had an entry module. This file supplies one and loads the existing
+  src/index.tsx bootstrap.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Used Car Marketplace - buy and sell used cars"
+    />
+    <title>Used Car Marketplace</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>

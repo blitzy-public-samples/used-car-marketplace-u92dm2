@@ -3,14 +3,20 @@
   "version": "1.0.0",
   "description": "Frontend for Task Management Application",
   "private": true,
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
   "dependencies": {
     "@reduxjs/toolkit": "^1.9.5",
     "axios": "^1.4.0",
+    "dompurify": "3.4.13",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-redux": "^8.1.1",
     "react-router-dom": "^6.14.1",
-    "tailwindcss": "^3.3.2"
+    "tailwindcss": "^3.3.2",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^5.16.5",
@@ -20,10 +26,17 @@
     "@types/node": "^20.4.1",
     "@types/react": "^18.2.14",
     "@types/react-dom": "^18.2.6",
+    "@typescript-eslint/eslint-plugin": "5.62.0",
+    "@typescript-eslint/parser": "5.62.0",
+    "@vitest/coverage-v8": "0.34.6",
     "autoprefixer": "^10.4.14",
+    "eslint": "8.57.1",
+    "eslint-plugin-react-hooks": "4.6.2",
+    "jsdom": "21.1.2",
     "postcss": "^8.4.25",
     "typescript": "^5.1.6",
     "vite": "^4.4.2",
+    "vitest": "0.34.6",
     "@vitejs/plugin-react": "^4.0.3"
   },
   "scripts": {
