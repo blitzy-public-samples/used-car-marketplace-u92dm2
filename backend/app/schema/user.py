@@ -10,3 +10,6 @@ class User(BaseModel):
     role: str
     created_at: datetime
     updated_at: datetime
+    is_verified: bool = False
+    rating_average: Optional[float] = None
+    rating_count: int = 0
