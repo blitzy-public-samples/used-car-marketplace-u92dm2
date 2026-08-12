@@ -512,13 +512,37 @@ class Rating(BaseModel):
     carrying one is reported as malformed rather than misclassified.
     """
 
-    id: str
-    transaction_id: str
+    # THE IDENTIFIERS ARE TYPED, NOT MERELY STRINGS
+    #
+    # ``id`` is the COMPOSITE key ``"{transaction_id}_{rater_id}"``, so it
+    # gets the composite bound; the three participant and transaction
+    # references get the component grammar. This is a security boundary
+    # rather than tidiness, because these values are USED AS PATHS: the
+    # service composes ``transaction_id`` and ``rater_id`` into the
+    # rating's own document ID and hands ``ratee_id`` to ``document()`` to
+    # credit an aggregate. A stored value carrying a forward slash would
+    # make Firestore resolve a NESTED PATH instead of the document the
+    # field appears to name, an oversized one would produce a key the
+    # moderation endpoint refuses, and a control character forges any log
+    # line that renders it.
+    #
+    # A stored document is not typed, so these constraints are also the
+    # quarantine: a body that violates one fails validation, which is how
+    # ``app/services/rating.py`` skips such a record - dropped from reads
+    # and refused for publication, logged for repair - instead of
+    # publishing a score against an identifier nothing can address.
+    #
+    # ``vehicle_listing_id`` stays a plain string deliberately: this
+    # feature never uses it as a path, only carries it so a rating can be
+    # rendered with context, and constraining a field this module does not
+    # address would refuse records over something it has no stake in.
+    id: RatingDocumentId
+    transaction_id: DocumentId
     # Denormalised from the transaction so a rating can be rendered
     # with context without a second document read.
     vehicle_listing_id: str
-    rater_id: str
-    ratee_id: str
+    rater_id: DocumentId
+    ratee_id: DocumentId
     direction: str
     score: RatingScore
     # ``max_length`` here is the RAW denial-of-service ceiling, not the
@@ -545,20 +569,26 @@ class Rating(BaseModel):
     # decision taken on a truthiness accident.
     is_published: StrictBool = False
     moderation_status: str = ModerationStatus.PENDING.value
-    # The POLICY CODE justifying a moderation decision, never free text and
-    # never anything derived from the score. The service constrains it to an
-    # allow-list (``MODERATION_REASON_CODES``), which is what makes
-    # sentiment-neutrality a property the system holds rather than one it
-    # asks its operators to remember: there is no expressible way to record
-    # "low score" as a reason. Machine-readable on purpose, so a moderation
-    # history can be audited by grouping rather than by reading prose.
+    # Why a review was withheld: the POLICY violation a moderator cited,
+    # recorded on the document so a withheld review carries its
+    # justification. It describes the CONTENT - abuse, personally
+    # identifying information, profanity - and never the score. That
+    # constraint is enforced where the transition is made
+    # (``app/services/rating.py:_moderate_rating``), which is also the one
+    # place that decides a reason may exist ONLY on a rejection: an
+    # approved or pending rating carries none, so a record can never
+    # display its review while claiming a violation. Bounded plain text,
+    # per the validator below.
+    #
+    # It is a single free-text field on purpose. An allow-list of policy
+    # codes was tried and removed: it made the contract wider than the one
+    # this feature is specified against, it could not record which phrase
+    # or which phone number was at issue - the fact a moderator's decision
+    # actually turns on - and it bought no sentiment-neutrality that the
+    # transition rule does not already provide, since neutrality comes from
+    # the score never driving the decision, not from the vocabulary a
+    # reason is written in.
     moderation_reason: Optional[str] = None
-    # The human specifics behind the code - which phrase was abusive, whose
-    # phone number appeared. Separate from the code precisely so the code
-    # can stay closed while the detail stays free, and OPERATIONAL: it
-    # reaches only the administrator response model, never a public or
-    # participant read.
-    moderation_note: Optional[str] = None
     # Permissive ANNOTATION by necessity, constrained by the validator
     # below. The write path assigns ``firestore.SERVER_TIMESTAMP``,
     # which is a sentinel object and not a ``datetime``; a strict
@@ -592,39 +622,21 @@ class Rating(BaseModel):
         cls,
         value: Optional[str],
     ) -> Optional[str]:
-        """Hold the moderator's reason code to a bounded plain-text contract.
+        """Hold the moderator's reason to a bounded plain-text contract.
 
-        The value is a policy code the service picks from an allow-list, so
-        this is a backstop rather than the constraint: it keeps a stored
-        document that predates the allow-list, or one written outside the
-        service, from carrying control characters or an unbounded string
-        into a response. Whitespace-only text normalises to ``None``, which
-        keeps "no reason recorded" a single state rather than two.
+        Staff-authored rather than public, but persisted on this document
+        and returned to an administrator and to the rating's own author, so
+        it gets the same normalisation as the review and a bound of its
+        own: an unbounded reason is an unbounded write into a document
+        Firestore caps at 1 MiB, and a newline in it forges a line in any
+        log or export that renders it. Whitespace-only text normalises to
+        ``None``, which keeps "no reason recorded" a single state rather
+        than two.
         """
         return as_plain_text(
             value,
             max_length=MODERATION_REASON_MAX_LENGTH,
             label='Moderation reason',
-        )
-
-    @validator('moderation_note')
-    def _validate_moderation_note(
-        cls,
-        value: Optional[str],
-    ) -> Optional[str]:
-        """Hold the operator's note to a bounded plain-text contract.
-
-        Staff-authored rather than public, but still persisted on this
-        document and still returned to an administrator, so it gets the
-        same normalisation as the review and a bound of its own: an
-        unbounded note is an unbounded write into a document Firestore
-        caps at 1 MiB, and a newline in it forges a line in any log or
-        export that renders it.
-        """
-        return as_plain_text(
-            value,
-            max_length=MODERATION_REASON_MAX_LENGTH,
-            label='Moderation note',
         )
 
     @validator('created_at', 'updated_at', always=True)
@@ -746,18 +758,19 @@ class ModeratedRatingView(RatingView):
     and its policy basis are the answer to the question asked. Every other
     read returns :class:`RatingView`.
 
-    ``moderation_reason`` is a POLICY CODE and never anything derived from
-    the score - the service constrains it to an allow-list, so a
-    score-based justification is not expressible. ``moderation_note``
-    carries the human specifics behind that code. Both exist so a withheld
-    review carries its justification on the record, which is what makes
-    the sentiment-neutrality of the decision auditable rather than merely
-    asserted.
+    ``moderation_reason`` records the POLICY violation the moderator
+    cited, and is present only on a rejection - the service refuses to
+    withhold a review without one and refuses to record one beside an
+    approved or pending state, so the pair a caller reads back cannot
+    contradict itself. It exists so a withheld review carries its
+    justification on the record, which is what makes the
+    sentiment-neutrality of the decision auditable rather than merely
+    asserted: the reason names something about the CONTENT, never the
+    score.
     """
 
     moderation_status: str
     moderation_reason: Optional[str] = None
-    moderation_note: Optional[str] = None
 
     @validator('moderation_status')
     def _validate_moderation_status(cls, value: Any) -> str:
@@ -1017,7 +1030,6 @@ def to_moderated_rating_view(rating: Rating) -> ModeratedRatingView:
         **to_rating_view(rating).dict(),
         moderation_status=rating.moderation_status,
         moderation_reason=rating.moderation_reason,
-        moderation_note=rating.moderation_note,
     )
 
 

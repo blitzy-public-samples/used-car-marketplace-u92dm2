@@ -99,13 +99,28 @@ import {
  * endpoint label and a list of schema field paths would otherwise be shown to
  * whoever was rating a car.
  *
+ * CREDENTIALS GO ONLY WHERE THE SERVER USES THEM
+ * -----------------------------------------------------------------------------
+ * Four of the six calls below are authenticated and two are public, exactly as
+ * the router declares: the submission, the eligibility check, the per-transaction
+ * read and the moderation transition all resolve a caller, while the ratings a
+ * user has received and their reputation aggregate are readable by anyone,
+ * matching the unauthenticated precedent of `GET /listings`.
+ *
+ * The bearer token is therefore attached PER ENDPOINT rather than per module —
+ * `createRatingApiInstance` installs the request interceptor only for the
+ * authenticated policy. Sending a credential to an endpoint that reads nothing
+ * from it spends least privilege for nothing, makes a cacheable public response
+ * private to every shared cache, and turns an expired token into a needless 401
+ * on a page that had no reason to care.
+ *
  * NOTHING SENSITIVE IS EVER LOGGED
  * -----------------------------------------------------------------------------
- * An `AxiosError` carries the `config` it came from, and by then the request
- * interceptor has written `Authorization: Bearer <token>` into its headers — so
- * logging the error object itself publishes a live credential to the console and
- * to anything mirroring it. Every log in this module therefore goes through
- * `describeRequestFailure`, which builds a fresh four-primitive object by
+ * An `AxiosError` carries the `config` it came from, and on an authenticated call
+ * the request interceptor has written `Authorization: Bearer <token>` into its
+ * headers — so logging the error object itself publishes a live credential to the
+ * console and to anything mirroring it. Every log in this module therefore goes
+ * through `describeRequestFailure`, which builds a fresh four-primitive object by
  * allow-list. The error is still REJECTED WITH in full, because the caller needs
  * the status and the detail; it is simply never written down.
  *
@@ -159,10 +174,13 @@ import {
  * member expression, so the surviving guard evaluates false in a bundle and
  * silently yields no base URL at all.
  *
- * `undefined` is a legitimate value, not a failure: axios then resolves every
- * path below against the page's own origin. That is the correct behaviour for a
- * deployment serving the API from the same host, and it is why nothing here
- * throws on an unset variable.
+ * `undefined` is what this constant holds when the variable is unset, and it is
+ * NOT treated as a legitimate configuration: `resolveApiBaseUrl` below throws on
+ * it. Falling back to the page's own origin — which is what axios does with an
+ * absent `baseURL` — is the failure that does not look like one, because the
+ * requests then succeed against the wrong server. So this constant is the raw
+ * read, and the decision about whether it is usable belongs to the one function
+ * that can name the variable while refusing it.
  */
 const RAW_API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
 
@@ -292,8 +310,8 @@ export const readAuthToken = (): string | null => {
  * may be logged. Nothing anywhere in this feature logs an axios error object.
  *
  * That prohibition is concrete rather than precautionary. An `AxiosError` carries
- * `config`, and `config` carries `headers` — including the
- * `Authorization: Bearer …` header the request interceptor below just attached —
+ * `config`, and `config` carries `headers` — including, on an authenticated call,
+ * the `Authorization: Bearer …` header the request interceptor below attached —
  * and `data`, the request body, which on the submission path is the review the
  * user wrote. `console.error('…', error)` serialises all of it into the browser
  * console, and from there into any telemetry or session-replay tool that scrapes
@@ -370,7 +388,8 @@ export const readServerDetail = (error: unknown): string | null => {
  * ---------------------------------------------------------------------------
  * An `AxiosError` carries its originating `config`, and by the time an error
  * exists the request interceptor above has already written
- * `Authorization: Bearer <token>` into `config.headers`. So
+ * `Authorization: Bearer <token>` into `config.headers` for any authenticated
+ * call — which is four of the six. So
  * `console.error('...', error)` publishes a live bearer token to the browser
  * console and to every telemetry agent that mirrors it (CWE-532, insertion of
  * sensitive information into log file). The same object also holds
@@ -433,40 +452,78 @@ export const describeRequestFailure = (
 };
 
 /**
- * Build an axios instance carrying the bearer token and preserving errors.
+ * Whether an instance is for calls the server authenticates, or for public reads.
+ *
+ * Named rather than a bare boolean because the value appears at every call site
+ * below, and `createRatingApiInstance(false)` at a call site says nothing about
+ * what the false means. `'authenticated'` and `'public'` state the endpoint's own
+ * contract, so a reader of `submitRating` or `fetchUserRatings` can see which of
+ * the two it claims to be without leaving the line.
+ */
+type RatingAuthPolicy = 'authenticated' | 'public';
+
+/**
+ * Build an axios instance for one auth policy, preserving errors either way.
  *
  * Mirrors `createApiInstance` in `./api`, which is a module-local `const` with
  * no `export` keyword. It is genuinely unexported, so the shape is replicated
  * here rather than imported. The reverse direction is also deliberate: `./api`
  * imports the mappers below, so this module must never import `./api` back.
  *
- * The response interceptor is load-bearing for the whole feature's UX. It logs
- * REDACTED metadata and then rejects with the ORIGINAL error, unwrapped and
- * unreplaced, which is the only reason `error.response.data.detail` survives to
- * be rendered verbatim by the submission form. Constructing a new error here —
- * however tidy the message — would discard the server's own explanation of the
- * refusal.
+ * CREDENTIALS ARE ATTACHED PER ENDPOINT, NOT PER MODULE
+ * -----------------------------------------------------------------------------
+ * The request interceptor is installed ONLY for the `'authenticated'` policy. It
+ * used to be installed unconditionally, so the two public reads — the ratings a
+ * user has received and their reputation aggregate — sent a live bearer token to
+ * an endpoint that declares no authentication dependency at all and reads
+ * nothing from the caller's identity. Four things were wrong with that, and none
+ * of them is theoretical:
+ *
+ *   - LEAST PRIVILEGE. A credential should reach exactly the requests that need
+ *     it. The reputation read is rendered beside every listing, so the token was
+ *     being put on the wire more often than on every other call combined, and
+ *     each of those requests is another place it can be logged by a proxy, an
+ *     error reporter or a browser extension.
+ *   - CACHING. A public GET carrying `Authorization` is treated by shared caches
+ *     and CDNs as private, so the one response in this feature that is genuinely
+ *     the same for every reader could not be cached for any of them.
+ *   - FAILURE MODE. An expired token on a public read is a needless way to turn a
+ *     working page into a 401 the interface has no reason to handle there.
+ *   - HONESTY. The endpoint's public contract is documented in three places; a
+ *     client that always authenticates makes that claim untestable from the
+ *     outside, because nothing ever exercises the unauthenticated path.
+ *
+ * The response interceptor is installed for BOTH, because it is load-bearing for
+ * the whole feature's UX. It logs REDACTED metadata and then rejects with the
+ * ORIGINAL error, unwrapped and unreplaced, which is the only reason
+ * `error.response.data.detail` survives to be rendered verbatim by the submission
+ * form. Constructing a new error here — however tidy the message — would discard
+ * the server's own explanation of the refusal.
  *
  * Logging and rejecting are deliberately different in what they carry. The
  * rejection keeps everything, because the caller is code that needs the status
  * and the detail; the log keeps only `describeRequestFailure`'s five primitives,
  * because a log is a durable artefact that outlives the request and that people
- * and telemetry agents read. The bearer token the request interceptor attached
- * is on the error and must not be in that artefact.
-
+ * and telemetry agents read. On an authenticated call the bearer token is on the
+ * error and must not be in that artefact.
+ *
+ * @param policy `'authenticated'` attaches the bearer token when one is stored;
+ *   `'public'` never attaches it, whether or not the reader is signed in.
  */
-const createRatingApiInstance = (): AxiosInstance => {
+const createRatingApiInstance = (policy: RatingAuthPolicy): AxiosInstance => {
   const instance = axios.create({
     baseURL: resolveApiBaseUrl()
   });
 
-  instance.interceptors.request.use((config) => {
-    const token = readAuthToken();
-    if (token) {
-      config.headers['Authorization'] = `Bearer ${token}`;
-    }
-    return config;
-  });
+  if (policy === 'authenticated') {
+    instance.interceptors.request.use((config) => {
+      const token = readAuthToken();
+      if (token) {
+        config.headers['Authorization'] = `Bearer ${token}`;
+      }
+      return config;
+    });
+  }
 
   instance.interceptors.response.use(
     (response) => response,
@@ -653,14 +710,87 @@ const decode = <T>(endpoint: string, decodeResponse: () => T): T => {
  * three are valid ISO 8601 spellings of the same fact; a naive local timestamp is
  * not accepted, because there is no fact in it.
  *
+ * MATCHING THE SHAPE IS NOT ENOUGH, because the shape admits dates that do not
+ * exist and the parser SILENTLY REPAIRS them rather than refusing them — see
+ * `isRealCalendarInstant`, which is what stands between "2024-02-31" and a rating
+ * displayed under 2 March. The three checks run in the order a reader can act on:
+ * present, then well-formed, then real.
+ *
  * @param value Raw wire value: an ISO 8601 timestamp with an offset, or
  *   null/absent.
  * @param field Dotted field name used in the error message.
  * @throws {TypeError} When the value is absent, not an offset-qualified ISO 8601
- *   timestamp, or not a real instant.
+ *   timestamp, does not name a real date and time, or is not a representable
+ *   instant.
  */
 const ISO_TIMESTAMP_PATTERN =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/;
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
+/**
+ * Whether the calendar components a timestamp DECLARES are the components a real
+ * instant has.
+ *
+ * The check the `Number.isNaN` test below cannot make, because JavaScript's date
+ * parser does not reject an out-of-range day: it NORMALISES it. Every one of these
+ * is well-formed against the pattern above and silently becomes a different date —
+ *
+ *   "2024-02-31T00:00:00Z"       -> 2 March 2024
+ *   "2023-02-29T00:00:00Z"       -> 1 March 2023   (2023 is not a leap year)
+ *   "2024-02-30T12:00:00+02:00"  -> 1 March 2024
+ *
+ * — so the earlier comment claiming that such a value produced an Invalid Date was
+ * simply wrong, and the guard it justified never fired. A rating would then be
+ * rendered and sorted under a date the server never sent, off by a day or more,
+ * with nothing anywhere reporting a problem. A timestamp that is quietly wrong is
+ * worse than one that fails, which is the same reasoning that requires an explicit
+ * offset.
+ *
+ * The test is a strict round trip. The declared components are written onto a UTC
+ * date, which applies exactly the normalisation the parser applies, and then read
+ * back: a real instant survives unchanged, while 31 February comes back as 2 March
+ * and fails on the day. It therefore needs no month-length table and no leap-year
+ * rule of its own — the platform's calendar is the authority, which is what makes
+ * it correct for every year rather than for the cases someone thought of.
+ *
+ * `setUTCFullYear` is used rather than `Date.UTC`, whose two-digit-year mapping
+ * would read a declared year of `0024` as 1924 and report a legitimate — if
+ * implausible — timestamp as malformed.
+ *
+ * The seconds component is optional in the pattern and defaults to 0, matching
+ * `new Date`. The fractional part is deliberately not round-tripped: a fraction
+ * cannot be out of range, and V8 truncates beyond milliseconds, so comparing it
+ * would reject the perfectly valid microsecond precision Python's `isoformat`
+ * emits.
+ *
+ * @param components The pattern's capture groups: year, month, day, hour, minute
+ *   and optional second, as written.
+ * @returns Whether those components name a real instant.
+ */
+const isRealCalendarInstant = (components: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}): boolean => {
+  const normalised = new Date(0);
+  normalised.setUTCFullYear(
+    components.year,
+    components.month - 1,
+    components.day
+  );
+  normalised.setUTCHours(components.hour, components.minute, components.second, 0);
+
+  return (
+    normalised.getUTCFullYear() === components.year &&
+    normalised.getUTCMonth() === components.month - 1 &&
+    normalised.getUTCDate() === components.day &&
+    normalised.getUTCHours() === components.hour &&
+    normalised.getUTCMinutes() === components.minute &&
+    normalised.getUTCSeconds() === components.second
+  );
+};
 
 const toDate = (value: string | null | undefined, field: string): Date => {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -670,15 +800,35 @@ const toDate = (value: string | null | undefined, field: string): Date => {
     );
   }
 
-  if (!ISO_TIMESTAMP_PATTERN.test(value)) {
+  const match = ISO_TIMESTAMP_PATTERN.exec(value);
+  if (match === null) {
     throw new TypeError(
       `${field} is not an ISO 8601 timestamp with a UTC offset: "${value}"`
     );
   }
 
+  // The pattern admits well-formed impossibilities - 31 February, an hour of 25 -
+  // so the components are checked against the calendar before the string is
+  // parsed. `match` groups are digit runs by construction, so each parses.
+  if (
+    !isRealCalendarInstant({
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+      hour: Number(match[4]),
+      minute: Number(match[5]),
+      second: match[6] === undefined ? 0 : Number(match[6])
+    })
+  ) {
+    throw new TypeError(
+      `${field} does not name a real date and time: "${value}"`
+    );
+  }
+
   const parsed = new Date(value);
-  // Still checked after the pattern, which admits a well-formed impossibility
-  // such as "2024-02-31T00:00:00Z" or an hour of 25.
+  // Reached only for a value whose components ARE a real instant, so this catches
+  // what remains: an offset the platform refuses, or a year beyond the range a
+  // `Date` can represent.
   if (Number.isNaN(parsed.getTime())) {
     throw new TypeError(`${field} is not a valid ISO 8601 timestamp: "${value}"`);
   }
@@ -701,9 +851,14 @@ const toDate = (value: string | null | undefined, field: string): Date => {
  * becomes a COMPILE error, whereas a converter would map the new name to a key
  * nobody reads and hand back a silent `undefined`.
  *
- * Optionality mirrors `backend/app/schema/rating.py` field by field, so a value
- * the server may legitimately omit is declared as omittable here and handled by
- * the mappers, rather than being asserted present and crashing at run time.
+ * Nullability mirrors `backend/app/schema/rating.py` field by field, and so does
+ * REQUIREDNESS, which is the distinction that matters: FastAPI serialises the
+ * declared response model, so every field of it is present on every payload and a
+ * nullable one carries `null` rather than vanishing. Each is therefore declared
+ * `T | null` and never `T | null | undefined`. Nothing here is optional, because
+ * nothing the server sends is optional — an absent key is a malformed payload,
+ * and modelling it as legitimate is what allowed the mappers to substitute a
+ * plausible value for it.
  *
  * Enumerated fields are typed as `string` on the way in, because a wire value is
  * unvalidated until a schema has seen it. The Zod enums narrow them to their
@@ -731,16 +886,18 @@ const toDate = (value: string | null | undefined, field: string): Date => {
  * omittable here would model a payload the server cannot send while hiding the
  * one it does.
  *
- * `moderation_status`, `moderation_reason` and `moderation_note` are ABSENT.
+ * `moderation_status` and `moderation_reason` are ABSENT.
  * Moderation state is operational: the visibility decision it drives has already
  * been applied to `is_published` and to whether `review` carries text, so a
  * public or participant reader needs none of it and is given none of it. Only
  * the admin-only moderation endpoint returns those fields, under
  * `ModeratedRatingWire` below.
  *
- * `review` remains omittable-or-null because the server returns the key carrying
+ * `review` is NULLABLE BUT REQUIRED: the server always returns the key, carrying
  * `null` when there is no value — the review was never written, or moderation has
- * not approved the text.
+ * not approved the text. Declaring it omittable would model a payload the server
+ * cannot send, and it let the mapper report a truncated response as a rating whose
+ * author had written nothing.
  */
 export interface RatingWire {
   id: string;
@@ -750,7 +907,7 @@ export interface RatingWire {
   ratee_id: string;
   direction: string;
   score: number;
-  review?: string | null;
+  review: string | null;
   is_published: boolean;
   created_at: string;
   updated_at: string;
@@ -766,15 +923,20 @@ export interface RatingWire {
  * public read by accident: the read paths are typed to the narrow shape, so a
  * mapper that leaked moderation state would not compile.
  *
- * `moderation_reason` is a POLICY CODE rather than prose, and never anything
- * derived from the score. `moderation_note` carries the operator's specifics
- * behind that code. Both are omittable-or-null: the server returns the key
- * carrying `null` when nothing has been recorded.
+ * `moderation_reason` is the policy basis the moderator recorded: prose about
+ * the review CONTENT, never anything derived from the score. The server permits
+ * it only beside `rejected` and requires it there, so it carries `null` on every
+ * state that displays the review.
+ *
+ * It is nullable but REQUIRED. `moderation_reason` is a declared field on
+ * `ModeratedRatingView` and the route sets no `response_model_exclude_*`, so
+ * FastAPI serialises the key on every response. Declaring it omittable would
+ * model a malformed payload rather than the server, and would erase the
+ * difference between "the server recorded no reason" and "the key never arrived".
  */
 export interface ModeratedRatingWire extends RatingWire {
   moderation_status: string;
-  moderation_reason?: string | null;
-  moderation_note?: string | null;
+  moderation_reason: string | null;
 }
 
 /**
@@ -801,37 +963,43 @@ export interface RatingAggregateWire {
 /**
  * Envelope returned by `GET /api/ratings/user/{userId}`.
  *
- * The two data halves travel together because they must agree: the list a reader
- * can see has to account for the average they are shown. Both cover published
- * ratings only.
+ * Two keys, mirroring the server exactly. Page metadata was mirrored here and
+ * removed again with the API expansion it belonged to.
  *
- * `items` is ONE PAGE while `aggregate` covers every published rating, so
- * `aggregate.count` may legitimately exceed `items.length`. `has_more` and
- * `next_cursor` are what make that difference legible rather than looking like a
- * contradiction: the first says the remainder exists, the second says how to
- * reach it. Both are declared required because the server sends both on every
- * page — `next_cursor` carrying `null` on the last one.
+ * The two halves travel together because they must agree, and the server
+ * establishes both from ONE pinned snapshot so they cannot disagree. Both cover
+ * published ratings only.
+ *
+ * `items` is bounded and omits any rating whose review moderation rejected;
+ * `aggregate` counts every published rating whatever its score and state. So
+ * `aggregate.count` may legitimately exceed `items.length` — the contract, not a
+ * contradiction.
  */
 export interface UserRatingsResponseWire {
   items: RatingWire[];
   aggregate: RatingAggregateWire;
-  next_cursor?: string | null;
-  has_more: boolean;
 }
 
 /**
  * `EligibilityDecision` as it travels.
  *
- * `reason`, `ratee_id` and `direction` are all omittable-or-null. There is
- * nothing to explain when the caller is eligible, and the server can only derive
- * the counterparty and the direction once it has confirmed the caller is a
- * participant — a decision that never got that far reports both as null.
+ * All five keys are REQUIRED, and three of them are nullable. There is nothing to
+ * explain when the caller is eligible, and the server can only derive the
+ * counterparty and the direction once it has confirmed the caller is a
+ * participant — a decision that never got that far reports both as null. What it
+ * never does is omit a key, so `undefined` here is a malformed payload and is
+ * refused rather than read as "no reason" or "no counterparty".
+ *
+ * The combinations those three may legitimately take are constrained together by
+ * `EligibilityDecisionSchema`: an eligible decision names its counterparty and
+ * its direction, an ineligible one carries the refusal's own sentence, and having
+ * already rated implies ineligible.
  */
 export interface EligibilityDecisionWire {
   eligible: boolean;
-  reason?: string | null;
-  ratee_id?: string | null;
-  direction?: string | null;
+  reason: string | null;
+  ratee_id: string | null;
+  direction: string | null;
   already_rated: boolean;
 }
 
@@ -849,23 +1017,21 @@ export interface RatingCreateWire {
 }
 
 /**
- * Body of `PATCH /api/ratings/{ratingId}/moderation`. Exactly three keys.
+ * Body of `PATCH /api/ratings/{ratingId}/moderation`. Exactly two keys.
  *
  * The router's model sets `extra = 'forbid'`, so any additional key — notably a
  * `score` or `review`, which the append-only contract never permits editing — is
  * refused with a 422 naming the offending field rather than silently ignored.
  *
- * `moderation_reason` is the POLICY CODE the server checks against its allow-list,
- * and `moderation_note` is the operator's free-text account of the specifics
- * behind that code. They are two fields rather than one on purpose: the code is
- * what decides, the note decides nothing, and separating them is what keeps a
- * justification from being written as prose that nobody can check. Either is
- * cleared when omitted.
+ * `moderation_reason` is the policy basis for the transition, describing the
+ * violation in the review content. The server governs it with a matrix rather
+ * than a default: mandatory when rejecting, refused on any other state, and
+ * cleared by the transition that leaves a rejection. Both halves surface as a
+ * 422, and neither is duplicated here.
  */
 export interface ModerationWire {
   moderation_status: ModerationStatus;
   moderation_reason?: string;
-  moderation_note?: string;
 }
 
 /*
@@ -886,10 +1052,31 @@ export interface ModerationWire {
  * enums declare those literals. Re-casing `buyer_to_seller` to `buyerToSeller`
  * would break both the enum parse and the backend contract.
  *
- * Absent and null collapse to `null`, never to `undefined`, because the schemas
- * declare these fields `.nullable()` and the two are not interchangeable to Zod.
- * `??` is used rather than `||` so that a falsy-but-real value survives: an empty
- * `review` stays an empty string and an `average` of 0 stays 0.
+ * NULL IS FORWARDED; AN ABSENT KEY IS REFUSED. The two are different facts and
+ * neither mapper below collapses one into the other.
+ *
+ * Every nullable field on a rating response is nullable-but-REQUIRED on the
+ * server: FastAPI serialises the declared model and no rating route sets
+ * `response_model_exclude_none` or `response_model_exclude_unset`, so `review`,
+ * `reason`, `ratee_id`, `direction` and `moderation_reason` are all present on
+ * every payload, carrying `null` when there is nothing to report. The wire
+ * interfaces above therefore declare them `T | null` rather than
+ * `T | null | undefined`, and the mappers pass each value through UNCHANGED
+ * instead of applying `?? null`.
+ *
+ * That coalescing was the defect. `wire.review ?? null` turns a truncated,
+ * reshaped or wrong-version payload into a confident statement of fact — "this
+ * rating carries no review", "this caller is refused for no stated reason", "this
+ * user has no ratings yet" — and every one of those is rendered to a user as
+ * though the server had said it. Passing the value through instead means an absent key
+ * reaches a `.nullable()` schema, which refuses `undefined` and reports the
+ * missing field BY NAME, and `decode` adds the endpoint. A malformed success is
+ * then a named contract failure rather than a plausible-looking lie.
+ *
+ * Nothing else is defaulted for the same reason, and the schemas additionally
+ * enforce the rules that span two fields — an eligible decision names its
+ * counterparty, an ineligible one explains itself, and a positive rating count
+ * requires an average.
  */
 
 /**
@@ -920,7 +1107,7 @@ export const toRating = (wire: RatingWire): Rating =>
     rateeId: wire.ratee_id,
     direction: wire.direction,
     score: wire.score,
-    review: wire.review ?? null,
+    review: wire.review,
     isPublished: wire.is_published,
     createdAt: toDate(wire.created_at, 'Rating.created_at'),
     updatedAt: toDate(wire.updated_at, 'Rating.updated_at')
@@ -938,11 +1125,11 @@ export const toRating = (wire: RatingWire): Rating =>
  * validate the same data twice while making the field list harder to audit. One
  * schema sees this payload once.
  *
- * `moderationReason` is carried through verbatim as the policy code the server
- * recorded, and `moderationNote` as the operator's account of it. Neither is
- * interpreted here: nothing in this module reads, branches on or renders a
- * decision from either, and no code exists for a low score, so sentiment-neutral
- * moderation is preserved by there being no mechanism to violate it.
+ * `moderationReason` is carried through verbatim as the policy basis the server
+ * recorded. It is not interpreted here: nothing in this module reads, branches on
+ * or renders a decision from it, and nothing here can see a score alongside it,
+ * so sentiment-neutral moderation is preserved by there being no mechanism to
+ * violate it.
  *
  * @param wire Raw moderated rating object from the moderation endpoint.
  * @returns The validated, camelCase rating including its moderation state.
@@ -960,13 +1147,12 @@ export const toModeratedRating = (
     rateeId: wire.ratee_id,
     direction: wire.direction,
     score: wire.score,
-    review: wire.review ?? null,
+    review: wire.review,
     isPublished: wire.is_published,
     createdAt: toDate(wire.created_at, 'ModeratedRating.created_at'),
     updatedAt: toDate(wire.updated_at, 'ModeratedRating.updated_at'),
     moderationStatus: wire.moderation_status,
-    moderationReason: wire.moderation_reason ?? null,
-    moderationNote: wire.moderation_note ?? null
+    moderationReason: wire.moderation_reason
   });
 
 /**
@@ -1026,9 +1212,9 @@ export const toEligibilityDecision = (
 ): EligibilityDecision =>
   EligibilityDecisionSchema.parse({
     eligible: wire.eligible,
-    reason: wire.reason ?? null,
-    rateeId: wire.ratee_id ?? null,
-    direction: wire.direction ?? null,
+    reason: wire.reason,
+    rateeId: wire.ratee_id,
+    direction: wire.direction,
     alreadyRated: wire.already_rated
   });
 
@@ -1046,17 +1232,10 @@ export const toEligibilityDecision = (
  * an empty list would render a user's reputation as "no ratings yet" on the
  * strength of a malformed response.
  *
- * The page metadata is mapped alongside them. `has_more` is checked for presence
- * rather than defaulted, for the same reason as the two data halves: defaulting an
- * absent flag to `false` would tell a reader that a page containing part of
- * someone's reputation was all of it. `next_cursor` legitimately arrives null on
- * the last page, so absent and null both collapse to null.
- *
- * @param wire Raw `{ items, aggregate, next_cursor, has_more }` envelope.
- * @returns The validated envelope: one page of published ratings, the aggregate
- *   over all of them, and how to reach the rest.
- * @throws {TypeError} When `items` is not an array, or `aggregate` or `has_more`
- *   is missing.
+ * @param wire Raw `{ items, aggregate }` envelope.
+ * @returns The validated envelope: the published ratings a reader may see, and
+ *   the aggregate over all of them.
+ * @throws {TypeError} When `items` is not an array or `aggregate` is missing.
  * @throws {ZodError} When any rating or the aggregate fails validation.
  */
 export const toUserRatingsResponse = (
@@ -1074,18 +1253,9 @@ export const toUserRatingsResponse = (
     );
   }
 
-  if (typeof wire.has_more !== 'boolean') {
-    throw new TypeError(
-      'UserRatingsResponse.has_more is required: expected a boolean saying ' +
-        'whether another page of ratings exists'
-    );
-  }
-
   return UserRatingsResponseSchema.parse({
     items: wire.items.map((item) => toRating(item)),
-    aggregate: toRatingAggregate(wire.aggregate),
-    nextCursor: wire.next_cursor ?? null,
-    hasMore: wire.has_more
+    aggregate: toRatingAggregate(wire.aggregate)
   });
 };
 
@@ -1138,35 +1308,28 @@ export const toRatingCreateWire = (input: RatingCreate): RatingCreateWire => {
 /**
  * Build the moderation `PATCH` body. F010-4.
  *
- * Three keys at most, because the router's model forbids extras and because the
- * append-only contract has nothing else to say: a state, the policy code that
- * justifies reaching it, and optionally the operator's account of the specifics.
- * The original score and words are untouched by this request and there is no
- * shape here capable of altering them.
+ * Two keys at most, because the router's model forbids extras and because the
+ * append-only contract has nothing else to say: a state, and the policy reason
+ * that justifies reaching it. The original score and words are untouched by this
+ * request and there is no shape here capable of altering them.
  *
- * The reason is a POLICY CODE from the server's allow-list — `abuse`,
- * `personal_information`, `profanity` and the rest — and is forwarded verbatim
- * rather than composed here, because the allow-list has one owner and a client
- * copy of it would be the one that drifted. A low score is never itself a
- * violation, no code expresses one, and this mapper cannot see the score at all:
- * that is the structural half of the guarantee that moderation stays
- * sentiment-neutral as 16 CFR Part 465 requires. The note is where the human
- * specifics belong, and it justifies nothing on its own.
+ * The reason is forwarded verbatim rather than composed, checked or classified
+ * here. This mapper cannot see the score at all, which is the structural half of
+ * the guarantee that moderation stays sentiment-neutral as 16 CFR Part 465
+ * requires; the other half is the server's, which never lets a score drive a
+ * transition.
  *
  * @param moderationStatus Target state; the union is enforced by the caller's type.
- * @param moderationReason Policy code. Omitted from the body when undefined,
- *   which the server reads as clearing any recorded reason. The server refuses a
- *   rejection that carries none, and refuses a code outside its allow-list, both
- *   surfacing as a 422 — those rules have one owner and are deliberately not
- *   duplicated here.
- * @param moderationNote Operator note recording the specifics behind the code.
- *   Omitted when undefined, which clears any recorded note.
- * @returns The one-, two- or three-key snake_case body.
+ * @param moderationReason The policy basis, describing the violation in the
+ *   review content. Omitted from the body when undefined, which the server reads
+ *   as clearing any recorded reason. The server requires one for a rejection and
+ *   refuses one for any other state, both surfacing as a 422 — those rules have
+ *   one owner and are deliberately not duplicated here.
+ * @returns The one- or two-key snake_case body.
  */
 export const toModerationWire = (
   moderationStatus: ModerationStatus,
-  moderationReason?: string,
-  moderationNote?: string
+  moderationReason?: string
 ): ModerationWire => {
   const body: ModerationWire = {
     moderation_status: moderationStatus
@@ -1174,10 +1337,6 @@ export const toModerationWire = (
 
   if (moderationReason !== undefined) {
     body.moderation_reason = moderationReason;
-  }
-
-  if (moderationNote !== undefined) {
-    body.moderation_note = moderationNote;
   }
 
   return body;
@@ -1223,7 +1382,7 @@ export const toModerationWire = (
  * @throws {RatingContractError} When the created rating cannot be interpreted.
  */
 export const submitRating = async (input: RatingCreate): Promise<Rating> => {
-  const api = createRatingApiInstance();
+  const api = createRatingApiInstance('authenticated');
   const response = await api.post<RatingWire>(
     RATINGS_PATH,
     toRatingCreateWire(input)
@@ -1237,51 +1396,43 @@ export const submitRating = async (input: RatingCreate): Promise<Rating> => {
  *
  * A public read, matching the unauthenticated precedent of `GET /listings`: a
  * reputation is what a prospective counterparty consults before deciding to
- * transact, so it cannot require an account to see.
+ * transact, so it cannot require an account to see. This request therefore sends
+ * NO bearer token, whether or not the reader happens to be signed in — the route
+ * declares no authentication dependency and reads nothing from the caller's
+ * identity, so a credential here would be spent for nothing and would make a
+ * response every reader shares private to one of them.
  *
  * Published ratings only, in both halves, so an unreciprocated rating appears in
  * neither. A user with no ratings is a first-class state and not an error — an
  * empty `items` beside `average: null, count: 0`.
  *
- * ONE PAGE, AND THE PAGE IS REPORTED
+ * THE USER ID IS THE WHOLE REQUEST
  * ---------------------------------------------------------------------------
- * `items` is a single page while `aggregate` covers every published rating, so
- * `aggregate.count` may exceed `items.length`. The response says so: `hasMore`
- * reports that a remainder exists and `nextCursor` is the value to pass back as
- * `after` to read it. Paging is therefore the caller's to drive, and it is
- * driveable — a reputation summary computed from records the response gave no way
- * to fetch would be exactly the discrepancy this metadata exists to remove.
+ * No page size, no cursor, no mode. `items` is bounded by the server and omits
+ * any rating whose review moderation rejected, while `aggregate` counts every
+ * published rating, so `aggregate.count` may exceed `items.length` — the
+ * contract, not a discrepancy. Page controls were sent from here and have been
+ * removed with the server-side expansion they belonged to: the cursor was a
+ * rating ID a caller supplied and the server looked up, which made a public read
+ * answer questions about ratings the caller could not otherwise see.
+ *
+ * The server settles any publication already due before answering, and takes
+ * both halves from one pinned snapshot, so this response can neither be waiting
+ * on a worker nor contradict itself.
  *
  * @param userId The user whose received ratings are wanted.
- * @param page Optional page controls. `limit` requests a page size, which the
- *   server clamps into a serviceable range rather than trusting; `after` is the
- *   `nextCursor` from a previous page, and omitting it starts at the newest
- *   rating. Neither is sent when undefined, which asks for the server's default
- *   first page.
- * @returns One page of published ratings, the aggregate over all of them, and the
- *   continuation metadata.
- * @throws {AxiosError} 404 when no such user exists; 422 when `after` is not a
- *   well-formed rating identifier.
+ * @returns The published ratings received, newest first, and the aggregate over
+ *   all of them.
+ * @throws {AxiosError} 404 when no such user exists.
  * @throws {RatingContractError} When the envelope cannot be interpreted.
  */
 export const fetchUserRatings = async (
-  userId: string,
-  page?: { limit?: number; after?: string }
+  userId: string
 ): Promise<UserRatingsResponse> => {
-  const api = createRatingApiInstance();
-  const params: Record<string, string | number> = {};
-
-  if (page?.limit !== undefined) {
-    params.limit = page.limit;
-  }
-
-  if (page?.after !== undefined) {
-    params.after = page.after;
-  }
-
+  // PUBLIC: no credential is attached, matching the endpoint's own contract.
+  const api = createRatingApiInstance('public');
   const response = await api.get<UserRatingsResponseWire>(
-    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`,
-    { params }
+    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`
   );
 
   return decode(`GET ${RATINGS_PATH}/user/{userId}`, () =>
@@ -1292,29 +1443,37 @@ export const fetchUserRatings = async (
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * NOT a separate endpoint, and not a second request either. It reads the same
- * `GET /api/ratings/user/{userId}` path with `aggregate_only=true`, which the
- * server answers from the user document alone: one document read, an empty
- * `items`, and the two numbers a badge needs.
+ * NOT a separate endpoint and not a separate mode: it reads the same
+ * `GET /api/ratings/user/{userId}` response and keeps the `aggregate` half. An
+ * `aggregate_only=true` mode was requested from here and has been removed,
+ * because it answered from the user document WITHOUT settling publications that
+ * were already due — and this is the surface that renders beside every listing,
+ * so the most-read reputation in the product was the one that could sit stale
+ * while a worker that will never run was nominally responsible for revealing it.
  *
- * Asking for the mode is the point of this function rather than an optimisation
- * detail. Fetching the full envelope to keep two fields transfers a page of
- * ratings — every review body, every identifier — and makes the server settle
- * due publications and run a second query, all discarded on arrival. This
- * surface renders beside every listing, so that waste is paid per card. The
- * aggregate is denormalised onto the user document precisely so a reputation
- * costs ONE read, which is what holds the 200 ms budget the SRS sets for 95% of
- * API responses; requesting the whole envelope would spend the saving it exists
- * to make.
+ * The cost of dropping it is honest and bounded: this call transfers the bounded
+ * `items` array it does not use. Correct-and-settled beats cheap-and-stale for a
+ * number the whole feature exists to report, and the aggregate itself is still
+ * one denormalised document read on the server.
  *
- * The response shape is identical in both modes, so it is decoded by the same
- * mapper and no schema knows which mode produced it.
+ * A public read, so it sends no bearer token — it delegates to
+ * `fetchUserRatings`, which attaches none. This is the surface that renders
+ * beside every listing, so it is also the one where an unnecessary credential
+ * would have been put on the wire most often.
+ *
+ * SETTLEMENT IS NEVER SKIPPED
+ * ---------------------------------------------------------------------------
+ * The server settles any rating whose window has elapsed before it answers,
+ * which it must: publication has no worker behind it, so a read is the only
+ * thing that ever performs one. A mode that skipped settlement would make this
+ * the one reputation figure in the system permitted to be behind — on the
+ * surface a buyer consults before transacting, and visibly disagreeing with the
+ * same user's profile page. Reading the aggregate out of the settled envelope is
+ * what guarantees this function and `fetchUserRatings` can never report
+ * different reputations for the same user.
  *
  * Reflects published ratings only, and includes every one of them whatever the
- * score. Because this mode does not settle, a rating that has become due but has
- * not yet been published is not counted here - correctly, since the aggregate
- * counts published ratings and publication is an action. The profile view
- * settles, so nothing is stranded.
+ * score.
  *
  * @param userId The user whose reputation is wanted.
  * @returns The aggregate. `average` is null, with `count` 0, for a user who has
@@ -1325,16 +1484,9 @@ export const fetchUserRatings = async (
 export const fetchUserReputation = async (
   userId: string
 ): Promise<RatingAggregate> => {
-  const api = createRatingApiInstance();
-  const response = await api.get<UserRatingsResponseWire>(
-    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}`,
-    { params: { aggregate_only: true } }
-  );
-
-  return decode(
-    `GET ${RATINGS_PATH}/user/{userId}?aggregate_only=true`,
-    () => toUserRatingsResponse(response.data).aggregate
-  );
+  // PUBLIC: delegates to `fetchUserRatings`, which attaches no credential.
+  const response = await fetchUserRatings(userId);
+  return response.aggregate;
 };
 
 /**
@@ -1353,7 +1505,7 @@ export const fetchUserReputation = async (
 export const fetchTransactionRatings = async (
   transactionId: string
 ): Promise<Rating[]> => {
-  const api = createRatingApiInstance();
+  const api = createRatingApiInstance('authenticated');
   const response = await api.get<RatingWire[]>(
     `${RATINGS_PATH}/transaction/${encodeURIComponent(transactionId)}`
   );
@@ -1389,7 +1541,7 @@ export const fetchTransactionRatings = async (
 export const fetchRatingEligibility = async (
   transactionId: string
 ): Promise<EligibilityDecision> => {
-  const api = createRatingApiInstance();
+  const api = createRatingApiInstance('authenticated');
   const response = await api.get<EligibilityDecisionWire>(
     `${RATINGS_PATH}/eligibility/${encodeURIComponent(transactionId)}`
   );
@@ -1419,27 +1571,24 @@ export const fetchRatingEligibility = async (
  *
  * @param ratingId The rating to transition.
  * @param moderationStatus Target state: `pending`, `approved` or `rejected`.
- * @param moderationReason The policy code justifying the transition. Required in
- *   practice for a rejection, which the server enforces; omitting it clears any
- *   recorded reason.
- * @param moderationNote Optional operator note recording the specifics behind the
- *   code; omitting it clears any recorded note.
+ * @param moderationReason The policy basis justifying the transition. Required
+ *   for a rejection and refused on any other state, both enforced by the server;
+ *   omitting it clears any recorded reason.
  * @returns The updated rating, including its moderation state.
  * @throws {AxiosError} 401 unauthenticated; 403 the caller is not an
  *   administrator; 404 no such rating; 422 a rejection carrying no policy basis,
- *   or a reason outside the server's allow-list.
+ *   or a reason supplied for a state that displays the review.
  * @throws {RatingContractError} When the updated rating cannot be interpreted.
  */
 export const moderateRating = async (
   ratingId: string,
   moderationStatus: ModerationStatus,
-  moderationReason?: string,
-  moderationNote?: string
+  moderationReason?: string
 ): Promise<ModeratedRating> => {
-  const api = createRatingApiInstance();
+  const api = createRatingApiInstance('authenticated');
   const response = await api.patch<ModeratedRatingWire>(
     `${RATINGS_PATH}/${encodeURIComponent(ratingId)}/moderation`,
-    toModerationWire(moderationStatus, moderationReason, moderationNote)
+    toModerationWire(moderationStatus, moderationReason)
   );
 
   return decode(`PATCH ${RATINGS_PATH}/{ratingId}/moderation`, () =>

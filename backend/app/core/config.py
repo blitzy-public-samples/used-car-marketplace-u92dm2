@@ -201,31 +201,24 @@ class Settings(BaseSettings):
     RATING_REVIEW_MAX_LENGTH: int = Field(2000, const=True)
     RATING_WINDOW_DAYS: int = Field(14, ge=0, le=365)
 
-    # Ceiling on how many unpublished ratings ONE pass of the scheduled
-    # window sweep may examine. It exists so the sweep is bounded by
-    # configuration rather than by a constant nobody can reach: the value
-    # trades how much of a backlog a single pass clears against the memory
-    # and time that pass costs the worker, and the right number depends on
-    # the size of the deployment. A backlog larger than the ceiling drains
-    # across successive passes, because publishing a rating removes it
-    # from the sweep's query permanently.
-    RATING_SWEEP_SCAN_LIMIT: int = Field(5000, ge=1, le=100000)
-
-    # Broker the Celery application connects to, declared OPTIONAL on
-    # purpose. ``app/tasks/background_jobs.py`` read this name before it
-    # was declared here, which made the whole task module unimportable -
-    # and with it the rating window sweep it hosts.
+    # The four settings above are the ONLY rating settings this feature
+    # adds, and the list is closed deliberately rather than by omission.
     #
-    # It stays optional rather than becoming required because no broker is
-    # provisioned for this deployment and no task in this codebase is ever
-    # dispatched. Making it required would fail application startup - the
-    # API, not just the worker - over infrastructure that nothing
-    # currently needs. Absent, the task module falls back to Celery's
-    # in-memory transport, which is enough to DEFINE and import tasks and
-    # is deliberately not enough to run them anywhere real; the rating
-    # feature's correctness never depends on a worker, because the read
-    # paths publish opportunistically instead.
-    CELERY_BROKER_URL: Optional[str] = None
+    # Two more were briefly declared here and have been removed:
+    # RATING_SWEEP_SCAN_LIMIT, a ceiling on the scheduled window sweep,
+    # and CELERY_BROKER_URL. Neither belongs in the configuration surface.
+    # The sweep's ceiling is a property of the query it walks, so it lives
+    # beside that query as a constant in app/services/rating.py where the
+    # reasoning for its value is visible; exposing it as a setting invited
+    # an operator to tune a number whose meaning is only legible next to
+    # the code that spends it, and it existed to support a global
+    # equality-plus-range sweep that needed a composite index this project
+    # does not declare. And a broker URL configures the worker tier, which
+    # is aspirational in this build - no task is ever dispatched and no
+    # broker is provisioned - so app/tasks/background_jobs.py names its
+    # in-memory transport outright instead of reading a setting that would
+    # only ever be absent. A setting that is always unset is not
+    # configuration; it is a promise the deployment cannot keep.
 
     # Browser origins permitted to call this API with credentials.
     # Validated below rather than merely typed: see FORBIDDEN_ORIGINS.

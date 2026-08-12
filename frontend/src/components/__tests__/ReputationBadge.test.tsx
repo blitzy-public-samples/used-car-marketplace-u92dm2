@@ -186,11 +186,18 @@ const scorePattern = (formatted: string): RegExp =>
  * The two are used together wherever "this string must (not) appear ANYWHERE" is
  * the actual requirement.
  *
- * Note that adjacent elements' text concatenates with no separator here, because
- * the visible spacing comes from a flex `gap` rather than from whitespace in the
- * markup — so a score of `4.5` beside a count of `12` reads as `4.5/512 ratings`
- * in this string. That is why the positive assertions below check for their own
- * fragment with `toContain` rather than comparing the whole line.
+ * Adjacent fragments ARE separated in this string, and that is a property worth
+ * knowing while reading the assertions rather than an implementation detail. A
+ * flex `gap` is not text, so the component additionally emits a literal space
+ * between each visual fragment; a score of `4.5` beside a count of `12` therefore
+ * reads as `4.5/5 12 ratings` here and not as the merged `4.5/512 ratings` that a
+ * gap alone would produce. An earlier version of this note described that merged
+ * form as simply how things were — which is what the `non-visual text` block below
+ * now asserts against, in both this channel and the accessibility tree.
+ *
+ * The string also contains the `sr-only` sentence, since that is real text in the
+ * DOM. Both facts are why the positive assertions check for their own fragment
+ * with `toContain` rather than comparing the whole line for equality.
  */
 const renderedText = (element: HTMLElement): string =>
   (element.textContent ?? '').replace(/\s+/g, ' ').trim();
@@ -449,48 +456,183 @@ describe('ReputationBadge', () => {
   });
 
   describe('declared numeric contract', () => {
-    it('renders a zero average that was actually earned', () => {
-      const { container } = render(<ReputationBadge average={0} count={3} />);
+    /*
+     * WHAT A VALID AGGREGATE IS, and therefore what these tests may assert.
+     *
+     * Both validated schemas — `RatingAggregate` in `../../schema/rating` and
+     * `RatingAggregate` in `backend/app/schema/rating.py` — require the average to
+     * be either null or a finite number INSIDE `RATING_MIN..RATING_MAX` with a
+     * positive count. An average of `0`, or one above the top of the scale, is
+     * therefore not a low or an unusual reputation: it is a value neither validator
+     * can emit, so it can only have reached this component through data that never
+     * passed one.
+     *
+     * These tests used to assert that such values were rendered, and described the
+     * prop as "deliberately unbounded" — which contradicted the contract they were
+     * supposedly defending, and pinned in place a badge that would state "0.0/5" or
+     * "5.4/5" on somebody's profile as fact. They are kept as MALFORMED-DATA tests,
+     * because the props are wider than the contract and defensive handling is worth
+     * pinning, but what they now require is the honest outcome: the empty state.
+     *
+     * None of this weakens sentiment neutrality, and the two tests below are what
+     * prove it: `RATING_MIN` is the lowest average a real rater can produce, and it
+     * renders in full. Nothing a user can earn is excluded — see the parity test in
+     * `sentiment neutrality`, which compares a 1.0 against a 4.9.
+     */
+    it('renders the scale floor in full, because it is a real reputation', () => {
+      const { container } = render(
+        <ReputationBadge average={RATING_MIN} count={3} />,
+      );
 
-      // The distinction this test defends is the whole reason the prop is
-      // `number | null`: the empty state is chosen by the ABSENCE of a value —
-      // `null`, or a non-finite one, or no ratings to average — and never by the
-      // value being small or falsy. `0` with three ratings behind it is a
-      // present, finite, server-computed figure, so it is displayed.
-      //
-      // The likeliest regression here is a one-character one: writing the guard
-      // as `average ? … : empty` instead of `average !== null`. That reads
-      // identically for every other input in this file and sends exactly this
-      // case to the empty state, silently converting a real aggregate into "no
-      // ratings yet". Below the scale's floor of `RATING_MIN` a zero should not
-      // arise from real data at all, which is precisely why nothing else would
-      // catch it.
-      expect(screen.getByText(scorePattern('0.0'))).toBeInTheDocument();
+      expect(
+        screen.getByText(scorePattern(formatRating(RATING_MIN))),
+      ).toBeInTheDocument();
       expect(screen.getByText(/^3\s+ratings$/)).toBeInTheDocument();
       expect(screen.queryByText(/no ratings yet/i)).not.toBeInTheDocument();
-      expect(renderedText(container)).toContain(`0.0/${RATING_MAX}`);
+      expect(renderedText(container)).toContain(
+        `${formatRating(RATING_MIN)}/${RATING_MAX}`,
+      );
     });
 
-    it('renders an average above the top of the scale exactly as given', () => {
+    it('renders the scale ceiling in full', () => {
+      const { container } = render(
+        <ReputationBadge average={RATING_MAX} count={8} />,
+      );
+
+      expect(renderedText(container)).toContain(
+        `${formatRating(RATING_MAX)}/${RATING_MAX}`,
+      );
+      expect(screen.queryByText(/no ratings yet/i)).not.toBeInTheDocument();
+    });
+
+    it('falls back to the empty state for a zero average, which no rater can produce', () => {
+      const { container } = render(<ReputationBadge average={0} count={3} />);
+
+      // Below the scale's floor, so it is malformed rather than harsh. Rendering it
+      // would assert a reputation that cannot exist; the empty state understates
+      // instead, which is the only honest direction to fail in.
+      expect(screen.getByText(/no ratings yet/i)).toBeInTheDocument();
+      expect(screen.queryByText(scorePattern('0.0'))).not.toBeInTheDocument();
+      expect(renderedText(container)).not.toContain(`0.0/${RATING_MAX}`);
+      expect(screen.queryByText(/^3\s+ratings$/)).not.toBeInTheDocument();
+    });
+
+    it('falls back to the empty state for an average above the top of the scale', () => {
       const aboveScale = RATING_MAX + 0.4;
 
       const { container } = render(
         <ReputationBadge average={aboveScale} count={11} />,
       );
 
-      // The prop is documented as deliberately unbounded: the average is a
-      // rounded running mean the server owns and validates, and this component's
-      // job is to display what it is handed. Clamping to `RATING_MAX` here would
-      // quietly disagree with the number the server computed and with every
-      // other surface that reads the same aggregate, so no clamp is asserted for
-      // in both directions — the given value is present, the clamped one is not.
-      expect(renderedText(container)).toContain(
+      // Neither rendered as given nor CLAMPED to `RATING_MAX`: a clamp would invent
+      // a plausible figure and disagree silently with every other surface reading
+      // the same aggregate. Both are asserted against.
+      expect(screen.getByText(/no ratings yet/i)).toBeInTheDocument();
+      expect(renderedText(container)).not.toContain(
         `${formatRating(aboveScale)}/${RATING_MAX}`,
       );
       expect(renderedText(container)).not.toContain(
         `${formatRating(RATING_MAX)}/${RATING_MAX}`,
       );
-      expect(screen.queryByText(/no ratings yet/i)).not.toBeInTheDocument();
+      expect(renderedText(container)).not.toContain('11');
+    });
+
+    it('renders a real RatingAggregate exactly as the API validates it', () => {
+      // The shape the schemas guarantee, so this is the case every other surface
+      // reading the same aggregate will hand over.
+      const aggregate: RatingAggregate = { average: 4.5, count: 12 };
+
+      render(<ReputationBadge {...aggregate} />);
+
+      expect(screen.getByText(scorePattern('4.5'))).toBeInTheDocument();
+      expect(screen.getByText(/^12\s+ratings$/)).toBeInTheDocument();
+    });
+  });
+
+  describe('non-visual text', () => {
+    /*
+     * The badge is three or four inline elements spaced by a flex `gap`, and a gap
+     * is not text — so anything that reads the subtree rather than looking at it
+     * (a screen reader, a copy-paste, a text export) used to receive the fragments
+     * run together: "Seller rating4.5/512 ratings", in which the score and the
+     * count merge into the number "512".
+     *
+     * The component now states the whole badge once as a screen-reader sentence and
+     * hides the visual fragments from assistive technology, so these tests assert
+     * the COMPLETE phrase rather than the presence of its pieces.
+     */
+    it('states the whole badge as one readable sentence', () => {
+      const { container } = render(
+        <ReputationBadge average={4.5} count={12} label="Seller rating" />,
+      );
+
+      expect(
+        screen.getByText('Seller rating: 4.5 out of 5 from 12 ratings'),
+      ).toBeInTheDocument();
+      // "out of" and "from" rather than "/" and juxtaposition, because a solidus is
+      // announced inconsistently and reads as a fraction.
+      expect(renderedText(container)).toContain(
+        'Seller rating: 4.5 out of 5 from 12 ratings',
+      );
+      // The defect itself: the merged run must not appear anywhere.
+      expect(renderedText(container)).not.toContain('4.5/512');
+    });
+
+    it('omits the caption from the sentence when there is none', () => {
+      render(<ReputationBadge average={4} count={3} />);
+
+      expect(
+        screen.getByText('4.0 out of 5 from 3 ratings'),
+      ).toBeInTheDocument();
+    });
+
+    it('uses the singular noun in the sentence for exactly one rating', () => {
+      render(<ReputationBadge average={5} count={1} label="Buyer rating" />);
+
+      expect(
+        screen.getByText('Buyer rating: 5.0 out of 5 from 1 rating'),
+      ).toBeInTheDocument();
+    });
+
+    it('separates the caption from the empty state in text as well as on screen', () => {
+      const { container } = render(
+        <ReputationBadge average={null} count={0} label="Seller rating" />,
+      );
+
+      expect(renderedText(container)).toBe('Seller rating: No ratings yet');
+      expect(renderedText(container)).not.toContain('ratingNo');
+    });
+
+    it('reads as the bare empty state when there is no caption', () => {
+      const { container } = render(<ReputationBadge average={null} count={0} />);
+
+      expect(renderedText(container)).toBe('No ratings yet');
+    });
+
+    it('hides the decorative fragments from assistive technology exactly once', () => {
+      const { container } = render(
+        <ReputationBadge average={4.5} count={12} label="Seller rating" />,
+      );
+
+      // The caption, the star, the score and the count are all hidden, because the
+      // sentence restates them; anything left exposed would be announced twice.
+      expect(container.querySelectorAll('[aria-hidden="true"]')).toHaveLength(4);
+      // And the sentence itself is NOT hidden.
+      const sentence = screen.getByText(
+        'Seller rating: 4.5 out of 5 from 12 ratings',
+      );
+      expect(sentence).not.toHaveAttribute('aria-hidden');
+      expect(sentence).toHaveClass('sr-only');
+    });
+
+    it('keeps the caption exposed in the empty state, which has no sentence', () => {
+      render(<ReputationBadge average={null} count={0} label="Seller rating" />);
+
+      // Nothing restates it there, so hiding it would lose whose reputation is
+      // missing.
+      expect(screen.getByText(/^Seller rating$/)).not.toHaveAttribute(
+        'aria-hidden',
+      );
     });
   });
 
@@ -579,6 +721,20 @@ describe('ReputationBadge', () => {
       expect(lowBadge.getByText('★')).toBeInTheDocument();
       expect(lowBadge.getByText(scorePattern('1.2'))).toBeInTheDocument();
       expect(lowBadge.getByText(/^4\s+ratings$/)).toBeInTheDocument();
+
+      // And again at the FLOOR of the scale, which is the case the compliance
+      // question actually turns on: `RATING_MIN` is the worst reputation a rater
+      // can produce, so if any presentation is ever going to be softened or
+      // de-emphasised it is this one. Asserted as its own comparison rather than
+      // left to the 1.2 case, because a threshold implemented as `average <= 1`
+      // would pass every assertion above and fail only here.
+      const floor = render(
+        <ReputationBadge average={RATING_MIN} count={4} label="Seller rating" />,
+      );
+
+      expect(presentationSkeleton(floor.container)).toBe(
+        presentationSkeleton(high.container),
+      );
     });
 
     it('renders the lowest score on the scale without suppressing it', () => {

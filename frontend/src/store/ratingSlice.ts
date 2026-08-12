@@ -21,6 +21,31 @@ import { Rating, RatingAggregate, EligibilityDecision } from '../schema/rating';
  * scope: nothing here is keyed by listing, sorted by score, or shaped for a
  * result set. This branch supplies the enabling data and nothing more.
  *
+ * EVERYTHING HELD HERE IS SERIALISABLE, AND `Rating` IS NOT
+ * -----------------------------------------------------------------------------
+ * `Rating` (`../schema/rating`) types `createdAt`/`updatedAt` as `z.date()`, so a
+ * rating that has come through `../services/rating` carries real `Date` objects.
+ * A `Date` is not a plain value by Redux Toolkit's reckoning: `configureStore`
+ * installs `serializableCheck` in its default middleware, and that check reports
+ * every non-plain value it finds in a dispatched action AND in the resulting
+ * state. Storing `Rating[]` here therefore produced a pair of development
+ * warnings on every load of a profile page, naming `rating.items.0.createdAt`.
+ *
+ * The warnings are the symptom. The reason the rule exists is that a store whose
+ * contents are not serialisable cannot be persisted, rehydrated, time-travelled or
+ * transferred, and a `Date` in particular does not survive the JSON round trip
+ * those all rely on — it comes back a string, so the code that read `.getTime()`
+ * before rehydration reads `undefined` after it.
+ *
+ * So this branch stores `StoredRating`: the same rating with its two timestamps as
+ * ISO 8601 strings, which is the shape the wire already uses. `toStoredRating`
+ * converts at the dispatch boundary and `fromStoredRating` converts back at the
+ * rendering boundary, both exported below. The alternative — relaxing
+ * `serializableCheck` where the reducer is registered — was rejected: it disables
+ * the check for the WHOLE store, so the next non-serialisable value anyone puts in
+ * any branch would go unreported, and it would put a rule about this feature in a
+ * file that belongs to all three.
+ *
  * A PURE STATE CONTAINER
  * -----------------------------------------------------------------------------
  * This module holds state and does nothing else. There is no HTTP, no async, no
@@ -93,8 +118,78 @@ import { Rating, RatingAggregate, EligibilityDecision } from '../schema/rating';
  *
  * There is no state interface export. The shape is module-private, matching both
  * siblings; a consumer that needs it derives `RootState['rating']`, which cannot
- * drift from what the store actually holds.
+ * drift from what the store actually holds. `StoredRating` and its two mappers ARE
+ * exported, because they are the branch's boundary contract rather than its shape:
+ * a caller has to be able to name what it converts into before dispatching and out
+ * of before rendering.
  */
+/**
+ * One rating as this branch holds it: `Rating` with serialisable timestamps.
+ *
+ * Identical to `Rating` (`../schema/rating`) in every field except `createdAt` and
+ * `updatedAt`, which are ISO 8601 strings here rather than `Date` objects. Derived
+ * with `Omit` rather than written out, so a field added to `Rating` appears here
+ * automatically and cannot be silently dropped on the way into the store.
+ *
+ * Exported because both boundaries need to name it: the page that dispatches a
+ * server response converts into it, and the component that renders one converts
+ * out of it.
+ */
+export type StoredRating = Omit<Rating, 'createdAt' | 'updatedAt'> & {
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * Convert one rating INTO the store's serialisable shape.
+ *
+ * Call this on every rating before dispatching `setRatings`, so no `Date` ever
+ * reaches an action or the state:
+ *
+ *   dispatch(setRatings(response.items.map(toStoredRating)));
+ *
+ * `toISOString` always emits UTC with a `Z` suffix, which is the same instant the
+ * server sent and a lossless round trip for `fromStoredRating`. It THROWS a
+ * `RangeError` on an Invalid Date, so an unusable timestamp is refused here rather
+ * than stored as the string "Invalid Date" and rendered as one — and it is not
+ * reachable through the normal path anyway, because `z.date()` rejects an Invalid
+ * Date before a `Rating` exists.
+ *
+ * @param rating A validated rating, as `../services/rating` returns it.
+ * @returns The same rating with ISO 8601 timestamps.
+ * @throws {RangeError} When either timestamp is an Invalid Date.
+ */
+export const toStoredRating = (rating: Rating): StoredRating => ({
+  ...rating,
+  createdAt: rating.createdAt.toISOString(),
+  updatedAt: rating.updatedAt.toISOString(),
+});
+
+/**
+ * Convert one stored rating BACK to the domain shape, for rendering.
+ *
+ * The inverse of `toStoredRating`, and the boundary a component reads through:
+ *
+ *   const items = useSelector((state: RootState) => state.rating.items);
+ *   <RatingList ratings={items.map(fromStoredRating)} />
+ *
+ * `../components/RatingList` takes `Rating[]` because it renders a `<time>`
+ * element and formats a date, so it needs the parsed value rather than the string.
+ * It already guards each timestamp with `instanceof Date && !Number.isNaN(...)` and
+ * omits an unusable one, which is why this function parses without refusing: a
+ * value that somehow arrived unparseable degrades one rating's date rather than
+ * throwing during a render and taking the whole list down with it. `Date` is the
+ * only field this touches; everything else is passed through.
+ *
+ * @param stored A rating as held in this branch.
+ * @returns The rating with `Date` timestamps.
+ */
+export const fromStoredRating = (stored: StoredRating): Rating => ({
+  ...stored,
+  createdAt: new Date(stored.createdAt),
+  updatedAt: new Date(stored.updatedAt),
+});
+
 interface RatingState {
   /**
    * Published ratings currently loaded — those received by one user, or those
@@ -109,8 +204,12 @@ interface RatingState {
    * user whose ratings have not been requested. `aggregate` is what separates
    * them — see below — and a component that must tell the two apart reads that
    * field rather than the length of this one.
+   *
+   * Held as `StoredRating`, so the timestamps are ISO strings and nothing in this
+   * branch is unserialisable. `fromStoredRating` is how a component gets the
+   * `Date`-carrying `Rating` it renders.
    */
-  items: Rating[];
+  items: StoredRating[];
   /**
    * Aggregate reputation of the user whose ratings were last loaded, or `null`
    * when no aggregate has been loaded.
@@ -195,8 +294,16 @@ const ratingSlice = createSlice({
      * merge would have to decide which of two versions of a document wins, and
      * this client has no basis for that decision. The server's response is the
      * answer, in the server's order.
+     *
+     * The payload is `StoredRating[]`, NOT `Rating[]`, and the difference is
+     * load-bearing rather than cosmetic: Redux Toolkit's `serializableCheck`
+     * inspects the dispatched action as well as the resulting state, so accepting
+     * `Rating[]` here would report a non-serialisable `Date` even if this reducer
+     * converted on the way in. Callers convert first — `setRatings(items.map(
+     * toStoredRating))` — which is also what makes the conversion visible at the
+     * call site instead of hidden in a reducer.
      */
-    setRatings: (state, action: PayloadAction<Rating[]>) => {
+    setRatings: (state, action: PayloadAction<StoredRating[]>) => {
       state.items = action.payload;
     },
     /**

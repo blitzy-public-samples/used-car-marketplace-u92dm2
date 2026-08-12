@@ -227,9 +227,14 @@ export const uploadPhoto = async (photo: File): Promise<string> => {
  *     directions — including the ISO-8601-to-`Date` conversion and the Zod
  *     validation that makes the returned values trustworthy rather than merely
  *     typed.
- *   - AUTHENTICATION. `./rating` attaches the same bearer token from the same
- *     storage key through its own request interceptor, so a delegated call is
- *     authenticated exactly as a direct one is.
+ *   - AUTHENTICATION, PER ENDPOINT. `./rating` attaches the bearer token from the
+ *     same storage key through a request interceptor it installs only for the
+ *     calls the server authenticates, so a delegated call carries exactly the
+ *     credentials a direct one does. `submitRating` and `fetchRatingEligibility`
+ *     are authenticated; `fetchUserRatings` and `fetchUserReputation` are public
+ *     reads and deliberately send no `Authorization` header, because the routes
+ *     they call declare no authentication dependency and read nothing from the
+ *     caller's identity.
  *   - ERRORS ARE NEVER SWALLOWED. No `try`/`catch` is added on either side of the
  *     delegation, so a refusal keeps its status and its `detail`:
  *
@@ -297,60 +302,51 @@ export const submitRating = (input: RatingCreate): Promise<Rating> =>
  *
  * A public read, matching the unauthenticated precedent of `GET /listings`: a
  * reputation is what a prospective counterparty consults before deciding to
- * transact, so it cannot require an account to see.
+ * transact, so it cannot require an account to see. No bearer token is sent, in
+ * this wrapper or in the `./rating` implementation it delegates to.
  *
  * Published ratings only, in both halves, so an unreciprocated rating appears in
  * neither until it is revealed. A user with no ratings is a first-class state
  * rather than an error — an empty `items` beside `average: null, count: 0`.
  *
- * `items` is ONE PAGE while `aggregate` covers every published rating, so
- * `aggregate.count` may exceed `items.length`. `hasMore` and `nextCursor` on the
- * result report that, and the `page` argument is how the remainder is reached.
- * The page controls exist here as well as on `./rating` deliberately: two
- * implementations of one endpoint that disagreed about whether page two is
- * reachable would be a contract with two answers.
+ * The user ID is the whole request: there is no page size, no cursor and no
+ * mode. `items` is bounded by the server and omits any rating whose review
+ * moderation rejected, while `aggregate` counts every published rating, so
+ * `aggregate.count` may exceed `items.length`. That is the contract and must not
+ * be rendered as a discrepancy.
  *
  * @param userId The user whose received ratings are wanted.
- * @param page Optional page controls. `limit` requests a page size, which the
- *   server clamps rather than trusts; `after` is the `nextCursor` from a previous
- *   page. Neither is sent when undefined, which asks for the default first page.
- * @returns One page of published ratings, the aggregate over all of them, and the
- *   continuation metadata.
- * @throws {AxiosError} 404 when no such user exists; 422 when `after` is not a
- *   well-formed rating identifier.
+ * @returns The published ratings received, newest first, and the aggregate over
+ *   all of them.
+ * @throws {AxiosError} 404 when no such user exists.
  * @throws {RatingContractError} When the envelope cannot be interpreted as
  *   `UserRatingsResponseSchema`.
  */
 export const fetchUserRatings = (
-  userId: string,
-  page?: { limit?: number; after?: string }
-): Promise<UserRatingsResponse> => fetchUserRatingsRequest(userId, page);
+  userId: string
+): Promise<UserRatingsResponse> => fetchUserRatingsRequest(userId);
 
 
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * NOT a separate endpoint, and not a second request either. It reads the same
- * `GET /api/ratings/user/{user_id}` path with `aggregate_only=true`, which the
- * server answers from the user document alone: one document read, an empty
- * `items`, and the two numbers a badge needs.
+ * The `aggregate` half of the same `GET /api/ratings/user/{user_id}` response.
+ * It is not a separate endpoint and no longer a separate mode: an
+ * `aggregate_only=true` mode existed and was removed, because it answered from
+ * the user document WITHOUT settling publications that were already due — and
+ * this is the surface that renders beside every listing, so the most-read
+ * reputation in the product was the one that could sit stale waiting on a worker
+ * that will never run.
  *
- * Requesting the mode is the point rather than an optimisation detail. Fetching
- * the full envelope to keep two fields transfers a page of ratings — every
- * review body, every identifier — and makes the server settle due publications
- * and run a second query, all discarded on arrival. This surface renders beside
- * every listing, so that waste is paid per card. The aggregate is denormalised
- * onto the user document precisely so that reading a reputation costs ONE read,
- * which is what keeps a profile view inside the 200 ms budget the SRS sets for
- * 95% of API responses.
+ * A public read, exactly as `fetchUserRatings` is: no bearer token is sent, in
+ * this wrapper or in the `./rating` implementation it delegates to.
  *
- * The response shape is identical in both modes, so the same mapper decodes it.
+ * Because both halves now come from one settled, version-pinned read, this
+ * wrapper and `fetchUserRatings` can never show a reader different reputations
+ * for the same user.
  *
  * Reflects published ratings only, and includes every one of them whatever the
- * score. This mode does not settle due publications, so a rating past its
- * window but not yet published is not counted — correctly, since the aggregate
- * counts published ratings and publication is an action. The profile view
- * settles, so nothing is stranded.
+ * score.
  *
  * @param userId The user whose reputation is wanted.
  * @returns The aggregate. `average` is null, with `count` 0, for a user who has

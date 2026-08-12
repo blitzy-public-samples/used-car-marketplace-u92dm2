@@ -84,11 +84,13 @@
  *     this suite asserting the old range.
  */
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-import StarRatingInput from '../StarRatingInput';
+import StarRatingInput, {
+  type StarRatingInputHandle,
+} from '../StarRatingInput';
 import { RATING_MIN, RATING_MAX } from '../../schema/rating';
 
 /**
@@ -947,5 +949,149 @@ describe('StarRatingInput onChange contract', () => {
 
     expect(reported).toEqual([]);
     expectCheckedScore(null);
+  });
+});
+
+/*
+ * REQUIRED STATE
+ * -----------------------------------------------------------------------------
+ * The score is mandatory in the form that owns this control, and a mandatory field
+ * has to SAY so: WCAG 3.3.2 asks for the instruction to be available to a sighted
+ * reader, and `aria-required` is what an assistive technology reports on entry.
+ * Previously neither existed, so the only signal that a score was needed was a
+ * submit button that silently refused to respond.
+ *
+ * Both channels are asserted, and so is their ABSENCE by default — a control that
+ * announced everything as required would be no more informative than one that
+ * announced nothing.
+ */
+describe('StarRatingInput required state', () => {
+  it('marks the group as required when the form says it is', () => {
+    render(<StarRatingInput value={null} onChange={ignoreScore} required />);
+
+    expect(screen.getByRole('radiogroup')).toHaveAttribute(
+      'aria-required',
+      'true',
+    );
+  });
+
+  it('states the requirement visibly, not only to assistive technology', () => {
+    render(<StarRatingInput value={null} onChange={ignoreScore} required />);
+
+    // A word rather than an asterisk: `*` is announced inconsistently, means
+    // nothing without a key, and is easy to miss at this size.
+    expect(screen.getByText(/\(required\)/i)).toBeInTheDocument();
+  });
+
+  it('carries the requirement in the group accessible name', () => {
+    render(
+      <StarRatingInput
+        value={null}
+        onChange={ignoreScore}
+        label="Your rating"
+        required
+      />,
+    );
+
+    // The marker lives INSIDE the labelling element, so it is part of the name the
+    // group is announced with rather than a detached note a reader may never reach.
+    expect(screen.getByRole('radiogroup')).toHaveAccessibleName(
+      'Your rating (required)',
+    );
+  });
+
+  it('asserts nothing about requirement by default', () => {
+    render(
+      <StarRatingInput
+        value={null}
+        onChange={ignoreScore}
+        label="Your rating"
+      />,
+    );
+
+    expect(screen.getByRole('radiogroup')).not.toHaveAttribute('aria-required');
+    expect(screen.queryByText(/\(required\)/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('radiogroup')).toHaveAccessibleName('Your rating');
+  });
+
+  it('changes nothing else about the control', () => {
+    render(
+      <StarRatingInput value={MID_SCORE} onChange={ignoreScore} required />,
+    );
+
+    // Requirement is a statement about the field, not a change of behaviour: the
+    // same five options, the same selection, the same echo.
+    expect(options()).toHaveLength(OPTION_COUNT);
+    expectCheckedScore(MID_SCORE);
+    expect(
+      screen.getByText(`${MID_SCORE} out of ${RATING_MAX}`),
+    ).toBeInTheDocument();
+  });
+});
+
+/*
+ * IMPERATIVE FOCUS
+ * -----------------------------------------------------------------------------
+ * The parent form has two transitions that delete the element the user is standing
+ * on — a successful submit and a successful retry — and after the retry the right
+ * destination is the first enabled control, which is this group. Focus cannot be
+ * expressed as rendered state, so the control exposes one method for it. These
+ * tests pin the contract the form depends on: focus lands on the group's single tab
+ * stop, and a disabled group is never made the destination.
+ */
+describe('StarRatingInput imperative focus', () => {
+  const FocusHarness = ({
+    value,
+    disabled = false,
+  }: {
+    value: number | null;
+    disabled?: boolean;
+  }) => {
+    const handle = useRef<StarRatingInputHandle | null>(null);
+
+    return (
+      <div>
+        <button type="button" onClick={() => handle.current?.focus()}>
+          move focus
+        </button>
+        <StarRatingInput
+          ref={handle}
+          value={value}
+          onChange={ignoreScore}
+          disabled={disabled}
+        />
+      </div>
+    );
+  };
+
+  it('focuses the first option when nothing is selected yet', async () => {
+    const user = userEvent.setup();
+    render(<FocusHarness value={null} />);
+
+    await user.click(screen.getByRole('button', { name: 'move focus' }));
+
+    expect(optionFor(RATING_MIN)).toHaveFocus();
+  });
+
+  it('focuses the selected option, which is the group tab stop', async () => {
+    const user = userEvent.setup();
+    render(<FocusHarness value={MID_SCORE} />);
+
+    await user.click(screen.getByRole('button', { name: 'move focus' }));
+
+    expect(optionFor(MID_SCORE)).toHaveFocus();
+    expect(optionFor(MID_SCORE)).toHaveAttribute('tabindex', '0');
+  });
+
+  it('does not move focus into a disabled group', async () => {
+    const user = userEvent.setup();
+    render(<FocusHarness value={MID_SCORE} disabled />);
+
+    const trigger = screen.getByRole('button', { name: 'move focus' });
+    await user.click(trigger);
+
+    // Focusing an inert control is a dead end: it reports "not now" and offers
+    // nowhere to go, so the caller does not have to know the state to call safely.
+    expect(optionFor(MID_SCORE)).not.toHaveFocus();
   });
 });

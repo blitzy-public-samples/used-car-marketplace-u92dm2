@@ -50,11 +50,22 @@ may cache that lookup.
 
 WHY THE READ PATHS DELEGATE INSTEAD OF QUERYING INLINE
 -------------------------------------------------------------------
-The existing routers query Firestore inline, and this one still does so
-for the AUTHORIZATION evidence it needs: the transaction document
-behind the participant gate, and the existence of the user behind the
-public read's 404. Those are authorization decisions and they belong in
-the handler.
+The existing routers query Firestore inline. This one does NOT, and both
+of the reads it used to perform were removed for the same reason: each
+was taken at a different instant from the data it governed.
+
+* The participant gate now belongs to
+  ``app/services/rating.py:list_transaction_ratings``, which applies it
+  before the read and AGAIN against a fresh read of the authorizing
+  document immediately before returning. Deciding it here meant deciding
+  it against one snapshot and returning data from another.
+* Whether the user behind the public read exists is established inside
+  the same pinned snapshot that produces their ratings and their
+  aggregate, because a separate existence read would be a separate
+  instant.
+
+What is left in this layer is the part that is genuinely HTTP: turning a
+typed refusal or a ``None`` into a status code.
 
 The RESULT SETS are a different matter, and they are delegated to
 ``app/services/rating.py`` deliberately, because producing them is not
@@ -72,11 +83,11 @@ a query - it is policy:
   answering, because no worker will - no Celery task in this codebase
   is ever dispatched and no broker is provisioned, so the read path IS
   the fallback that makes the deferred reveal correct;
-* the query shapes are pinned to the three composite indexes declared
+* the query shapes are pinned to the two composite indexes declared
   in ``infrastructure/firestore.indexes.json``, and every predicate
-  beyond them - moderation state, for one - is applied in Python,
-  because a query needing an index nobody declared fails outright
-  instead of degrading.
+  beyond them - moderation state, for one, and the publication deadline
+  in the scheduled sweep - is applied in Python, because a query
+  needing an index nobody declared fails outright instead of degrading.
 
 Restating any of that here would place a second, drifting copy of an
 FTC-relevant visibility policy in the HTTP layer. The service module
@@ -156,12 +167,15 @@ Pydantic v1 semantics apply throughout, matching the pin in
 """
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, validator
 
 
 from app.api.auth import get_current_user
-from app.db.firestore import db
+# There is deliberately no ``db`` import here. This router performs no
+# Firestore read of its own: authorization evidence and result sets alike
+# come from app/services/rating.py, so that neither can be taken at a
+# different instant from the data it governs.
 from app.schema.rating import (
     MODERATION_REASON_MAX_LENGTH,
     DocumentId,
@@ -196,8 +210,6 @@ from app.schema.user import User
 # HTTP layer would be a second source of truth for a policy the FTC
 # review-suppression rule constrains.
 from app.services.rating import (
-    MODERATION_REASON_CODES,
-    TRANSACTIONS_COLLECTION,
     DuplicateRating,
     NotATransactionParticipant,
     RaterNotVerified,
@@ -300,15 +312,29 @@ MAPPED_DOMAIN_FAILURES = tuple(
 class UserRatingsResponse(BaseModel):
     """The public reputation view of one user. F010-3.
 
-    Two fields rather than a bare list, because a reputation is not
-    just its reviews: the aggregate is maintained on the user document
-    and read by ID, so it is authoritative on its own and is reported
-    beside the ratings rather than derived from them by the client.
+    Two fields, and deliberately no more. That is the contract this
+    endpoint publishes: the ratings a reader may see, and the aggregate
+    maintained on the user document. Page metadata was added here and
+    removed again - it widened the published API, and the cursor it
+    introduced was a caller-supplied rating ID the server looked up,
+    which turned a public read into an existence oracle for any rating
+    ID a caller cared to try.
 
-    ``items`` carries the published ratings only, so an unreciprocated
+    ``items`` carries published ratings only, so an unreciprocated
     rating stays invisible until it is revealed - the double-blind
-    model holds on the way out as well as on the way in. ``aggregate``
-    counts published ratings and every one of them, whatever the score.
+    model holds on the way out as well as on the way in. Review text is
+    present only once moderation has approved it, and a rating whose
+    review moderation REJECTED is withheld from this list entirely.
+
+    ``aggregate`` covers every published rating whatever its score and
+    whatever its moderation state, because a moderation decision is
+    about content and letting it move a score would make moderation
+    sentiment-relevant - which is exactly what must never happen.
+
+    So ``aggregate.count`` may exceed ``len(items)``, for two documented
+    reasons: a withheld record is counted and not shown, and the list is
+    bounded while the aggregate is not. That is the contract rather than
+    a discrepancy, and a client must not present it as one.
 
     A user with no ratings is a first-class state and not an error: an
     empty ``items`` beside ``average=None, count=0``. It is modelled
@@ -319,36 +345,23 @@ class UserRatingsResponse(BaseModel):
     items: List[RatingView] = Field(
         ...,
         description=(
-            'One PAGE of published ratings received by the user, newest '
-            'first. Review text is present only once moderation has '
-            'approved it; the score is always present. Moderation state '
-            'is never present - it is operational, and the visibility '
+            'The published ratings received by the user, newest first, '
+            'bounded by the service. Review text is present only once '
+            'moderation has approved it; a rating whose review was '
+            'rejected is withheld from this list. Moderation state is '
+            'never present - it is operational, and the visibility '
             'decision it drives has already been applied.'
         ),
     )
     aggregate: RatingAggregate = Field(
         ...,
         description=(
-            'Denormalised reputation summary over ALL published ratings, '
-            'not only this page - a reputation is not a property of a '
-            'page. ``average`` is null and ``count`` is zero when the '
-            'user has none.'
-        ),
-    )
-    next_cursor: Optional[str] = Field(
-        None,
-        description=(
-            'Pass as ``after`` to read the following page. Null on the '
-            'last page.'
-        ),
-    )
-    has_more: bool = Field(
-        ...,
-        description=(
-            'Whether another page exists. Reported explicitly because '
-            '``aggregate.count`` may exceed the number of items on this '
-            'page, and a reader must be able to tell that the remainder '
-            'is reachable rather than missing.'
+            'Denormalised reputation summary over ALL published '
+            'ratings, whatever their score and whatever their '
+            'moderation state - a reputation is not a property of the '
+            'records a reader may be shown, so ``count`` may exceed '
+            'the number of items. ``average`` is null and ``count`` is '
+            'zero when the user has none.'
         ),
     )
 
@@ -371,29 +384,27 @@ class ModerationUpdate(BaseModel):
     straight on to the document and would silently disable every state
     check that reads it.
 
-    ``moderation_reason`` is a POLICY CODE, and the allow-list it is
-    checked against lives in the service so the rule has one owner. It is
-    optional on this model and MANDATORY in practice for a rejection: the
-    service refuses to withhold a rating without a recorded policy basis,
-    which surfaces as a 422. Enforcing it twice would put the rule in two
-    places, and the router's copy would be the one that drifted.
-    Both that requirement and the reason's plain-text bound are applied by
-    the validator below, during REQUEST validation, before the handler body
-    runs - so a malformed moderation request is refused where every other
-    malformed request to this router is refused, and a rating is never
-    withheld first and justified afterwards. The rule is not duplicated:
-    the validator reuses the same ``as_plain_text`` normaliser and the same
+    ``moderation_reason`` is the policy basis for the transition, written
+    as bounded plain text describing the violation in the CONTENT. It is
+    optional on this model and governed by a MATRIX the service owns:
+    mandatory when rejecting, and refused on any other state, because a
+    state that displays the review cannot also carry a violation recorded
+    against it. Both halves surface as a 422.
+
+    The matrix is applied by the validator below during REQUEST
+    validation, before the handler body runs - so a malformed moderation
+    request is refused where every other malformed request to this router
+    is refused, and a rating is never withheld first and justified
+    afterwards. That is not a second implementation of the rule: the
+    validator reuses the same ``as_plain_text`` normaliser and the same
     ``MODERATION_REASON_MAX_LENGTH`` bound the service applies, and the
-    service remains the owner of the policy-code allow-list for any future
-    caller that does not come through this model.
+    service enforces the identical matrix for any future caller that does
+    not come through this model.
 
-
-    Constraining the reason to a code rather than accepting free text is
-    what makes sentiment neutrality structural. A low score is never
-    itself a violation, and there is no code for one - so "low score"
-    cannot be recorded as a justification even by an administrator who
-    wants to. The human specifics go in ``moderation_note``, which is
-    where a description belongs and which decides nothing.
+    Sentiment neutrality does not depend on the reason's vocabulary; it
+    depends on the score never entering the decision. There is no score
+    threshold and no score-correlated behaviour in this router, and a
+    reason names something about the words rather than about the number.
     """
 
     moderation_status: ModerationStatus = Field(
@@ -406,17 +417,11 @@ class ModerationUpdate(BaseModel):
     moderation_reason: Optional[str] = Field(
         None,
         description=(
-            'The policy basis for the transition, as one of the codes '
-            '{0}. Required when rejecting, cleared when omitted. A low '
-            'score is not a policy violation and no code expresses '
-            'one.'.format(list(MODERATION_REASON_CODES))
-        ),
-    )
-    moderation_note: Optional[str] = Field(
-        None,
-        description=(
-            'Optional operator note recording the specifics behind the '
-            'code. Bounded plain text; it justifies nothing on its own.'
+            'The policy basis for the transition, describing the '
+            'violation in the review CONTENT - abuse, personally '
+            'identifying information, profanity. Required when '
+            'rejecting and refused on any other state, which displays '
+            'the review. A low score is never itself a violation.'
         ),
     )
 
@@ -427,12 +432,12 @@ class ModerationUpdate(BaseModel):
     # below exists for. Matches how ``app/schema/rating.py`` declares its
     # own always-on validators.
     @validator('moderation_reason', always=True)
-    def _reason_is_bounded_and_present_when_rejecting(
+    def _reason_matches_the_target_state(
         cls,
         value: Optional[str],
         values: dict,
     ) -> Optional[str]:
-        """Normalise the policy reason and require one for a rejection.
+        """Normalise the policy reason and hold it to the state matrix.
 
         Declared on ``moderation_reason`` rather than as a root
         validator because Pydantic v1 validates fields in declaration
@@ -460,10 +465,12 @@ class ModerationUpdate(BaseModel):
             none is required.
 
         Raises:
-            ValueError: The reason exceeds the bound, or a rejection was
-                requested without one. Pydantic reports either as a 422
-                naming this field, before the handler runs, so a rating
-                is never withheld first and justified afterwards.
+            ValueError: The reason exceeds the bound, a rejection was
+                requested without one, or one was supplied for a state
+                that displays the review. Pydantic reports each as a 422
+                naming this field, before the handler runs, so a rating is
+                never withheld first and justified afterwards - and never
+                displayed with a violation recorded against it.
         """
         recorded = as_plain_text(
             value,
@@ -471,10 +478,26 @@ class ModerationUpdate(BaseModel):
             label='Moderation reason',
         )
         target = values.get('moderation_status')
-        if target == ModerationStatus.REJECTED and recorded is None:
+        if target is None:
+            # ``moderation_status`` failed its own enumeration check and is
+            # absent from ``values``. Deferring rather than raising keeps
+            # the specific error already being reported from being buried
+            # under a vaguer second one about this field.
+            return recorded
+        if target == ModerationStatus.REJECTED:
+            if recorded is None:
+                raise ValueError(
+                    'Rejecting a rating requires a policy reason '
+                    'describing the violation in the review content. A '
+                    'low score is never itself a violation.'
+                )
+            return recorded
+        if recorded is not None:
             raise ValueError(
-                'Rejecting a rating requires a policy reason describing '
-                'the violation. A low score is never itself a violation.'
+                'A moderation reason may only accompany a rejection. '
+                'State {0!r} displays the review, so recording a policy '
+                'violation against it would leave a record that '
+                'contradicts itself.'.format(target.value)
             )
         return recorded
 
@@ -625,32 +648,7 @@ def create_rating(
     response_model=UserRatingsResponse,
     summary='Read the published ratings a user has received',
 )
-def get_user_ratings(
-    user_id: DocumentId,
-    limit: Optional[int] = Query(
-        None,
-        ge=1,
-        description=(
-            'Page size. Omitted uses the service default, and any value '
-            'is clamped into a serviceable range rather than trusted.'
-        ),
-    ),
-    after: Optional[RatingDocumentId] = Query(
-        None,
-        description=(
-            "The previous page's ``next_cursor``. Omitted starts at the "
-            'newest rating.'
-        ),
-    ),
-    aggregate_only: bool = Query(
-        False,
-        description=(
-            'Answer from the user document alone - the aggregate with '
-            'an empty items list. One read, for a reputation badge '
-            'that needs the two numbers and not the reviews.'
-        ),
-    ),
-) -> UserRatingsResponse:
+def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
     """Report one user's reputation. F010-3.
 
     Resolves to ``GET /api/ratings/user/{user_id}``.
@@ -661,63 +659,50 @@ def get_user_ratings(
     cannot read before deciding whether to transact would not serve the
     purpose the feature exists for. Only published ratings are
     returned, so nothing here reveals a rating its counterparty has not
-    yet answered, and review text appears only once moderation has
-    approved it.
+    yet answered; review text appears only once moderation has approved
+    it, and a rating whose review was rejected is withheld entirely.
+
+    NO PARAMETERS, AND THAT IS THE CONTRACT
+    -------------------------------------------------------------------
+    The path parameter is the whole request. A page size, a cursor and an
+    aggregate-only mode were added here and removed again, each for its
+    own reason:
+
+    * the cursor was a caller-supplied rating ID that the service looked
+      up and positioned this public query from, so any rating ID -
+      another user's, or one still unpublished - could be handed in and
+      its existence read back off the response;
+    * the aggregate-only mode answered from the user document without
+      settling publications that were already due, and it was the mode
+      the reputation badge used, so the most-read surface in the product
+      was the one that could show a reputation waiting on a worker that
+      will never run;
+    * and all three widened a published contract that is two fields.
 
     THE PAGE AND THE AGGREGATE COME FROM ONE OPERATION
     -------------------------------------------------------------------
-    Both halves are taken from a single ``get_user_reputation`` call, and
-    that is a correctness requirement rather than a tidiness one. Serving
-    this endpoint settles any publication already due, because no worker
-    will; when the list and the aggregate were fetched through two separate
-    service calls, each settled independently and the second pass could
-    publish a rating AFTER the list had been materialised. The response
-    then carried a count that included a rating the accompanying list did
-    not - a profile reading "4 reviews" above three of them, with nothing
-    to tell the reader which number was true.
+    Both halves are taken from a single ``get_user_reputation`` call,
+    which settles any publication already due and then reads the list and
+    the aggregate inside ONE read-only transaction. That is a correctness
+    requirement rather than a tidiness one: read independently, the two
+    can straddle a concurrent publication and report a count that
+    includes a rating the accompanying list does not - a profile reading
+    "4 reviews" above three of them, with nothing to tell the reader
+    which number is true.
 
-    THE PAGE IS EXPLICIT
-    -------------------------------------------------------------------
-    The read is bounded, and the bound is now REPORTED. ``next_cursor``
-    and ``has_more`` accompany every page, so a user with more ratings than
-    one page is not left with an average computed from records the response
-    gave no way to reach. ``aggregate`` still covers every published rating
-    rather than the page, because a reputation is not a property of a page.
-
-    Serving this endpoint settles any publication that is already due,
-    and settles it EXACTLY ONCE: the listing and the aggregate are both
-    derived from the state that single pass leaves, so the count can
-    never describe a later instant than the list beside it.
-
-    ``aggregate_only=true`` answers from the user document alone - the
-    aggregate with an empty ``items`` list, in one read, with no
-    settlement. It is the mode a reputation badge wants: that surface
-    needs two numbers and appears beside every listing, so downloading a
-    page of reviews to render it is pure waste. It is a MODE of this
-    endpoint rather than a sixth route because the five resolved paths
-    are a published contract, and a query parameter extends it without
-    changing it. The response shape is identical either way, so no
-    client-side schema has to know which mode produced it.
-
+    ``aggregate`` covers every published rating whatever its score and
+    state, so ``count`` may exceed the number of items returned. Both
+    reasons - a withheld record, and the bound on the list - are stated
+    on the response model.
 
     Args:
         user_id: The rated user. Validated against the Firestore
             document-ID grammar before it can reach ``document()``.
-        limit: Page size, clamped by the service.
-        after: Cursor from a previous page. Validated against the
-            COMPOSITE rating-ID grammar, because a rating's key is
-            ``"{transaction_id}_{rater_id}"`` and is longer than either
-            component.
-
-        aggregate_only: Answer from the user document alone, skipping
-            settlement and the listing query.
 
     Returns:
-        One page of published ratings received, newest first, beside the
-        denormalised aggregate and the continuation metadata. The page is
-        empty and the aggregate zero for a user who has never been rated,
-        which is a state and not an error.
-
+        The published ratings received, newest first, beside the
+        denormalised aggregate. Both are empty and zero for a user who
+        has never been rated, which is a state and not an error.
 
     Raises:
         HTTPException: 404 when no such user exists. The distinction
@@ -726,17 +711,11 @@ def get_user_ratings(
             is a 200.
     """
     # No Firestore read happens in this handler. Existence, the
-    # aggregate and the listing all come out of ONE settlement pass in
-    # the service, which reads the user document once and re-reads it
-    # only when settlement actually moved the aggregate. A ``None`` means
-    # there is no such user, and turning that into a status code is this
-    # layer's whole job here.
-    reputation = get_user_reputation(
-        user_id,
-        limit=limit,
-        after=after,
-        include_items=not aggregate_only,
-    )
+    # aggregate and the listing all come out of ONE pinned snapshot in
+    # the service, taken after it has settled anything due. A ``None``
+    # means there is no such user, and turning that into a status code is
+    # this layer's whole job here.
+    reputation = get_user_reputation(user_id)
     if reputation is None:
         raise HTTPException(
             status_code=404,
@@ -745,8 +724,6 @@ def get_user_ratings(
     return UserRatingsResponse(
         items=to_rating_views(reputation.items),
         aggregate=reputation.aggregate,
-        next_cursor=reputation.next_cursor,
-        has_more=reputation.has_more,
     )
 
 
@@ -779,13 +756,33 @@ def get_transaction_ratings(
     so enumerating them is not a practical attack, and the 403 itself
     already reveals that the caller is not a party.
 
+    THE GUARD IS APPLIED BY THE SERVICE, AROUND THE READ
+    -------------------------------------------------------------------
+    This handler does not read Firestore, and that is the fix rather than
+    a delegation preference. It previously read the transaction, decided
+    participation, and then called a service function that settled
+    publications and ran its own query - so authorization was decided
+    against one snapshot and the data returned from another, and a
+    transaction reassigned in between would have been disclosed to a
+    caller who was no longer party to it. ``list_transaction_ratings``
+    now applies the check before the read AND again against a fresh read
+    of the authorizing document immediately before returning, which is
+    the form that guarantee takes for an operation that writes and so
+    cannot run inside a read-only snapshot.
+
+    What crosses this boundary is the typed refusal, mapped by the same
+    six-exception table every other handler here uses - so the statuses
+    are unchanged: 404 for an unknown transaction, 403 for a caller who
+    is not a party on EITHER check.
+
     Being a participant does not lift the double-blind model. A caller
     always sees their OWN rating in full - including its review text even
     when moderation rejected it, because otherwise a withheld review would
     vanish with no explanation to the person who wrote it. The
-    counterparty's stays hidden until it publishes. Returning both
-    unconditionally would hand a participant exactly the early look the
-    model exists to deny.
+    counterparty's stays hidden until it publishes, and stays hidden for
+    good if moderation rejected it. Returning everything unconditionally
+    would hand a participant exactly the early look the model exists to
+    deny.
 
     Moderation state is not returned to anybody here, author included. The
     response model carries no such field: the decision it drives has
@@ -806,33 +803,12 @@ def get_transaction_ratings(
             dependency); 404 when no such transaction exists; 403 when
             the caller is neither its buyer nor its seller.
     """
-    snapshot = (
-        db.collection(TRANSACTIONS_COLLECTION)
-        .document(transaction_id)
-        .get()
-    )
-    if not snapshot.exists:
-        raise HTTPException(
-            status_code=404,
-            detail=TransactionNotFound.message,
+    try:
+        return to_rating_views(
+            list_transaction_ratings(transaction_id, current_user)
         )
-    transaction_data = snapshot.to_dict() or {}
-    # Read with ``.get`` rather than by subscript, so a transaction
-    # document missing a participant field fails CLOSED with a 403
-    # instead of raising a ``KeyError`` that would surface as a 500. A
-    # document that cannot name its parties authorizes nobody.
-    participants = [
-        transaction_data.get('buyer_id'),
-        transaction_data.get('seller_id'),
-    ]
-    if not current_user.id or current_user.id not in participants:
-        raise HTTPException(
-            status_code=403,
-            detail=NotATransactionParticipant.message,
-        )
-    return to_rating_views(
-        list_transaction_ratings(transaction_id, current_user.id)
-    )
+    except MAPPED_DOMAIN_FAILURES as error:
+        raise domain_failure(error) from error
 
 
 @router.get(
@@ -954,14 +930,13 @@ def set_rating_moderation(
             the key is as long as both participant IDs plus the joining
             underscore, so holding it to the component bound would refuse
             a key this API had itself created.
-        payload: The target state, its policy reason code and an optional
-            operator note.
+        payload: The target state and, for a rejection, the policy reason
+            that justifies it.
         current_user: The authenticated caller, who must be an
             administrator.
 
     Returns:
-        The rating in its new state, with the recorded policy code and
-        note.
+        The rating in its new state, with the recorded policy reason.
 
     Raises:
         HTTPException: 401 when unauthenticated (raised by the
@@ -969,8 +944,8 @@ def set_rating_moderation(
             404 when no rating exists at that ID, or its stored body
             cannot be interpreted - nothing is written on either path;
             422 when a rejection is requested without a policy reason,
-            when the reason is not one of the permitted policy codes, or
-            when the note exceeds the bound the service applies to it.
+            when a reason accompanies a state that displays the review, or
+            when the reason exceeds the bound applied to it.
 
     """
     if current_user.role != ADMIN_ROLE:
@@ -983,17 +958,15 @@ def set_rating_moderation(
             rating_id,
             payload.moderation_status,
             payload.moderation_reason,
-            payload.moderation_note,
         )
     except ValueError as error:
         # The service refuses to withhold a rating without a recorded
-        # policy basis, constrains that basis to an allow-list of policy
-        # codes, and bounds the note it records. All three are reported as
-        # a 422 carrying the service's own explanation - which lists the
-        # permitted codes - because the request is well formed and the
-        # caller can act on it. The rules are enforced there and not
-        # duplicated here, so there is exactly one statement of what a
-        # valid moderation decision is.
+        # policy basis, refuses to record one beside a state that displays
+        # the review, and bounds the text it stores. All three are
+        # reported as a 422 carrying the service's own explanation,
+        # because the request is well formed and the caller can act on it.
+        # The rules are enforced there and not duplicated here, so there
+        # is exactly one statement of what a valid moderation decision is.
         raise HTTPException(status_code=422, detail=str(error)) from error
 
     if rating is None:

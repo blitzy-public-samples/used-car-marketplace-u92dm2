@@ -1,7 +1,14 @@
-import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { ZodError } from 'zod';
 
-import StarRatingInput from './StarRatingInput';
+import StarRatingInput, { type StarRatingInputHandle } from './StarRatingInput';
 import {
   CONTRACT_ERROR_MESSAGE,
   RatingContractError,
@@ -10,16 +17,9 @@ import {
   readServerDetail,
   submitRating,
 } from '../services/rating';
-import { validateRatingInput } from '../utils/validation';
+import { prepareReviewText, validateRatingInput } from '../utils/validation';
 
-import {
-  RATING_MAX,
-  RATING_MIN,
-  REVIEW_MAX_LENGTH,
-  normalizeReviewText,
-  textLength
-
-} from '../schema/rating';
+import { RATING_MAX, RATING_MIN, REVIEW_MAX_LENGTH } from '../schema/rating';
 import type { EligibilityDecision, Rating } from '../schema/rating';
 
 /**
@@ -348,22 +348,27 @@ const describeSubmissionForLog = (error: unknown): Record<string, unknown> =>
     : describeRequestFailure(error);
 
 /**
- * The one piece of copy for an over-long review, in one place.
+ * The one piece of copy for an over-long review, and it is deliberately CONSTANT.
  *
- * Defined once because it is rendered from two independent triggers — reactively
- * the moment the text crosses the bound, and again from the submit handler if a
- * submission is attempted anyway — and two hand-written copies of the same
- * sentence would eventually disagree with each other.
+ * It quotes the limit and NOT the current length, which is the whole point. The
+ * sentence used to interpolate the live count — "your review is 2001 characters" —
+ * and it was rendered inside an assertive live region, so every keystroke past the
+ * bound produced a different string and every different string INTERRUPTED a screen
+ * reader mid-word. Someone editing a long review was talked over on every
+ * character they typed, which is a worse failure than the one the message was
+ * reporting.
  *
- * The actual length is quoted rather than only the limit, because "your review is
- * 2001 characters" tells the reader how much to cut while "too long" does not.
+ * A constant fixes that by construction: the text is identical on the second
+ * keystroke over the limit and on the two-hundredth, so the DOM does not change,
+ * so nothing is re-announced. The threshold is announced ONCE, when it is crossed.
  *
- * @param length The current review length in characters, measured after
- *   normalisation — the same figure the counter shows.
- * @returns One sentence naming the overage and the bound.
+ * The exact figure is not lost — it stays in the character counter beside the
+ * field, which is associated by `aria-describedby` and is NOT a live region, so it
+ * is read on demand rather than shouted. That is the right division: the count is
+ * reference information a reader consults, while crossing the bound is an event.
  */
-const describeOverLengthReview = (length: number): string =>
-  `Your review is ${length} characters once formatting is removed. Shorten it to ${REVIEW_MAX_LENGTH} characters or fewer before submitting.`;
+const OVER_LENGTH_REVIEW_MESSAGE =
+  `Your review is over the ${REVIEW_MAX_LENGTH}-character limit once formatting is removed. Shorten it before submitting; the counter below the field shows the current length.`;
 
 /**
  * Name the counterparty's ROLE from the server's decision, for display only.
@@ -573,13 +578,70 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   const eligibilityRequestRef = useRef(0);
 
   /**
+   * The confirmation region, so focus can be MOVED to it once a rating exists.
+   *
+   * The polite `role="status"` paragraph carries the confirmation and is the only
+   * element that is present both before and after the form unmounts, which is what
+   * makes it the right destination — see `pendingFocus`.
+   */
+  const statusRef = useRef<HTMLParagraphElement | null>(null);
+
+  /**
+   * The star group, so focus can be moved INTO it after a successful retry.
+   */
+  const scoreGroupRef = useRef<StarRatingInputHandle | null>(null);
+
+  /**
+   * Where focus must go once the DOM reflects the change that removed it.
+   *
+   * WHY THIS EXISTS. Two transitions in this component delete the element the user
+   * was standing on:
+   *
+   *   - a successful SUBMIT unmounts the whole form, taking the submit button with
+   *     it, because a recorded rating is terminal and nothing offers to change it;
+   *   - a successful RETRY unmounts the "Check again" button, because there is no
+   *     longer anything to retry.
+   *
+   * When focus is inside an element that is removed, the browser moves it to
+   * `document.body`. For a keyboard or screen-reader user that is not a small
+   * inconvenience: their position in the document is gone, nothing is announced
+   * where they now are, and the next Tab starts again from the top of the page —
+   * WCAG 2.4.3 Focus Order, and the reason a live region alone is not sufficient
+   * here. It also silently breaks the confirmation: a submission that "worked" left
+   * the user nowhere, with no way to reach the sentence saying so except by
+   * re-traversing the page.
+   *
+   * WHY IT IS STATE AND NOT A CALL IN THE HANDLER. The destination does not exist
+   * yet at the moment the decision is made. `setSubmittedRating(created)` schedules
+   * a render; the confirmation is only focusable after that render commits. So the
+   * handler records an INTENT and the effect below acts on it once React has
+   * flushed, which is also what makes the behaviour correct under batching and
+   * under React 18's double-invoked development renders.
+   *
+   * `null` means "nothing to move", which is the normal state.
+   */
+  const [pendingFocus, setPendingFocus] = useState<
+    'confirmation' | 'controls' | null
+  >(null);
+
+  /**
    * Ask the server whether this caller may rate this transaction.
    *
    * Used for the initial load and for every retry, deliberately the same
    * function: a retry that differed from the first attempt in any way would be a
    * second code path to keep correct.
+   *
+   * @param isRetry Whether this call came from the retry BUTTON, which is what
+   *   decides whether focus is moved on success — the button is about to be
+   *   unmounted with the user standing on it, while the initial load has no focus
+   *   to rescue and must not steal any. It is a parameter rather than a read of
+   *   `eligibilityFailed` because this callback is a dependency of the effect
+   *   below: depending on that flag would change the callback's identity the moment
+   *   a request failed, re-running the effect, resetting the form and issuing
+   *   another request — an unbounded retry loop, from a state that is reached by a
+   *   single dropped connection.
    */
-  const loadEligibility = useCallback(async () => {
+  const loadEligibility = useCallback(async (isRetry = false) => {
     const requestId = eligibilityRequestRef.current + 1;
     eligibilityRequestRef.current = requestId;
 
@@ -606,6 +668,24 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
          * nothing left to retry.
          */
         setEligibilityFailed(false);
+
+        /*
+         * A retry that SUCCEEDS removes the button the user pressed, so the intent
+         * to move focus is recorded here. It is recorded only when a retry was in
+         * fact outstanding: the initial load reaches this line too, and the user is
+         * not standing on anything then - they may be typing elsewhere on the page,
+         * and stealing focus on a background load would be its own defect.
+         *
+         * Where it goes depends on the answer, because "the first enabled control"
+         * only exists when the decision is that the caller may rate. An eligible
+         * decision enables the star group, which is the next thing to do; an
+         * ineligible one enables nothing, so focus goes to the region that has just
+         * been given the server's reason - which is the only useful destination and
+         * is announced as it receives focus.
+         */
+        if (isRetry) {
+          setPendingFocus(decision.eligible ? 'controls' : 'confirmation');
+        }
       }
     } catch (error) {
       // Sanitised: `describeRequestFailure` emits the endpoint, the status or
@@ -647,6 +727,10 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     // this flag itself — see the note there — so the reset belongs here, where
     // per-transaction state is reset anyway.
     setEligibilityFailed(false);
+    // Any focus move queued against the previous transaction is abandoned with it:
+    // moving focus now would land the user on a confirmation for a rating that is
+    // no longer on screen.
+    setPendingFocus(null);
 
 
     loadEligibility();
@@ -657,6 +741,42 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       eligibilityRequestRef.current += 1;
     };
   }, [transactionId, loadEligibility]);
+
+  /**
+   * Move focus once the render that removed its previous home has committed.
+   *
+   * This runs AFTER the DOM is updated, which is the only point at which the
+   * destination exists: the confirmation is focusable only once
+   * `submittedRating` has rendered, and the star group is enabled only once an
+   * eligible decision has. Doing it in the handler would focus an element that was
+   * still disabled, or one React was about to replace.
+   *
+   * `tabIndex={-1}` on the status paragraph is what makes it focusable at all
+   * without adding it to the tab sequence — it is not a control, so Tab must not
+   * stop on it, but focus may be placed there programmatically. Focusing it is also
+   * what guarantees the confirmation is READ: a live region announces a change, and
+   * a region the user is standing on is announced again on demand and is where
+   * their next Tab starts from.
+   *
+   * The intent is cleared immediately, so a later unrelated re-render cannot move
+   * focus a second time and drag it away from wherever the user has since gone.
+   * `focus()` on the star group is a no-op while it is disabled, so a decision that
+   * arrived eligible and was disabled again in the same commit cannot leave focus
+   * on an inert control.
+   */
+  useEffect(() => {
+    if (pendingFocus === null) {
+      return;
+    }
+
+    if (pendingFocus === 'controls') {
+      scoreGroupRef.current?.focus();
+    } else {
+      statusRef.current?.focus();
+    }
+
+    setPendingFocus(null);
+  }, [pendingFocus]);
 
   const isEligible = eligibility !== null && eligibility.eligible;
   const hasSubmitted = submittedRating !== null;
@@ -680,31 +800,42 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * included for the same reason: a form in a state the server would refuse
    * should not offer to send it.
    *
-   * The handler still re-checks both. A form can be submitted by pressing Enter
-   * inside a text control, which does not consult the button at all.
+   * The handler still re-checks both, and does not treat this flag as a
+   * precondition it can assume. A `submit` event does not have to come from the
+   * button: `requestSubmit()` on the form element, a devtools-dispatched event, or
+   * an implicit submission from a single-line input added here later all reach the
+   * handler without consulting `disabled`. A disabled control is an interface
+   * affordance; the guard is the rule.
    */
   /**
-   * The review's length, measured exactly the way the server measures it.
+   * The review, prepared ONCE for every purpose this component has for it.
    *
-   * TWO steps, and both matter. `normalizeReviewText` is the schema's faithful
-   * port of the server's normaliser, so nothing the server strips - decomposed
-   * (NFD) Unicode from macOS and iOS, CRLF line endings, zero-width characters,
-   * runs of blank lines - is charged to the author; measuring the raw text
-   * instead made this form refuse submissions the server would have accepted,
-   * and a reviewer writing with diacritics lost roughly half of a stated 2000
-   * characters. `textLength` then counts CODE POINTS rather than UTF-16 code
-   * units, because `String.length` is wrong for exactly the text people write:
-   * every emoji is one code point stored as a surrogate pair, so a counter using
-   * `.length` would tell someone who wrote 1200 emoji they had used 2400 of
-   * their 2000 characters.
+   * `prepareReviewText` performs the submission path's own three steps in its own
+   * order - sanitise with DOMPurify, normalise as the server normalises, then
+   * count CODE POINTS rather than UTF-16 code units - and returns the value, its
+   * length and whether it exceeds the bound. Everything downstream reads this one
+   * result: the character counter, the over-limit message, `canSubmit`, the
+   * submit handler's re-check, and the `review` that actually goes on the wire.
    *
-   * `RatingCreateSchema` applies the same two steps in the same order, so this
-   * flag, the counter, the reactive over-limit message and the submit guard all
-   * measure one string.
+   * Deriving all five from one value is the fix for a real divergence rather than
+   * a tidiness preference. This component used to measure `textLength(
+   * normalizeReviewText(review))` - the RAW text - while `validateRatingInput`
+   * sanitised before validating, so the two disagreed by however much
+   * sanitisation removed. Paste `<b>Great car</b>` and the counter charged 17
+   * characters for a payload of 10; at the boundary that meant a review could be
+   * shown as over the limit, have its submit button disabled and be described as
+   * too long, on the strength of a string that was never going to be sent.
+   *
+   * `useMemo` because the preparation parses the text with DOMPurify, and this
+   * component re-renders for reasons that have nothing to do with the review -
+   * an eligibility response, a star selection, a submission starting. The
+   * dependency is the raw text, which is the only thing the result depends on.
    */
-  const reviewLength = textLength(normalizeReviewText(review));
+  const preparedReview = useMemo(() => prepareReviewText(review), [review]);
 
-  const isReviewOverLimit = reviewLength > REVIEW_MAX_LENGTH;
+  const reviewLength = preparedReview.length;
+
+  const isReviewOverLimit = preparedReview.isOverLimit;
 
   const canSubmit =
     isEligible &&
@@ -734,6 +865,20 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   };
 
   /**
+   * The retry button's handler.
+   *
+   * A wrapper rather than `onClick={loadEligibility}` for two reasons: the click
+   * event would otherwise be passed as `isRetry` — truthy by accident, correct only
+   * by luck — and this is where the call is declared to BE a retry, which is what
+   * arranges the focus move on success. The returned promise is deliberately not
+   * awaited and needs no `catch`: `loadEligibility` handles its own failure and
+   * never rejects.
+   */
+  const handleRetry = (): void => {
+    void loadEligibility(true);
+  };
+
+  /**
    * Wraps `setScore` so choosing a star also drops a stale error. Passed to the
    * star control instead of the bare setter for exactly that reason.
    */
@@ -756,8 +901,10 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     // stale error beside a fresh outcome.
     clearStoredError();
 
-    // Re-checked rather than trusted from `canSubmit`: Enter in the textarea
-    // submits the form without the button being involved.
+    // Re-checked rather than trusted from `canSubmit`, because a `submit` event
+    // need not have come from the button - see the note there. Enter inside the
+    // textarea does NOT submit this form; it inserts a newline, which is normal
+    // textarea behaviour and is why the review can be written as paragraphs.
     if (score === null) {
       setErrorMessage(
         `Choose a score from ${RATING_MIN} to ${RATING_MAX} before submitting.`,
@@ -766,21 +913,20 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     }
 
     /**
-     * Measured on the NORMALISED text, which is exactly what the counter
-     * displays and exactly what `RatingCreateSchema` and the server bound, so
-     * none of the four can disagree about whether the review is too long. The
-     * textarea's `maxLength` caps the RAW text at a much larger ceiling, so this
-     * is the real gate rather than defensive decoration. Returning here means
-     * the request is never sent: a refusal this local should not cost a round
-     * trip.
-
+     * Measured on the PREPARED text - `preparedReview`, the same result the
+     * counter shows and the same value the payload carries - so the gate, the
+     * message, the counter and the request cannot disagree about whether the
+     * review is too long. There is no `maxLength` on the textarea to fall back on,
+     * deliberately (see the note on the element), so this is the real gate rather
+     * than defensive decoration. Returning here means the request is never sent: a
+     * refusal this local should not cost a round trip.
      *
-     * It deliberately stores NOTHING. The message is already on screen, derived
-     * from `reviewLength` by `alertMessage`, and storing a second copy is what
-     * makes it go stale: a stored "your review is 2001 characters" survives the
-     * user fixing the review and then sits, visibly false, above a counter
-     * reading "6 / 2000". Derived state cannot rot, so the derivation is left as
-     * the single source and this branch only refuses to send.
+     * It deliberately stores NOTHING. The explanation is already on screen,
+     * derived from `preparedReview`, and storing a second copy is what makes it go
+     * stale: a stored message survives the user fixing the review and then sits,
+     * visibly false, above a counter that now reads "6 / 2000". Derived state
+     * cannot rot, so the derivation is left as the single source and this branch
+     * only refuses to send.
      */
     if (isReviewOverLimit) {
       return;
@@ -789,27 +935,29 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     setIsSubmitting(true);
 
     try {
-      const trimmed = review.trim();
-
       /**
-       * The review is forwarded as the user typed it, trimmed, and is sanitised
-       * by `validateRatingInput` — which now sanitises BEFORE it validates, so
-       * the value the schema approves is the value that goes on the wire.
-       * Sanitising here as well would be worse than redundant: it would make this
-       * component a second owner of the content policy, and the double pass would
-       * have to be reasoned about every time that policy changed. The reviewable
-       * guarantee is unchanged and structural — the submitted payload is the
-       * value `validateRatingInput` returns, so no path out of this component can
-       * forward unsanitised free text.
+       * The review submitted is THE VALUE THAT WAS MEASURED — `preparedReview
+       * .value`, the same result the counter, the over-limit message and the
+       * submit gate all read. Nothing is re-derived here, so there is no second
+       * expression that could drift from the first.
        *
-       * Omitted entirely when there is nothing to say. `review` is optional on
-       * the wire, so an empty string would send a present-but-blank review
-       * where the correct statement is that no review was written.
+       * It is already sanitised and normalised, and `validateRatingInput` applies
+       * both again on the way through. That is deliberate rather than wasteful:
+       * sanitising plain text and normalising normalised text are idempotent, so
+       * the value is unchanged, while the guarantee that no path out of this
+       * component can forward unsanitised free text stays structural — it holds
+       * because of what `validateRatingInput` does, not because this component
+       * remembered to prepare first.
+       *
+       * `undefined` when there is nothing to say. `review` is optional on the
+       * wire, so an empty string would send a present-but-blank review where the
+       * correct statement is that no review was written; `prepareReviewText`
+       * already collapses whitespace-only and markup-only text to that state.
        */
       const payload = validateRatingInput({
         transactionId,
         score,
-        review: trimmed.length > 0 ? trimmed : undefined,
+        review: preparedReview.value,
       });
 
       const created = await submitRating(payload);
@@ -834,6 +982,15 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
        * this component renders — `submittedRating` — already says so.
        */
       setSubmittedRating(created);
+
+      /*
+       * The controls are about to unmount with the focused submit button inside
+       * them, so focus is moved to the confirmation. That sentence is the answer to
+       * what the user just did, and being on it means a screen reader reads it and
+       * a keyboard user continues from the right place instead of from the document
+       * body.
+       */
+      setPendingFocus('confirmation');
 
       try {
         /*
@@ -886,8 +1043,24 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    *
    * One region rather than several, because a screen reader queues live regions
    * and three competing ones would talk over each other. The order below is the
-   * order of what matters: what just happened, then what is being waited on,
-   * then why the controls are inert.
+   * order of what matters: what just happened, then the one local rule the user can
+   * act on immediately, then what is being waited on, then why the controls are
+   * inert.
+   *
+   * THE OVER-LENGTH SENTENCE IS ANNOUNCED HERE, POLITELY, AND NOT IN THE ASSERTIVE
+   * REGION. It used to live there, carrying the live character count, so it was
+   * rewritten and re-announced on every keystroke past the bound — assertively,
+   * which means interrupting whatever the screen reader was saying, including the
+   * word the user was in the middle of typing. Being over a length limit is not an
+   * emergency: it is a condition the reader needs to know about and then work on,
+   * which is precisely what `role="status"` is for. Because the text is a constant
+   * it is announced once, when the threshold is crossed, and stays silent
+   * afterwards no matter how much more is typed.
+   *
+   * It still outranks the loading and ineligibility messages, because it is the
+   * CURRENT obstacle the user can do something about, and it sits below the
+   * submission confirmation, which is terminal — once a rating exists the controls
+   * are gone and the review length is history.
    *
    * The empty string is a legitimate value — see the region's own comment for
    * why it stays mounted while it has nothing to say.
@@ -926,6 +1099,8 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       ? `${recorded} It is now visible on their profile.`
       : `${recorded} It stays private for now. If the other party rates you too, both ratings become visible at the same time; if they never do, yours becomes visible on its own once the rating window closes.`;
 
+  } else if (isReviewOverLimit) {
+    statusMessage = OVER_LENGTH_REVIEW_MESSAGE;
   } else if (isLoadingEligibility) {
     statusMessage = 'Checking whether you can rate this transaction...';
   } else if (eligibility !== null && !eligibility.eligible) {
@@ -949,29 +1124,21 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * because the server reports both as null until it can derive them.
    */
   /**
-   * The one assertive announcement, resolved by priority.
+   * The one assertive announcement: a refusal, and nothing else.
    *
-   * An over-long review OUTRANKS a stored error, and it is reported reactively
-   * rather than only on submit. Both halves matter.
+   * Assertive is for an outcome the user did not ask for and must hear about now —
+   * a submission the server rejected, or a local guard that stopped one. It is
+   * emphatically NOT for a condition that changes as somebody types: the
+   * over-length sentence was moved to the polite region above precisely because
+   * updating an `aria-live="assertive"` node on every keystroke interrupts the
+   * screen reader on every keystroke.
    *
-   * Reactively, because the bound is knowable the instant the text crosses it,
-   * and a form that stays silent until the user presses a button they can no
-   * longer press would be a dead end. This is the one local rule that can be
-   * evaluated without the server, so it is the one worth reporting immediately.
-   *
-   * Outranking, because it is the CURRENT, actionable obstacle: showing a
-   * leftover "you have already rated this transaction" from an earlier attempt,
-   * while the real reason the button is inert is the length, would send the user
-   * to fix the wrong thing.
-   *
-   * The length message is DERIVED here and stored nowhere, and `errorMessage` is
-   * dropped by every input handler. Together those two rules are what stop this
-   * region going stale: whichever branch wins, its text is true of the payload
-   * as it stands right now.
+   * What remains is `errorMessage`, which is set only by an attempt — a failed
+   * eligibility check, a refused submission, a submit with no score chosen — and is
+   * dropped by every input handler, so this region never asserts something the
+   * current payload has already made false. One event, one announcement.
    */
-  const alertMessage = isReviewOverLimit
-    ? describeOverLengthReview(reviewLength)
-    : errorMessage ?? '';
+  const alertMessage = errorMessage ?? '';
 
   const counterpartyLabel = describeCounterparty(eligibility);
 
@@ -1023,7 +1190,17 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       */}
       <p
         id={statusId}
+        ref={statusRef}
         role="status"
+        /*
+          `-1` keeps this out of the tab sequence — it is a message, not a control,
+          so Tab must not stop here — while making it a legitimate PROGRAMMATIC focus
+          target. That is what the two transitions above need: when the form or the
+          retry button is unmounted, focus is moved here rather than being dropped
+          to the document body, so the user keeps their place and the sentence
+          explaining what happened is where they are standing.
+        */
+        tabIndex={-1}
         className={
           hasSubmitted
             ? 'mt-3 text-sm font-semibold text-gray-900'
@@ -1065,7 +1242,7 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       {eligibilityFailed && !hasSubmitted ? (
         <button
           type="button"
-          onClick={loadEligibility}
+          onClick={handleRetry}
           disabled={isLoadingEligibility}
           className={`mt-3 ${RETRY_BUTTON_CLASSES}`}
         >
@@ -1085,11 +1262,25 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       */}
       {hasSubmitted ? null : (
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+          {/*
+            `required` because a rating with no score is not a rating: the submit
+            button stays disabled until one is chosen, and a control that is
+            mandatory has to SAY so rather than leaving the user to infer it from a
+            button that will not respond. The prop renders `aria-required` on the
+            group and the word "(required)" inside its visible label, so the
+            obligation reaches a screen reader and a sighted reader by independent
+            channels.
+
+            The review beside it is labelled "(optional)" in the same way, so the
+            two fields state their status in the same voice.
+          */}
           <StarRatingInput
+            ref={scoreGroupRef}
             value={score}
             onChange={handleScoreChange}
             label="Your rating"
             disabled={controlsDisabled}
+            required
           />
 
           <div className="flex flex-col gap-1">
@@ -1129,6 +1320,18 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
                */
               rows={4}
               aria-describedby={counterId}
+              /*
+               * The over-limit state as a PROPERTY of the field, which is what a
+               * screen reader reports when the user moves back to it: "invalid
+               * entry", alongside the counter it is described by. Without it the
+               * only machine-readable signal was a live-region announcement that had
+               * already been made and could not be re-read from the field itself.
+               *
+               * `undefined` rather than `false` when the review is within bounds, so
+               * the attribute is absent instead of asserting validity on a field
+               * that has not been validated for anything else.
+               */
+              aria-invalid={isReviewOverLimit ? true : undefined}
               className={TEXTAREA_CLASSES}
             />
 

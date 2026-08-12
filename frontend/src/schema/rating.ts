@@ -78,13 +78,29 @@ import { z } from 'zod';
  * records why, which is what `PATCH /api/ratings/{ratingId}/moderation` performs
  * on the moderation fields alone, leaving the original score and words intact.
  *
- * Nothing here sanitises. `review` is BOUNDED at its maximum length and is
- * otherwise passed through untouched — no `.transform()` strips, escapes or
- * rewrites an author's words. Sanitisation belongs to the existing DOMPurify
- * wrapper `sanitizeUserInput` in `../utils/validation` and to the submission
- * form; the server independently normalises the text it stores. A schema that
- * silently rewrote content would make the value a reader sees differ from the
- * value that was validated.
+ * Nothing here sanitises, and the one transform there is exists to keep the
+ * client and the server measuring the same string.
+ *
+ * `RatingCreateSchema.review` applies `.transform(normalizeReviewText)`, which is
+ * a faithful port of the server's own `as_plain_text` normalisation minus its
+ * length check: NFC composition, CRLF folding, removal of control and format
+ * characters other than newline and tab, collapsing runs of blank lines, and a
+ * trim. The bound is then measured against the normalised text, because that is
+ * the value the server stores and the value a reader counts. So the value this
+ * schema approves IS the value that goes on the wire, and it is what the server
+ * would have normalised the input to anyway — the transform cannot make the two
+ * disagree, which is the property a length rule split across two layers needs.
+ *
+ * What it deliberately does NOT do is edit anybody's words. No markup is
+ * stripped and no character is escaped: text still carrying a `<` or `>` after
+ * normalisation is REFUSED with a message naming the character, exactly as the
+ * server refuses it, rather than being quietly rewritten. XSS sanitisation is
+ * separate and belongs to the DOMPurify wrapper `sanitizeUserInput` in
+ * `../utils/validation`, which the submission path applies before parsing.
+ *
+ * No response schema transforms at all. A rating read back from the server is
+ * validated as received, so the value a reader sees is the value that was
+ * validated.
  */
 
 /**
@@ -244,12 +260,18 @@ const CONTROL_OR_FORMAT_CHARACTER = /\p{Cc}|\p{Cf}/u;
  *      a run of exactly two, whatever its original length.
  *   5. Trim surrounding whitespace.
  *
- * This is a MEASUREMENT helper, not a sanitiser and not a transform. Nothing in
- * this module rewrites what a user typed — the value sent is the value they
- * wrote, and the server normalises the copy it persists — because a schema that
- * silently rewrote content would make the text a reader sees differ from the text
- * that was validated. XSS is separately handled by `sanitizeUserInput` in
- * `../utils/validation`.
+ * This is NOT a sanitiser: it removes what prose cannot contain and composes what
+ * is equivalent, and it neither strips markup nor escapes anything. XSS is
+ * separately handled by `sanitizeUserInput` in `../utils/validation`.
+ *
+ * It is used twice, for one purpose. `RatingCreateSchema.review` applies it as a
+ * `.transform()`, so the value that reaches the wire is the normalised text, and
+ * the bound below is then measured on that same text. Both uses exist so client
+ * and server MEASURE AND STORE THE SAME STRING — the server normalises the copy
+ * it persists identically, so the transform cannot change what a submission means
+ * and cannot make the accepted value differ from the stored one. A reader
+ * measuring the raw text instead would be charged for characters the server
+ * removes.
  *
  * @param value Raw review text as authored.
  * @returns The normalised text, which may be empty when the input carried
@@ -293,6 +315,34 @@ export const normalizeReviewText = (value: string): string => {
 const REVIEW_TAG_DELIMITERS = /[<>]/;
 
 /**
+ * Count Unicode CODE POINTS, with no normalisation of any kind.
+ *
+ * The primitive `textLength` is built on, and the correct measure for a value the
+ * server bounds WITHOUT normalising it — an identifier rather than prose.
+ * Pydantic's `constr(max_length=…)` measures `len(value)` on the string exactly
+ * as received and Python's `len` counts code points, so a bound written with
+ * Zod's `.max()` — which counts UTF-16 CODE UNITS — is a different, stricter rule
+ * for any text outside the Basic Multilingual Plane: a 128-code-point identifier
+ * of astral characters measures 256 by `.length` and would be refused here while
+ * the server accepted it. A client silently overriding the authoritative rule is
+ * the failure mode, and this function is how it is avoided.
+ *
+ * `Array.from` iterates by code point (`String.prototype[Symbol.iterator]` yields
+ * whole surrogate pairs), which is what makes the count correct rather than
+ * approximately correct.
+ *
+ * Kept as its own function rather than folded into `textLength`, because NFC
+ * composition is right for prose and wrong for an identifier: the server composes
+ * a review before measuring it and does not compose a document ID at all, so
+ * measuring an ID after composition would count fewer code points than the rule
+ * being mirrored and would accept a value the server refuses.
+ *
+ * @param text Text exactly as received.
+ * @returns The number of Unicode code points.
+ */
+export const codePointLength = (text: string): number => Array.from(text).length;
+
+/**
  * Measure author-supplied text the way the server measures it: NFC-composed
  * Unicode code points.
  *
@@ -328,7 +378,7 @@ const REVIEW_TAG_DELIMITERS = /[<>]/;
  * @returns The number of NFC-composed Unicode code points.
  */
 export const textLength = (text: string): number =>
-  Array.from(text.normalize('NFC')).length;
+  codePointLength(text.normalize('NFC'));
 
 /**
  * A string bounded by the server's length rule rather than by `.length`.
@@ -606,18 +656,29 @@ export type Rating = z.infer<typeof RatingSchema>;
  * endpoint is gated on `role === 'admin'` and its caller just set the state they
  * are reading back.
  *
- * `moderationReason` is a POLICY CODE, not prose, and never anything derived from
- * the score — the server constrains it to an allow-list (`abuse`,
- * `personalInformation` and so on, in snake_case on the wire), so a score-based
- * justification is not expressible. It is modelled as a bounded string rather
- * than a `z.enum` on purpose: the allow-list is the server's to extend, and a
- * client enum would reject a newly added code as a contract breach instead of
- * displaying it. `moderationNote` carries the human specifics behind the code.
+ * `moderationReason` is the policy basis a moderator recorded: prose describing
+ * the violation in the review CONTENT — abuse, personally identifying
+ * information, profanity — and never anything derived from the score. The server
+ * permits it ONLY beside `rejected`, and requires it there, so this pair can
+ * never arrive as a displayed review carrying a violation against it. Nullable
+ * rather than optional because the server always sends the key, with `null` on
+ * every state that displays the review.
  */
 export const ModeratedRatingSchema = RatingSchema.extend({
   moderationStatus: ModerationStatusSchema,
-  moderationReason: z.string().max(MODERATION_REASON_MAX_LENGTH).nullable(),
-  moderationNote: z.string().max(MODERATION_REASON_MAX_LENGTH).nullable()
+  /*
+   * `boundedText` rather than `.max()`, exactly as the review above and for the
+   * same reason: the server bounds this through `as_plain_text(…,
+   * max_length=MODERATION_REASON_MAX_LENGTH)`, which measures NFC-composed code
+   * points, while Zod's `.max()` measures UTF-16 code units. This field arrives
+   * on a RESPONSE, so the mismatch would reject a payload the server had already
+   * validated and stored — a moderator's reason containing an emoji would report
+   * as a contract failure to the administrator who had just written it.
+   */
+  moderationReason: boundedText(
+    MODERATION_REASON_MAX_LENGTH,
+    `A moderation reason must be at most ${MODERATION_REASON_MAX_LENGTH} characters`
+  ).nullable()
 });
 
 export type ModeratedRating = z.infer<typeof ModeratedRatingSchema>;
@@ -667,9 +728,23 @@ export const RatingCreateSchema = z.object({
   transactionId: z
     .string()
     .min(1, 'A transaction reference is required')
-    .max(
-      TRANSACTION_ID_MAX_LENGTH,
-      `A transaction reference must be at most ${TRANSACTION_ID_MAX_LENGTH} characters`
+    /*
+     * A CODE-POINT bound, not Zod's `.max()`, for the same reason the review's
+     * bound is a refinement: the server's `DocumentId` is
+     * `constr(max_length=128)`, which measures Python's `len` — code points —
+     * while `.max()` measures UTF-16 code units. The two disagree on any
+     * identifier containing an astral character, where a 128-code-point value
+     * measures 256 by `.length`, and the disagreement runs the wrong way: this
+     * layer would refuse a reference the server accepts, so a transaction whose
+     * ID happened to contain one could never be rated from this client at all.
+     * `codePointLength` rather than `textLength` because the server does not
+     * normalise an ID before measuring it, so neither may this.
+     */
+    .refine(
+      (value) => codePointLength(value) <= TRANSACTION_ID_MAX_LENGTH,
+      {
+        message: `A transaction reference must be at most ${TRANSACTION_ID_MAX_LENGTH} characters`
+      }
     )
     .refine(isPathSafeDocumentId, {
       message:
@@ -832,18 +907,84 @@ export type RatingAggregate = z.infer<typeof RatingAggregateSchema>;
  * them as null. Modelling them as nullable is what lets a form render the
  * disabled-with-reason state instead of failing on absent data.
  */
-export const EligibilityDecisionSchema = z.object({
-  eligible: z.boolean(),
-  reason: z.string().nullable(),
-  rateeId: z.string().nullable(),
-  direction: RatingDirectionSchema.nullable(),
-  /**
-   * Whether this caller has already rated this transaction. Distinct from
-   * `eligible`, because "you have had your say" and "you were never entitled to
-   * one" are different states that a profile or a form should not conflate.
-   */
-  alreadyRated: z.boolean()
-});
+export const EligibilityDecisionSchema = z
+  .object({
+    eligible: z.boolean(),
+    reason: z.string().nullable(),
+    rateeId: z.string().nullable(),
+    direction: RatingDirectionSchema.nullable(),
+    /**
+     * Whether this caller has already rated this transaction. Distinct from
+     * `eligible`, because "you have had your say" and "you were never entitled to
+     * one" are different states that a profile or a form should not conflate.
+     */
+    alreadyRated: z.boolean()
+  })
+  .superRefine((decision, context) => {
+    /*
+     * THE FIELDS ARE NULLABLE INDIVIDUALLY AND CONSTRAINED TOGETHER.
+     *
+     * Every field above is satisfiable on its own by a decision that cannot
+     * exist, and each impossible combination would be acted on by the submission
+     * form as though it were an answer. `evaluate_eligibility` in
+     * `backend/app/services/rating.py` returns from exactly four places, so the
+     * three rules below are what it can actually produce:
+     *
+     *   - an ELIGIBLE decision is only reached after the counterparty has been
+     *       derived, so `rateeId` and `direction` are both present, and it is
+     *       unreachable once a rating exists, so `alreadyRated` is false. A
+     *       payload claiming eligibility without a counterparty would let the
+     *       form tell someone they may rate while being unable to say whom.
+     *   - an INELIGIBLE decision always carries the refusal's own message as
+     *       `reason`, because the server composes it from the very exception the
+     *       write path would raise. Without it the form disables its control
+     *       with no explanation, which is the accessibility failure the endpoint
+     *       exists to prevent.
+     *   - `alreadyRated` implies ineligible, since having rated is one of the
+     *       reasons a caller is refused.
+     *
+     * Refused here rather than smoothed over, because a malformed decision is
+     * the one input this form cannot recover from: it gates a write the server
+     * will refuse anyway, and the user is told nothing useful either way.
+     */
+    if (decision.eligible) {
+      if (decision.rateeId === null) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['rateeId'],
+          message:
+            'An eligible decision must name the counterparty being rated'
+        });
+      }
+
+      if (decision.direction === null) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['direction'],
+          message: 'An eligible decision must carry the rating direction'
+        });
+      }
+
+      if (decision.alreadyRated) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['alreadyRated'],
+          message:
+            'A caller who has already rated this transaction cannot be eligible'
+        });
+      }
+
+      return;
+    }
+
+    if (decision.reason === null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['reason'],
+        message: 'An ineligible decision must explain why'
+      });
+    }
+  });
 
 export type EligibilityDecision = z.infer<typeof EligibilityDecisionSchema>;
 
@@ -851,25 +992,24 @@ export type EligibilityDecision = z.infer<typeof EligibilityDecisionSchema>;
  * Payload of `GET /api/ratings/user/{userId}` — the ratings a user has received,
  * together with the aggregate computed from them.
  *
- * The two travel together because they must agree: the list a reader can see has
- * to account for the average they are shown, and the server establishes both from
- * one settlement pass so the envelope cannot contradict itself. Published ratings
- * only, so an unpublished rating appears in neither half.
+ * Two keys, mirroring the server's `UserRatingsResponse` exactly. Page metadata
+ * was mirrored here and removed again: it widened a published contract that is
+ * two fields, and the cursor behind it let any rating ID be handed back to a
+ * public read and its existence inferred from the answer.
  *
- * `items` is ONE PAGE while `aggregate` covers every published rating, so
- * `aggregate.count` may legitimately exceed `items.length`. That is not a
- * discrepancy and must not be presented as one — `hasMore` is what tells a reader
- * the remainder is reachable rather than missing, and `nextCursor` is how it is
- * reached. Without them a user with more than a page of ratings was shown an
- * average computed from records the response gave no way to fetch.
+ * The two halves travel together because they are established from ONE pinned
+ * snapshot on the server, so the envelope cannot contradict itself. Published
+ * ratings only, so an unpublished rating appears in neither.
+ *
+ * `items` is bounded and omits any rating whose review moderation rejected,
+ * while `aggregate` counts every published rating whatever its score and state.
+ * So `aggregate.count` may legitimately exceed `items.length`. That is the
+ * contract, not a discrepancy, and it must not be rendered as one — in
+ * particular `aggregate.average` is never derived from `items`.
  */
 export const UserRatingsResponseSchema = z.object({
   items: z.array(RatingSchema),
-  aggregate: RatingAggregateSchema,
-  /** Pass as `after` to read the following page. Null on the last page. */
-  nextCursor: z.string().nullable(),
-  /** Whether another page exists beyond `items`. */
-  hasMore: z.boolean()
+  aggregate: RatingAggregateSchema
 });
 
 export type UserRatingsResponse = z.infer<typeof UserRatingsResponseSchema>;

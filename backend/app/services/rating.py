@@ -105,10 +105,16 @@ Mapping domain failures onto responses belongs to the router, which
 translates ``RaterNotVerified`` and ``NotATransactionParticipant`` to
 403, ``TransactionNotFound`` to 404, ``TransactionNotCompleted`` and
 ``DuplicateRating`` to 409, and ``SelfRatingNotAllowed`` to 422. Those
-six ARE the client-facing vocabulary of this feature, in full. Every one
-of them derives from ``RatingError``, so a router that also catches the
-base class handles anything added here later rather than leaking a 500;
-each carries a ``message`` fit to be shown to the caller.
+six ARE the client-facing vocabulary of this feature, in full, and each
+carries a ``message`` fit to be shown to the caller.
+
+The router's mapping is CLOSED over exactly those six: it catches the
+tuple derived from its own status table and deliberately does not catch
+the base ``RatingError``. So a subclass added here later is not quietly
+answered 400 with an unreviewed message - it propagates, is logged with
+a traceback and surfaces as the unclassified defect it is, until someone
+maps it on purpose. Adding a failure mode therefore means editing both
+files, and that is the intended cost.
 
 Two further exceptions defined below are deliberately NOT part of that
 vocabulary and are deliberately not ``RatingError`` subclasses:
@@ -148,24 +154,30 @@ Three rules decide what a reader gets, and they are applied by
 
 1. Publication gates the RECORD. Nothing unpublished is visible to
    anybody but its author - that is the double-blind model.
-2. Moderation gates the CONTENT, never the score. A published rating's
-   score is always shown and always counted, whatever its value and
-   whatever its moderation state; its free-text review is shown only
-   once ``moderation_status`` is ``approved``, which is what "moderation
-   before display" means in practice. A number cannot carry abuse or
-   personal data, and withholding one for being low is the suppression
-   the FTC rule forbids; unreviewed or policy-violating prose can carry
-   both, so ``pending`` text waits and ``rejected`` text is gone for
-   good. The RECORD survives either way, because removing it would put
-   the visible list and the aggregate into permanent disagreement: the
-   aggregate counts every published rating, so a reader who could see
-   n-1 ratings behind an average computed from n would be shown a
-   reputation the ratings on the page cannot account for.
+2. Moderation decides how much of a published rating a reader gets, and
+   it is driven by the CONTENT and never by the score. An ``approved``
+   rating is shown in full; a ``pending`` one is shown with its review
+   text withheld, which is what "moderation before display" means in
+   practice; a ``rejected`` one is withheld from the reader entirely,
+   because a record a moderator has ruled a policy violation must not
+   keep appearing. A number cannot carry abuse or personal data, and
+   withholding one for being LOW is the suppression the FTC rule
+   forbids, so there is no score threshold anywhere in this module.
 3. Authorship overrides both, for the author only. A rater always sees
    their own rating in full, including while it is unrevealed and
    including when its review was rejected, together with the reason -
    otherwise a withheld review would vanish with no explanation to the
    person who wrote it.
+
+The AGGREGATE is deliberately not governed by rule 2. It counts every
+published rating whatever its score and whatever its moderation state,
+because moving a score on a content decision is exactly what would make
+moderation sentiment-relevant. So ``rating_count`` can exceed the number
+of records a reader is shown. That is the contract, stated on the
+response model rather than reconciled by weakening either half - and the
+alternative, keeping a withheld record on the page as a bare score, was
+tried and rejected: a reader cannot tell a stripped review from a rating
+whose author simply wrote nothing.
 
 ``moderation_reason`` is an operator note and is never returned to
 anyone but the author.
@@ -210,6 +222,7 @@ from app.core.config import settings
 from app.db.firestore import (
     create_document_with_id,
     db,
+    run_in_read_only_transaction,
     run_in_transaction,
 )
 from app.schema.rating import (
@@ -235,6 +248,12 @@ RATINGS_COLLECTION = 'ratings'
 USERS_COLLECTION = 'users'
 TRANSACTIONS_COLLECTION = 'transactions'
 
+# Firestore's name for a document's own ID, usable as an ordering field.
+# Ordering by it is how a query that needs no data ordering still gets a
+# TOTAL order - which a cursor requires - without a composite index and
+# without excluding documents that lack some data field.
+DOCUMENT_ID_FIELD = '__name__'
+
 # The only transaction state that authorizes a rating. This is the
 # literal value app/api/transactions.py writes, compared
 # case-insensitively so a differently-cased document still matches.
@@ -243,23 +262,30 @@ COMPLETED_STATUS = 'completed'
 # Page sizes for the collection reads. Both are bounded so no read path
 # can degrade into an unbounded scan as the collection grows.
 #
-# This module issues exactly THREE query shapes, and each one is served
-# by one of the three composite indexes declared in
+# This module issues exactly TWO shapes that need a composite index, and
+# each is served by one of the TWO indexes declared in
 # infrastructure/firestore.indexes.json. Nothing here may introduce a
-# fourth shape without declaring the index for it, because a query
-# needing an undeclared composite index fails outright at runtime rather
-# than degrading:
+# third without declaring the index for it, because a query needing an
+# undeclared composite index fails outright at runtime rather than
+# degrading:
 #
 #   ratings received by one user, and the due subset of them
 #     -> (ratee_id ASC, is_published ASC, created_at DESC)
 #   ratings belonging to one transaction, ordered by rater
 #     -> (transaction_id ASC, rater_id ASC)
-#   ratings past their publication deadline, oldest first
-#     -> (is_published ASC, created_at ASC)
 #
 # A query using a prefix of an index's fields for equality is served by
 # that same index, which is why the first index serves both the
 # published listing and the due-settlement read.
+#
+# The third shape this module reads - the global sweep for ratings whose
+# window has closed - needs NO composite index, and that is a deliberate
+# design constraint rather than an accident. It filters on
+# ``is_published`` alone and walks the automatic single-field index by
+# document name, deciding due-ness in Python. Adding the deadline to the
+# query would read better and cost an index: an equality filter combined
+# with a range on a different field requires a composite index, and this
+# project declares two. See :func:`_publish_expired_ratings`.
 DEFAULT_RATINGS_PAGE_SIZE = 50
 DEFAULT_SWEEP_PAGE_SIZE = 200
 
@@ -286,18 +312,23 @@ SETTLE_BATCH_SIZE = 10
 # of the ordering - which is stable, because a published rating leaves
 # the query.
 #
-# Read from settings rather than hardcoded, because it is the one number
-# an operator has to be able to move: it trades how much of a backlog a
-# single pass clears against how much memory and time that pass costs the
-# worker, and the right value depends on the size of the deployment
-# rather than on anything this module can know.
-DEFAULT_SWEEP_SCAN_LIMIT = settings.RATING_SWEEP_SCAN_LIMIT
+# Declared here, beside the query it bounds, rather than exposed as a
+# setting. The number is only legible next to the walk that spends it:
+# it trades how much of a backlog one pass clears against the memory and
+# time that pass costs, and both sides of that trade are properties of
+# this code rather than of a deployment. An operator who needs a
+# different value needs to see the walk to choose one.
+DEFAULT_SWEEP_SCAN_LIMIT = 5000
 
-# Ceiling on a caller-supplied page size. A lower bound alone is not a
-# bound: an unclamped ``limit`` is passed straight to Firestore and turns
-# a public read into a collection scan, so both ends are closed by
-# _page_size().
-MAX_RATINGS_PAGE_SIZE = 200
+# Ceiling on documents the per-user settlement on a READ path may
+# examine in one pass. Much smaller than the sweep's, because this one
+# runs on the critical path of a public read against the SRS 200 ms
+# budget: it is large enough to walk the whole due set for any realistic
+# user in one pass - which is what stops the oldest due record starving
+# behind newer ones - and small enough that a pathological backlog
+# cannot turn one read into an unbounded scan. The remainder drains
+# across successive reads, and the scheduled sweep clears it wholesale.
+SETTLE_SCAN_LIMIT = 100
 
 # The Firestore document-ID grammar, mirrored from
 # ``app.schema.rating.DocumentId`` so the two entry points that receive a
@@ -363,53 +394,36 @@ _NO_CLAIM = object()
 # a Firestore transaction cannot do.
 AGGREGATE_PRECISION = 2
 
-# The ONLY reasons a rating's review may be withheld, as an allow-list of
-# policy codes. Every one names a property of the CONTENT; none can be
-# satisfied by the score.
+# The one moderation state on which a reason may be recorded, and the one
+# on which a reason is REQUIRED. Both halves of that sentence are enforced
+# by :func:`_moderate_rating`, and together they are the whole
+# reason/state matrix:
 #
-# Free text was the previous contract, and free text cannot enforce a
-# policy - it can only record whatever a moderator typed. An administrator
-# could withhold a review with the reason "low score" or "bad for us", and
-# the system would accept it, store it, and report itself as compliant
-# because a reason was present. That is precisely the review suppression
-# the FTC Rule on the Use of Consumer Reviews and Testimonials (16 CFR Part
-# 465) prohibits: suppressing reviews on the basis of rating or negative
-# sentiment. Sentiment-neutrality has to be a property the system HOLDS,
-# not one it asks its operators to remember.
+#   rejected  -> a reason is mandatory. A rejection is the transition that
+#                removes somebody's words from view, so it either cites
+#                the policy violation in the CONTENT that justifies it or
+#                it does not happen.
+#   approved  -> no reason. The review is displayed; a stored
+#   pending      justification beside a displayed review is a record that
+#                contradicts itself, and a stale one left over from an
+#                earlier rejection is worse - it reads as a live finding.
+#                Supplying one is refused, and any previously stored
+#                reason is cleared by the same write that moves the state.
 #
-# An allow-list makes it structural. A rejection either cites one of these
-# codes or it does not happen, so there is no expressible way to record a
-# score-based justification - and the stored code is machine-readable,
-# which makes the whole moderation history auditable by grouping rather
-# than by reading prose.
-#
-# The specifics still get recorded, in a SEPARATE optional operator note.
-# Splitting the two is what lets the code stay closed while the detail
-# stays free: "which policy" is a decision the system constrains, "what
-# exactly happened" is a description only a person can write.
-MODERATION_REASON_CODES = (
-    # Abusive, harassing or threatening language directed at a person.
-    'abuse',
-    # Personally identifying information about anyone - address, phone
-    # number, email, government identifier, plate number.
-    'personal_information',
-    # Profanity or obscenity.
-    'profanity',
-    # Content unrelated to the transaction being rated, including
-    # advertising and link spam.
-    'off_topic',
-    # Content the reviewer did not write, or that misrepresents who wrote
-    # it - the authenticity condition the same FTC rule addresses.
-    'inauthentic',
-    # Unlawful content, or content infringing somebody's rights.
-    'illegal_content',
-)
-
-# Bound on the operator note that accompanies a reason code. It is
-# persisted on the rating document and read back by an administrator, so it
-# gets the same bounded plain-text treatment as everything else stored
-# here.
-MODERATION_NOTE_MAX_LENGTH = MODERATION_REASON_MAX_LENGTH
+# Sentiment-neutrality does NOT come from the vocabulary the reason is
+# written in; it comes from the score never entering the decision. There
+# is no score threshold, no score-correlated filter and no "hide low
+# ratings" path anywhere in this module, and none may be added. An
+# allow-list of policy codes was tried here and removed: it widened the
+# documented contract with a second field for the specifics, and it could
+# not record WHICH phrase or WHOSE phone number was at issue - which is
+# what a moderator's decision actually turns on, and what an operator
+# reviewing that decision needs to see. The FTC Rule on the Use of
+# Consumer Reviews and Testimonials (16 CFR Part 465) prohibits
+# suppressing reviews on the basis of rating or negative sentiment, and it
+# is the transition rule above - plus the aggregate counting every
+# published rating whatever its value - that holds that line.
+MODERATION_REASON_REQUIRED_STATUS = ModerationStatus.REJECTED.value
 
 # Provider faults that mean "this did not happen, try again" rather than
 # "this cannot happen". Only these are treated as deferrable by the
@@ -638,13 +652,43 @@ def _rating_document_id(transaction_id: str, rater_id: str) -> str:
     write hotspots, and a composite of two random IDs has none of that
     character.
 
+    BOTH COMPONENTS ARE VALIDATED HERE, NOT ONLY UPSTREAM
+    ---------------------------------------------------------------
+    The value this returns is used as a Firestore document ID, so a
+    component carrying a forward slash would not produce a badly named
+    rating - it would produce a NESTED PATH, and the create would land
+    somewhere other than where every reader looks for it. An oversized
+    component produces a key that cannot be moderated later, because the
+    moderation endpoint holds its path parameter to the composite bound.
+    Both components have already been proved by the time any caller
+    reaches this in the current code - the transaction ID by
+    ``RatingCreate`` or by the guard sequence, the rater ID by
+    ``User.id`` and by guard 1 - so this is a backstop rather than the
+    gate. It is here because the consequence of composing an unchecked
+    key is silent and permanent, and a backstop over that is cheap.
+
     Args:
         transaction_id: Transaction that authorizes the rating.
         rater_id: ID of the authenticated user submitting it.
 
     Returns:
         ``"{transaction_id}_{rater_id}"``.
+
+    Raises:
+        ValueError: Either component cannot be used as a Firestore
+            document ID. Unreachable through the guarded paths, and
+            deliberately loud rather than defensive-and-silent: nothing
+            here can decide what a caller should be told instead.
     """
+    for label, component in (
+        ('transaction_id', transaction_id),
+        ('rater_id', rater_id),
+    ):
+        if not _is_valid_document_id(component):
+            raise ValueError(
+                'Cannot compose a rating key from {0}={1!r}: it is not a '
+                'usable Firestore document ID.'.format(label, component)
+            )
     return '{0}_{1}'.format(transaction_id, rater_id)
 
 
@@ -668,10 +712,17 @@ def _load_transaction(transaction_id: str) -> Optional[Dict[str, Any]]:
         transaction_id: Document ID in the ``transactions`` collection.
 
     Returns:
-        The document body, or ``None`` when no such document exists or
-        the ID is empty.
+        The document body, or ``None`` when no such document exists or the
+        ID cannot name one. A value that cannot name a document is
+        reported as absence rather than raised, because that is exactly
+        what it means: no document lives at an unusable key, and the guard
+        sequence turns absence into ``TransactionNotFound`` in the
+        contract's own order.
     """
-    if not transaction_id:
+    # Grammar applied before the value reaches ``document()``: Firestore
+    # reads a forward slash as a path separator, so an unvalidated value
+    # can address a document other than the one it appears to name.
+    if not _is_valid_document_id(transaction_id):
         return None
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
@@ -806,6 +857,20 @@ def _assess(
     # ``get_current_user`` re-reads the user document on every request,
     # so revoking verification takes effect on the caller's very next
     # call with no token rotation.
+    #
+    # An identity that cannot name a user document is refused HERE, in the
+    # verification guard, rather than later where it would be composed
+    # into a rating key or passed to ``document()``. Reported as "not
+    # verified" because that is what it is from this module's side: the
+    # account cannot be read, so it carries no verification - the same
+    # reading ``_submit_transaction_body`` already gives a caller whose
+    # user document has been deleted. ``User.id`` is grammar-bound, so
+    # this is unreachable through the API and is the backstop for any
+    # other caller of this module.
+    caller_identity = getattr(caller, 'id', None)
+    if not _is_valid_document_id(caller_identity):
+        outcome['error'] = RaterNotVerified()
+        return outcome
     if is_verified is _UNREAD:
         is_verified = getattr(caller, 'is_verified', False)
     # Literal ``True`` and nothing else. A truthiness test would let the
@@ -921,32 +986,6 @@ def _assess(
     outcome['vehicle_listing_id'] = listing_id.strip()
 
     return outcome
-
-
-def _page_size(limit: Any, default: int = DEFAULT_RATINGS_PAGE_SIZE) -> int:
-    """Clamp a caller-supplied page size into a serviceable range.
-
-    A lower bound alone is not a bound: ``limit=100000`` would be passed
-    straight to Firestore and turn a public read into a collection scan.
-    Both ends are therefore closed, and a value that is not a whole
-    number at all falls back to the default rather than raising - a
-    malformed page size is a request-shaping mistake, not a reason to
-    refuse to serve the read.
-
-    Args:
-        limit: Candidate page size, of any type.
-        default: Value to use when ``limit`` is not interpretable.
-
-    Returns:
-        An integer in ``[1, MAX_RATINGS_PAGE_SIZE]``.
-    """
-    try:
-        requested = int(limit)
-    except (TypeError, ValueError):
-        requested = default
-    if requested < 1:
-        requested = 1
-    return min(requested, MAX_RATINGS_PAGE_SIZE)
 
 
 def _is_valid_document_id(value: Any) -> bool:
@@ -1470,7 +1509,14 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
         key. ``False`` when it does not, or when either component of
         the key is missing.
     """
-    if not transaction_id or not rater_id:
+    # Grammar rather than emptiness, because the two values are COMPOSED
+    # into a document key here: a slash in either would make the composed
+    # ID a nested path and the probe would answer about a document nobody
+    # can otherwise reach. An unusable key names no rating, which is the
+    # same answer as "no rating exists".
+    if not _is_valid_document_id(transaction_id):
+        return False
+    if not _is_valid_document_id(rater_id):
         return False
     document_id = _rating_document_id(transaction_id, rater_id)
     snapshot = (
@@ -1684,16 +1730,26 @@ def _submit_transaction_body(
         raise verification['error']
 
     # --- read 2: the transaction, for R2 and the state guards ---
-    transaction_snapshot = (
-        db.collection(TRANSACTIONS_COLLECTION)
-        .document(transaction_id)
-        .get(transaction=transaction)
-    )
-    transaction_body = (
-        (transaction_snapshot.to_dict() or {})
-        if transaction_snapshot.exists
-        else None
-    )
+    # An ID that cannot name a document is treated as ABSENCE rather than
+    # passed to ``document()``, where a forward slash would be read as a
+    # nested path. Absence is the honest reading - no document lives at an
+    # unusable key - and it keeps the published guard order intact: the
+    # caller learns about verification first and about the unknown
+    # transaction second, exactly as they would for a well-formed ID that
+    # names nothing.
+    if _is_valid_document_id(transaction_id):
+        transaction_snapshot = (
+            db.collection(TRANSACTIONS_COLLECTION)
+            .document(transaction_id)
+            .get(transaction=transaction)
+        )
+        transaction_body = (
+            (transaction_snapshot.to_dict() or {})
+            if transaction_snapshot.exists
+            else None
+        )
+    else:
+        transaction_body = None
 
     # --- guards 2 to 6 (R2, self-rating, completed, ratable) ---
     outcome = _assess(
@@ -1733,11 +1789,10 @@ def _submit_transaction_body(
         'review': review,
         'is_published': False,
         'moderation_status': ModerationStatus.PENDING.value,
-        # Both written explicitly as null rather than omitted, so a new
-        # rating has the same document shape as a moderated one and no
-        # consumer has to distinguish "no reason" from "field absent".
+        # Written explicitly as null rather than omitted, so a new rating
+        # has the same document shape as a moderated one and no consumer
+        # has to distinguish "no reason" from "field absent".
         'moderation_reason': None,
-        'moderation_note': None,
         'created_at': firestore.SERVER_TIMESTAMP,
         'updated_at': firestore.SERVER_TIMESTAMP,
     }
@@ -2155,9 +2210,17 @@ def _locked_transaction(
             nothing to re-derive the counterparty from, so no
             publication can be justified.
     """
-    if not transaction_id:
+    # The value comes off a STORED rating document, so it is data rather
+    # than input, and data can be wrong: a slash in it would make
+    # ``document()`` resolve a nested path instead of the transaction, and
+    # an oversized or control-bearing value forges the log line that
+    # reports it. Quarantined as a publication invariant failure, which
+    # leaves the rating unpublished, repairable, and named in the log.
+    if not _is_valid_document_id(transaction_id):
         raise PublicationInvariantError(
-            'Rating carries no transaction reference'
+            'Rating carries no usable transaction reference: {0!r}'.format(
+                transaction_id
+            )
         )
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
@@ -2214,10 +2277,20 @@ def _validate_locked_rating(
     Raises:
         PublicationInvariantError: Any fact fails to re-prove.
     """
+    # A stored rater ID is data, and this one is about to be composed
+    # into a document key and compared against the record's own name, so
+    # it is held to the component grammar rather than merely to
+    # non-emptiness. A slash in it would make the composed key a nested
+    # path; an oversized one would produce a key the moderation endpoint
+    # cannot accept. Either way the record is quarantined - left
+    # unpublished, repairable, and named in the log - instead of
+    # publishing against an identifier nothing can address.
     rater_id = body.get('rater_id')
-    if not rater_id:
+    if not _is_valid_document_id(rater_id):
         raise PublicationInvariantError(
-            'Rating {0} names no rater'.format(document_id)
+            'Rating {0} names no usable rater: {1!r}'.format(
+                document_id, rater_id
+            )
         )
     if document_id != _rating_document_id(transaction_id, rater_id):
         raise PublicationInvariantError(
@@ -2289,8 +2362,16 @@ def _locked_user_state(
         two already validated as a possible pair.
 
     Raises:
-        PublicationInvariantError: No such user document.
+        PublicationInvariantError: No such user document, or a ``user_id``
+            that cannot name one. The second case is quarantined rather
+            than looked up, because a stored participant ID carrying a
+            slash would make ``document()`` resolve a nested path and
+            credit a score to something other than a user.
     """
+    if not _is_valid_document_id(user_id):
+        raise PublicationInvariantError(
+            'Ratee {0!r} is not a usable user document ID'.format(user_id)
+        )
     user_ref = db.collection(USERS_COLLECTION).document(user_id)
     snapshot = user_ref.get(transaction=transaction)
     if not snapshot.exists:
@@ -2642,10 +2723,12 @@ def _transaction_rating_snapshots(transaction_id: str) -> List[Any]:
         transaction_id: Transaction whose ratings are wanted.
 
     Returns:
-        Document snapshots, ordered by rater id ascending.
+        Document snapshots, ordered by rater id ascending. Empty for a
+        ``transaction_id`` that cannot name a document, which no rating
+        can reference.
 
     """
-    if not transaction_id:
+    if not _is_valid_document_id(transaction_id):
         return []
     query = (
         db.collection(RATINGS_COLLECTION)
@@ -2847,25 +2930,41 @@ def _publish_expired_ratings(
     that is due. This function is the scheduled equivalent of the same
     work, not a prerequisite for it.
 
-    THE QUERY ASKS FOR DUE RECORDS, NOT FOR UNPUBLISHED ONES
+    ONE EQUALITY FILTER, AND THE DEADLINE APPLIED IN PYTHON
     ---------------------------------------------------------------
-    Two equality-and-range filters against the window deadline, ordered
-    ``created_at`` ASCENDING, served by the declared
-    ``(is_published ASC, created_at ASC)`` composite index. That
-    distinction is the whole performance argument. Most unpublished
-    ratings are NOT yet due - they are the ones submitted in the last
-    fortnight - so a sweep over "unpublished" reads the entire live
-    backlog to discover that almost none of it is actionable, and pays
-    for those documents on every pass. A sweep over "unpublished AND past
-    the deadline" reads only what it is going to act on, and on a healthy
-    system that is usually nothing at all.
+    The query asks for unpublished ratings and nothing else, walked by
+    document name, with due-ness decided here by
+    :func:`_window_elapsed`. Asking the datastore for "unpublished AND
+    past the deadline" would read better and would cost an index this
+    project does not have: an equality filter combined with a range on a
+    DIFFERENT field requires a composite index, and
+    infrastructure/firestore.indexes.json declares exactly two - both
+    shaped for the read paths, neither able to serve
+    ``(is_published, created_at)``. A query needing an undeclared
+    composite index does not run slowly, it fails outright with
+    ``FailedPrecondition``, so the shape that needs no declaration is the
+    shape this sweep uses. Filtering on ``is_published`` alone is served
+    by Firestore's automatic single-field index.
 
-    Oldest first, which is what makes progress durable WITHOUT any stored
-    cursor: publishing a record removes it from this query's result set
-    permanently, so each pass faces a strictly smaller candidate set than
-    the last and resumes at the oldest record still due. Nothing has to
-    remember where the previous pass stopped, and no record can starve
-    behind a run of others.
+    What that costs is reading not-yet-due candidates: on a healthy
+    system most unpublished ratings are inside their window, and each
+    pass pays for those documents to discover they are not actionable.
+    The ceiling below bounds that cost, and it is the right trade against
+    a third index, because this sweep runs on a worker rather than on a
+    request path - and because nothing dispatches it, the read paths
+    carry the real burden with the far narrower per-user query.
+
+    Ordering by document NAME rather than by ``created_at`` is what keeps
+    the walk index-free and total. It also cannot silently exclude a
+    record: Firestore drops a document that lacks an ordered field from
+    the result set entirely, so ordering by a timestamp would hide a
+    rating that has not been stamped, while every document has a name.
+
+    Progress is durable without any stored cursor. Publishing a record
+    removes it from this query permanently, so each pass faces a strictly
+    smaller PUBLISHABLE set than the last; and because a pass walks a
+    cursor to the ceiling rather than re-reading one page, a due record
+    cannot starve behind a run of not-yet-due ones.
 
     The walk is bounded twice over - the cursor pagination of
     :func:`_paginate` caps documents examined at ``limit``, and
@@ -2876,17 +2975,18 @@ def _publish_expired_ratings(
     :func:`_apply_publication`, where separate transactions would each
     read the same starting count and lose an update.
 
-    A rating whose ``created_at`` is absent or unusable does not match
-    the range filter and is therefore never examined here. Nothing is
-    stranded by that, because :func:`_window_elapsed` reads an unusable
-    timestamp as "not yet due" - so such a record was never publishable
-    by the previous unfiltered scan either, which examined it on every
-    pass and then declined to publish it every time.
+    A rating whose ``created_at`` is absent or unusable is examined and
+    then declined, because :func:`_window_elapsed` reads an unusable
+    timestamp as "not yet due" - deferring a reveal rather than risking
+    an early one. Nothing is stranded by that: no path would publish
+    such a record, because every one of them decides due-ness through
+    that same function. The record needs its timestamp repaired, not
+    another reader.
 
     Args:
-        limit: Ceiling on the number of due ratings examined in one pass,
-            so no single call becomes an unbounded read. A larger backlog
-            drains across successive passes.
+        limit: Ceiling on the number of unpublished ratings examined in
+            one pass, so no single call becomes an unbounded read. A
+            larger backlog drains across successive passes.
 
     Returns:
         The IDs of the ratings this pass published, which the Celery task
@@ -2897,19 +2997,16 @@ def _publish_expired_ratings(
         .where(
             filter=firestore.FieldFilter('is_published', '==', False)
         )
-        .where(
-            filter=firestore.FieldFilter(
-                'created_at', '<=', _window_deadline()
-            )
-        )
-        .order_by('created_at')
+        .order_by(DOCUMENT_ID_FIELD)
     )
 
     published: List[str] = []
     examined = 0
     deferred = 0
     for batch in _chunked(
-        _paginate(query, DEFAULT_SWEEP_PAGE_SIZE, max(1, int(limit))),
+        _due_snapshots(
+            _paginate(query, DEFAULT_SWEEP_PAGE_SIZE, max(1, int(limit)))
+        ),
         SETTLE_BATCH_SIZE,
     ):
         examined += len(batch)
@@ -2980,13 +3077,13 @@ def publish_expired_ratings(limit: Optional[int] = None) -> List[str]:
 
     Args:
         limit: Ceiling on documents examined in one pass. ``None`` uses
-            ``settings.RATING_SWEEP_SCAN_LIMIT``, which is where an
-            operator tunes it. A value below 1 is raised to 1 rather than
-            refused, because a mis-tuned ceiling is a reason to do less
-            work, not a reason to stop publishing.
+            :data:`DEFAULT_SWEEP_SCAN_LIMIT`, which is declared beside
+            the walk it bounds. A value below 1 is raised to 1 rather
+            than refused, because a mis-tuned ceiling is a reason to do
+            less work, not a reason to stop publishing.
 
     Returns:
-        The IDs of the ratings this pass published, oldest first. Empty
+        The IDs of the ratings this pass published. Empty
         when nothing was due. IDs rather than a bare count because the
         caller that logs this pass is the only record that it happened -
         no audit collection exists - so naming the records makes a
@@ -3007,35 +3104,44 @@ def _publish_due_for_ratee(user_id: str) -> bool:
     would simply never become correct. So a read that is about to report
     a user's reputation settles what is already due first.
 
-    What this deliberately does NOT do is drain a backlog. It runs on the
-    critical path of a public read against a 200 ms budget, so the work
-    it may do is bounded twice over:
+    IT WALKS THE WHOLE DUE SET, NOT ONE PAGE OF IT
+    ---------------------------------------------------------------
+    The work is bounded by a scan ceiling rather than by a single page,
+    and that distinction is a correctness one. An earlier revision took
+    the ``SETTLE_BATCH_SIZE`` NEWEST due records and reversed that page in
+    memory, which looks equivalent and is not: under sustained arrivals
+    more than a page can become due between two reads, and the oldest
+    record then sits behind a permanently replenished run of newer ones
+    and is never reached. Overdue is exactly the state that must not be
+    able to persist, so the walk advances a cursor over every due record
+    it finds, up to :data:`SETTLE_SCAN_LIMIT` documents examined.
+
+    Bounded three ways, because this runs on the critical path of a public
+    read against the SRS 200 ms budget:
 
     * the query asks the datastore for DUE records only, using a range
       filter on ``created_at`` against the window deadline, so a user
       with a hundred ratings still inside their window costs ONE query
       returning nothing rather than a hundred candidate documents and a
-      transaction each;
-    * it takes at most ``SETTLE_BATCH_SIZE`` of them;
-    * and it settles that whole page inside ONE transaction rather than
-      one per record. Every rating on this page is aimed at the SAME
-      user, so a transaction each would rewrite that user's aggregate
-      once per record - which is both a lost-update race across separate
-      transactions and, on a public read against a 200 ms budget, ten
-      round trips where one will do.
-      :func:`_window_publication_batch_body` folds them into a single
-      aggregate write and skips a record that cannot be re-proved
-      without costing the rest of the page theirs.
+      transaction each - and on a healthy system that is the case every
+      time;
+    * the cursor walk stops after :data:`SETTLE_SCAN_LIMIT` documents,
+      so even a pathological backlog cannot turn one read into an
+      unbounded scan; the remainder drains across successive reads and
+      the scheduled sweep clears it wholesale;
+    * each group of at most ``SETTLE_BATCH_SIZE`` settles inside ONE
+      transaction rather than one per record. Every rating here is aimed
+      at the SAME user, so a transaction each would rewrite that user's
+      aggregate once per record - which is both a lost-update race across
+      separate transactions and, against a 200 ms budget, ten round trips
+      where one will do. :func:`_window_publication_batch_body` folds them
+      into a single aggregate write and skips a record that cannot be
+      re-proved without costing the rest of its group theirs.
 
-    A backlog larger than one page still drains, and it does so for a
-    reason that has nothing to do with the scan direction: the query
-    selects only records that are BOTH unpublished AND past their
-    deadline, and settling a record removes it from that set permanently.
-    Each read therefore faces a strictly smaller candidate set than the
-    last, so no record can be passed over indefinitely regardless of which
-    end of the page is taken. The page is reversed in memory so the
-    longest-overdue record of the batch is settled first, which costs
-    nothing on a page of ``SETTLE_BATCH_SIZE``.
+    A backlog larger than the ceiling still drains: the query selects only
+    records that are BOTH unpublished AND past their deadline, and
+    settling a record removes it from that set permanently, so each read
+    faces a strictly smaller candidate set than the last.
 
     The reciprocal reveal is NOT attempted here. It belongs to the
     submission that completes the pair (:func:`submit_rating`) and to the
@@ -3065,11 +3171,11 @@ def _publish_due_for_ratee(user_id: str) -> bool:
     range filter and so is never settled here - the same "unusable
     timestamp means not yet due" reading :func:`_window_elapsed` applies,
     deferring a reveal rather than risking an early one. The global sweep
-    filters on the deadline too, so no path examines such a record - and
-    nothing is stranded by that, because there is no path that would have
-    published it: every one of them decides due-ness through
-    :func:`_window_elapsed`, which declines an unusable timestamp. The
-    record needs its timestamp repaired, not another reader.
+    does examine such a record, because it filters on the deadline in
+    Python rather than in its query, and then declines it for the same
+    reason. Nothing is stranded either way: every path decides due-ness
+    through :func:`_window_elapsed`, so the record needs its timestamp
+    repaired rather than another reader.
 
     Args:
         user_id: The rated user whose due ratings are settled.
@@ -3100,39 +3206,35 @@ def _publish_due_for_ratee(user_id: str) -> bool:
             filter=firestore.FieldFilter('created_at', '<=', deadline)
         )
         .order_by('created_at', direction=firestore.Query.DESCENDING)
-        .limit(SETTLE_BATCH_SIZE)
     )
-    # Reversed locally so the longest-overdue record of the page leads
-    # the batch. The WIRE order has to be DESCENDING to match the
-    # declared index exactly; the order within a page is this function's
-    # own business, and leading with the most overdue record is what a
-    # partially-applied page - impossible here, but not in a future that
-    # splits the batch - should have settled first.
-    document_ids = [
-        snapshot.id for snapshot in reversed(list(query.stream()))
-    ]
-    if not document_ids:
-        return False
-    try:
-        published = run_in_transaction(
-            _window_publication_batch_body,
-            document_ids,
-        )
-    except DEFERRABLE_PUBLICATION_ERRORS as error:
-        # A page that cannot publish must not stop the read from
-        # answering, but it is reported at the severity its cause
-        # deserves. Anything outside these classes propagates.
-        #
-        # An invariant failure on a SINGLE record never reaches here -
-        # the batch body skips and logs it per record. What reaches here
-        # is a fault affecting the whole transaction, so the records stay
-        # due and the next read tries again.
-        _log_publication_failure(
-            'ratings due for user {0}'.format(user_id),
-            error,
-        )
-        return False
-    return bool(published)
+    changed = False
+    for batch in _chunked(
+        _paginate(query, SETTLE_BATCH_SIZE, SETTLE_SCAN_LIMIT),
+        SETTLE_BATCH_SIZE,
+    ):
+        document_ids = [snapshot.id for snapshot in batch]
+        try:
+            published = run_in_transaction(
+                _window_publication_batch_body,
+                document_ids,
+            )
+        except DEFERRABLE_PUBLICATION_ERRORS as error:
+            # A group that cannot publish must not stop the read from
+            # answering, and must not stop the walk either: the remaining
+            # groups are independent, so one transient fault costs only
+            # its own records, which stay due for the next read.
+            #
+            # An invariant failure on a SINGLE record never reaches here -
+            # the batch body skips and logs it per record. What reaches
+            # here is a fault affecting the whole transaction.
+            _log_publication_failure(
+                'ratings due for user {0}'.format(user_id),
+                error,
+            )
+            continue
+        if published:
+            changed = True
+    return changed
 
 
 def _settle_transaction(transaction_id: str) -> Tuple[List[Any], bool]:
@@ -3208,41 +3310,61 @@ def _sort_key(rating: Rating) -> datetime:
     return moment
 
 
-def _visible_projection(rating: Rating) -> Rating:
+def _visible_projection(rating: Rating) -> Optional[Rating]:
     """Project a rating into what a reader other than its author may see.
 
     The whole of the moderation half of the visibility policy, and the
     one place "moderation before display" is implemented. Every published
     rating reaches it - none is dropped beforehand - so the case it
-    governs is a rating that WILL be shown, and the question is how much
-    of it.
+    governs is a rating that MIGHT be shown, and the question is whether
+    and how much of it.
 
-    The two halves of a rating are treated differently because they carry
-    different risk:
+    Three outcomes, decided by ``moderation_status`` alone and never by
+    the score:
 
-    * The SCORE is shown, and counted, for every published rating
-      whatever its value and whatever its moderation state. A number
-      cannot contain abuse, profanity or somebody's phone number, so
-      there is nothing about it for moderation to act on, and withholding
-      it for being low is precisely the review suppression the FTC rule
-      forbids. There is deliberately no score threshold, no
-      score-correlated filter and no "hide low ratings" path anywhere in
-      this module, and none may be added.
-    * The free-text REVIEW is user-authored content and is the only part
-      a policy violation can live in, so it is withheld until moderation
-      has APPROVED it. While ``moderation_status`` is ``pending`` the
-      reader gets the rating with no review text, which is what stops
-      unreviewed content - including PII - from being published by
-      default; once it is ``rejected`` the text is withheld permanently,
-      because a rejection is never revisited into an approval here.
+    * ``approved`` - the rating is returned in full. Moderation has read
+      the words and cleared them.
+    * ``pending`` - the rating is returned with no review text. That is
+      what stops unreviewed content, including PII, from being published
+      by default, and it is the meaning of "moderation before display".
+    * ``rejected`` - the rating is WITHHELD. A moderator found a policy
+      violation in it, so it is removed from the reader's view entirely
+      rather than shown with its words stripped out.
 
-    What is NOT done here is dropping the record. A rejected rating is
-    returned score-only rather than removed, because the aggregate counts
-    every published rating: removing it would leave a profile showing
-    fewer ratings than the average is computed from, which is a
-    reputation figure the visible page cannot account for. Withholding
-    the words is the moderation decision; withholding the vote would be a
-    different one, and it is not this system's.
+    The score is never the reason for any of this. There is deliberately
+    no score threshold, no score-correlated filter and no "hide low
+    ratings" path anywhere in this module, and none may be added: a
+    number cannot contain abuse, profanity or somebody's phone number,
+    and withholding one for being low is precisely the review suppression
+    the FTC rule forbids.
+
+    WHY WITHHOLDING THE WHOLE RECORD, AND WHAT IT COSTS
+    ---------------------------------------------------------------
+    A rejected rating was previously returned score-only, on the argument
+    that the aggregate counts every published rating so removing the
+    record would leave a profile showing fewer ratings than its average
+    was computed from. That cost is real and it is accepted, because the
+    alternative is worse: a record a moderator has ruled a policy
+    violation would keep appearing on the page, and a reader has no way
+    to tell a stripped review from a rating whose author simply wrote
+    nothing.
+
+    So the two halves of a reputation answer different questions, and
+    they are documented as answering them rather than reconciled by
+    weakening either:
+
+    * ``rating_average``/``rating_count`` cover EVERY published rating,
+      whatever its score and whatever its moderation state. The
+      aggregate is maintained at publication and never adjusted
+      afterwards, because a moderation state is a decision about CONTENT
+      and letting it move a score would make moderation
+      sentiment-relevant - exactly what must never happen.
+    * the visible LIST covers what a reader may be shown, so a withheld
+      record is absent from it.
+
+    ``aggregate.count`` may therefore exceed the number of items
+    returned. That is a property of the contract, not a discrepancy, and
+    it is stated on the response model so no client renders it as one.
 
     ``moderation_reason`` is redacted on every path, approved or not: it
     is an internal note recording why a moderator acted, written for
@@ -3287,11 +3409,15 @@ def _visible_projection(rating: Rating) -> Rating:
         rating: Rating as stored.
 
     Returns:
-        A copy with unapproved content and the internal moderation note
-        removed. The original is never mutated - these models are also
-        the values the aggregate and the publication paths read.
+        A copy with unapproved content and the internal moderation
+        reason removed, or ``None`` when the rating is withheld and this
+        reader may not see it at all. The original is never mutated -
+        these models are also the values the aggregate and the
+        publication paths read.
     """
-    redacted = {'moderation_reason': None, 'moderation_note': None}
+    if rating.moderation_status == ModerationStatus.REJECTED.value:
+        return None
+    redacted = {'moderation_reason': None}
     if rating.moderation_status == ModerationStatus.APPROVED.value:
         return rating.copy(update=redacted)
     return rating.copy(update=dict(redacted, review=None))
@@ -3301,6 +3427,7 @@ def _paginate(
     query: Any,
     page_size: int,
     scan_limit: int,
+    transaction: Any = None,
 ) -> Iterable[Any]:
     """Walk an ORDERED query page by page, advancing a cursor.
 
@@ -3331,6 +3458,12 @@ def _paginate(
         scan_limit: Hard ceiling on documents examined, so no single
             call can degrade into an unbounded read of a large
             collection.
+        transaction: Open transaction to read every page through, so a
+            multi-page walk observes ONE instant rather than one per
+            page. ``None`` reads each page independently, which is
+            correct for the settlement walks - they write between pages,
+            and a record that left the query is a record they no longer
+            need.
 
     Yields:
         Document snapshots, in the query's order.
@@ -3342,7 +3475,7 @@ def _paginate(
         page_query = query.limit(window)
         if cursor is not None:
             page_query = page_query.start_after(cursor)
-        page = list(page_query.stream())
+        page = list(page_query.stream(transaction=transaction))
         if not page:
             return
         for snapshot in page:
@@ -3351,6 +3484,36 @@ def _paginate(
         cursor = page[-1]
         if len(page) < window:
             return
+
+
+def _due_snapshots(snapshots: Iterable[Any]) -> Iterable[Any]:
+    """Keep only the snapshots whose publication window has closed.
+
+    The deadline half of the sweep's predicate, applied here rather than
+    in the query. Combining an equality filter on ``is_published`` with a
+    range on ``created_at`` would require a composite index that
+    infrastructure/firestore.indexes.json does not declare - and a query
+    needing an undeclared composite index fails outright rather than
+    running slowly - so the datastore answers the part it can index and
+    this decides the rest. See :func:`_publish_expired_ratings`.
+
+    Lazy, so the sweep still interleaves settlement with the cursor walk
+    instead of materialising every candidate first.
+
+    Args:
+        snapshots: Document snapshots of unpublished ratings, in the
+            order the walk produced them.
+
+    Yields:
+        The subset whose window has elapsed, in the same order. A record
+        with an absent or unusable ``created_at`` is not due - see
+        :func:`_window_elapsed`, which defers a reveal rather than
+        risking an early one.
+    """
+    for snapshot in snapshots:
+        body = snapshot.to_dict() or {}
+        if _window_elapsed(body.get('created_at')):
+            yield snapshot
 
 
 def _chunked(items: Iterable[Any], size: int) -> Iterable[List[Any]]:
@@ -3386,10 +3549,8 @@ def _chunked(items: Iterable[Any], size: int) -> Iterable[List[Any]]:
 
 def _list_ratings_for_user(
     user_id: str,
-    limit: int = DEFAULT_RATINGS_PAGE_SIZE,
-    after: Optional[str] = None,
-    settle: bool = True,
-) -> Tuple[List[Rating], Optional[str], bool]:
+    transaction: Any = None,
+) -> List[Rating]:
     """List the published ratings a user has received, newest first.
 
     Satisfies the reputation half of F010-3, and is the public read: no
@@ -3398,53 +3559,44 @@ def _list_ratings_for_user(
     holds on the way out as well as on the way in - an unreciprocated
     rating is invisible here until it is revealed.
 
-    Review CONTENT is returned only once moderation has approved it, so
-    unreviewed text is never displayed; every published rating is
-    returned and its score shown regardless of moderation state, because
-    suppressing a score by sentiment is prohibited and because this list
-    must describe the same set of ratings the aggregate counts. See
-    :func:`_visible_projection`.
+    What a reader may see of each one is decided by
+    :func:`_visible_projection`: an approved rating in full, a pending
+    one with its review text withheld, and a rejected one not at all.
+    The score is never withheld for its value, and the aggregate on the
+    user document keeps counting every published rating whatever its
+    state - so ``count`` may exceed the number of records returned here.
+    That is the contract rather than a discrepancy; see
+    :func:`_visible_projection` for why withholding the record is the
+    right side of that trade.
 
-    Any rating already due for publication is settled first, so this
-    read never reports a reputation that is merely waiting for a worker
-    that will not run - unless ``settle`` is false, which is how
-    :func:`get_user_reputation` arranges for the settlement to happen
-    exactly once for a request that reads both this list and the
-    aggregate.
-
-    THE PAGE IS EXPLICIT, NOT A SILENT TRUNCATION
+    ONE BOUNDED READ, WITH NO WIRE-LEVEL CURSOR
     -------------------------------------------------------------------
-    This function used to return at most ``limit`` ratings and say
-    nothing about the rest. That is the one shape a bounded read must not
-    have: the aggregate on the profile counts EVERY published rating, so
-    a user with more than a page of them was shown an average computed
-    from ratings the page could not reach and offered no way to ask for
-    the next one. The older ones were not slow to find, they were
-    unreachable. Reporting a cursor and a has-more flag turns the bound
-    into a contract the caller can act on, and keeps the read bounded.
+    The read is bounded at :data:`DEFAULT_RATINGS_PAGE_SIZE` visible
+    records and reports no continuation token, because the endpoint's
+    contract is ``{items, aggregate}`` and nothing else. A cursor was
+    tried here and removed: it widened the published API, and the cursor
+    itself was a caller-supplied rating ID that this function looked up
+    and positioned a public query from - so any rating ID, including one
+    belonging to a different user or one still unpublished, could be
+    handed in and its existence inferred from the response. A read with
+    no cursor cannot be asked that question at all.
 
+    The bound is a real limit and is documented as one: a user with more
+    published ratings than a page has ratings this endpoint does not
+    return, while ``aggregate`` still describes all of them. Paging is a
+    contract change rather than a fix, and it belongs to whoever plans
+    one.
 
     Args:
         user_id: The rated user.
-        limit: Maximum number of ratings to return - not a budget the
-            datastore may spend on documents this function goes on to
-            skip as unusable.
-        after: Document ID of the last rating of the previous page.
-            ``None`` starts at the newest. An ID that no longer resolves
-            is treated as the start of the collection rather than as an
-            error, because the natural cause is a document removed
-            between two pages and refusing to serve the read would be a
-            worse answer than serving it from the top.
-        settle: Whether to settle publications already due before
-            reading. Pass ``False`` when the caller has already settled
-            for this user in this request.
+        transaction: Open transaction to read through, so this list and
+            the aggregate beside it can be taken from ONE pinned
+            snapshot. ``None`` reads independently, which is only
+            correct for a caller that reads nothing else.
 
     Returns:
-        ``(ratings, next_cursor, has_more)`` - visible ratings ordered by
-        creation time descending and each projected for public display,
-        the cursor to pass as ``after`` for the following page, and
-        whether another page exists. The cursor is ``None`` and
-        ``has_more`` is ``False`` when the page is the last one.
+        The visible ratings, newest first, each projected for public
+        display.
     """
     # The document ID grammar is applied here, before ``user_id`` reaches
     # any ``document()`` call downstream, because this is a CALLER-FACING
@@ -3462,12 +3614,8 @@ def _list_ratings_for_user(
     # its own right and a check that only exists in a caller is a check
     # the next caller will not have.
     if not _is_valid_document_id(user_id):
-        return [], None, False
+        return []
 
-    if settle:
-        _publish_due_for_ratee(user_id)
-
-    wanted = _page_size(limit)
     # Exactly the declared (ratee_id, is_published, created_at DESC)
     # composite index. The equality-only helper in app/db/firestore.py
     # cannot express the ordering, which is why the client is used
@@ -3479,187 +3627,162 @@ def _list_ratings_for_user(
         .order_by('created_at', direction=firestore.Query.DESCENDING)
     )
 
-    # Resume after the caller's cursor. Firestore's ``start_after`` needs
-    # the document SNAPSHOT rather than its ID, because the cursor is
-    # positioned by the values the query orders on; so the cursor document
-    # is fetched by ID first. A cursor that no longer resolves - the
-    # document was removed between two pages - degrades to the start of
-    # the collection rather than raising, because a reputation page is not
-    # worth refusing over a stale bookmark.
-    if after:
-        cursor_snapshot = (
-            db.collection(RATINGS_COLLECTION).document(after).get()
-            if _is_valid_rating_id(after)
-            else None
-        )
-        if cursor_snapshot is not None and cursor_snapshot.exists:
-            query = query.start_after(cursor_snapshot)
-        else:
-            logger.info(
-                'Ignoring an unresolvable ratings cursor %r for user %s; '
-                'serving the first page instead.',
-                after,
-                user_id,
-            )
-
-    # Moderation is NOT filtered here, and not in the query either. A
-    # published rating's score is always shown and always counted, so a
-    # rejected record is returned score-only by _visible_projection
-    # rather than dropped - which is what keeps this list and the
-    # aggregate describing the same set of ratings.
-    #
-    # The cursor walk still earns its keep: a stored document whose body
-    # cannot satisfy the Rating contract is skipped, and without a walk a
-    # page filled with such records would answer "this user has no
-    # reviews" while valid ones sat just beyond it. The scan factor
-    # bounds how far past `wanted` that walk may look.
-    #
-    # One MORE visible record than the page needs is collected, and then
-    # discarded. That extra record is how ``has_more`` is established from
-    # evidence rather than from a guess: a page that happens to be exactly
-    # full is indistinguishable from a page with more behind it unless
-    # something beyond it has actually been seen. The walk's scan ceiling
-    # is raised by the same one record so the probe cannot come at the
-    # cost of a record the page itself wanted.
+    # Moderation is NOT filtered in the query, and cannot be: adding a
+    # third equality filter to this shape would need an index that is not
+    # declared, and a query needing an undeclared composite index fails
+    # outright. So the walk collects VISIBLE records - dropping the
+    # withheld ones and any stored body that cannot satisfy the Rating
+    # contract - and the scan factor bounds how far past the page it may
+    # look while doing so. Without a walk, a page filled with withheld or
+    # unusable records would answer "this user has no reviews" while
+    # valid ones sat just beyond it.
     visible: List[Rating] = []
-    probe = wanted + 1
     pages = _paginate(
         query,
         DEFAULT_RATINGS_PAGE_SIZE,
-        probe * MAX_VISIBILITY_SCAN_FACTOR,
+        DEFAULT_RATINGS_PAGE_SIZE * MAX_VISIBILITY_SCAN_FACTOR,
+        transaction=transaction,
     )
     for snapshot in pages:
         rating = _rating_from_dict(_body_with_document_id(snapshot))
         if rating is None:
             continue
-        visible.append(_visible_projection(rating))
-        if len(visible) >= probe:
+        projected = _visible_projection(rating)
+        if projected is None:
+            continue
+        visible.append(projected)
+        if len(visible) >= DEFAULT_RATINGS_PAGE_SIZE:
             break
-
-    has_more = len(visible) > wanted
-    page = visible[:wanted]
-    # The cursor is the last RETURNED record, never the probe, or the next
-    # page would skip the record the probe saw.
-    next_cursor = page[-1].id if (page and has_more) else None
-    return page, next_cursor, has_more
+    return visible
 
 
 class UserReputation(NamedTuple):
     """One user's reputation as a single coherent answer.
 
-    Returned by :func:`get_user_reputation`. The four fields belong
-    together because they are established from ONE settlement pass: the
-    list and the aggregate describe the same set of ratings, and the
-    cursor describes the same page as the list.
+    Returned by :func:`get_user_reputation`. The two fields belong
+    together because they are established from ONE pinned snapshot: the
+    list and the aggregate describe the same instant, so the envelope
+    cannot contradict itself.
 
     Attributes:
-        items: The page of visible ratings, newest first.
+        items: The visible ratings, newest first, bounded by
+            :data:`DEFAULT_RATINGS_PAGE_SIZE`.
         aggregate: The denormalised summary over ALL published ratings,
-            not only the page - a reputation is not a property of a page.
-        next_cursor: Cursor for the following page, or ``None`` on the
-            last one.
-        has_more: Whether another page exists.
+            including any whose review a moderator withheld - a
+            reputation is not a property of the records a reader may be
+            shown. ``count`` may therefore exceed ``len(items)``; see
+            :func:`_visible_projection`.
     """
 
     items: List[Rating]
     aggregate: RatingAggregate
-    next_cursor: Optional[str]
-    has_more: bool
 
 
-def get_user_reputation(
+def _reputation_snapshot_body(
+    transaction: firestore.Transaction,
     user_id: str,
-    limit: Optional[int] = None,
-    after: Optional[str] = None,
-    include_items: bool = True,
-) -> Optional[UserReputation]:
+) -> Optional[Tuple[List[Rating], RatingAggregate]]:
+    """Read a user's existence, ratings and aggregate at ONE instant.
+
+    The body of the read-only transaction behind
+    :func:`get_user_reputation`. All three answers come from the same
+    pinned snapshot, which is the point: the aggregate lives on the user
+    document and the ratings live in another collection, so two
+    independent reads can straddle a publication commit and return a
+    count that includes a rating the accompanying list does not. That is
+    not a stale response but a self-contradictory one - a profile reading
+    "4 reviews" above three of them, with nothing to tell the reader
+    which number is true.
+
+    Reads only. Enrolled through
+    :func:`app.db.firestore.run_in_read_only_transaction`, so a write
+    added here later raises rather than committing.
+
+    Args:
+        transaction: Active read-only Firestore transaction, supplied
+            positionally by the runner.
+        user_id: The rated user.
+
+    Returns:
+        ``(items, aggregate)``, or ``None`` when there is no such user.
+    """
+    snapshot = (
+        db.collection(USERS_COLLECTION)
+        .document(user_id)
+        .get(transaction=transaction)
+    )
+    if not snapshot.exists:
+        return None
+    items = _list_ratings_for_user(user_id, transaction=transaction)
+    return items, _aggregate_from_snapshot(user_id, snapshot)
+
+
+def get_user_reputation(user_id: str) -> Optional[UserReputation]:
     """Report one user's reputation as ONE coordinated read. PUBLIC. F010-3.
 
     The supported entry point for the public reputation endpoint, and the
     reason it exists is correctness rather than convenience.
 
-    SETTLEMENT HAPPENS EXACTLY ONCE PER REQUEST
+    SETTLE FIRST, THEN READ ONE SNAPSHOT
     -------------------------------------------------------------------
-    Publication has no worker behind it, so a read that is about to report
-    a reputation first settles whatever is already due. Both halves of
-    this answer used to do that independently - the list settled, then the
-    aggregate settled again - and the second pass could publish a rating
-    AFTER the list had been materialised. The response then carried a
-    count and an average that included a rating the accompanying list did
-    not, which is not a stale answer but an internally contradictory one:
-    a profile showing "4 reviews" above three of them, with no way for the
-    reader to tell which number to believe.
+    Publication has no worker behind it, so a read that is about to
+    report a reputation first settles whatever is already due - EVERY
+    such read, with no mode that skips it. A mode that answered from the
+    user document alone was tried and removed: it was the mode the
+    reputation badge used, so the one surface a reader sees most often
+    was the one that could report a rating as unpublished indefinitely
+    while a worker that will never run was nominally responsible for
+    revealing it. Settlement is what makes the deferred reveal correct,
+    and correctness is not an opt-in.
 
-    Settling once, here, and then reading both projections with settlement
-    switched off makes the envelope coherent by construction. The order is
-    still list-then-aggregate so that both observe the state INCLUDING
-    whatever this pass just revealed.
+    Then BOTH halves of the answer are read inside a single read-only
+    transaction. Settling first and reading once, in that order, is what
+    makes the envelope coherent by construction: the snapshot observes
+    everything this pass revealed, and the list and the aggregate observe
+    each other's instant. Two independent reads could straddle a
+    concurrent publication and report a count the list does not account
+    for.
 
     Nothing about visibility is relaxed: only published ratings appear,
-    review content appears only once moderation has approved it, and the
-    aggregate counts every published rating whatever the score.
+    review content appears only once moderation has approved it, a
+    rejected rating is withheld, and the aggregate counts every published
+    rating whatever its score and whatever its moderation state.
 
     Args:
         user_id: The rated user.
-        limit: Page size. ``None`` uses the default, and the value is
-            clamped into a serviceable range rather than trusted.
-        after: Cursor from a previous page's ``next_cursor``.
-
-    Args (continued):
-        include_items: When false, answer from the user document alone -
-            the aggregate beside an empty page, for a reputation badge
-            that needs the two numbers and not the reviews.
 
     Returns:
         A :class:`UserReputation`, or ``None`` when there is no such user.
-        ``None`` is deliberately distinct from an empty page beside
+        ``None`` is deliberately distinct from an empty list beside
         ``average=None, count=0``: "this user has no ratings" and "there
         is no such user" are different answers and only the first is a
-        200. Establishing existence here rather than in the router is what
-        keeps the whole read to one get-by-ID of the user document.
+        200. Establishing existence inside the snapshot rather than in the
+        router is what keeps the whole read to one coherent operation.
     """
     # Grammar applied before the value reaches ``document()``. See
     # ``_list_ratings_for_user`` for the full reasoning.
     if not _is_valid_document_id(user_id):
         return None
 
-    # ONE get-by-ID, serving BOTH the existence answer and the aggregate.
-    # The router performs no read of its own, so nothing here is fetched
-    # twice: a ``None`` return is what it turns into a 404.
-    user_ref = db.collection(USERS_COLLECTION).document(user_id)
-    snapshot = user_ref.get()
-    if not snapshot.exists:
-        return None
+    # The single settlement pass for this request, before the snapshot is
+    # taken so the snapshot includes whatever it revealed. Bounded, and it
+    # raises only on a permanent fault - a transient one is absorbed per
+    # group by the settlement itself.
+    #
+    # It runs before existence is established, which costs one bounded
+    # query for a user that does not exist and buys the ordering above.
+    # The alternative - read the user, settle, read again - is the
+    # two-instant shape this function exists to avoid.
+    _publish_due_for_ratee(user_id)
 
-    if not include_items:
-        # A reputation badge needs the two numbers and not the reviews, so
-        # the listing query and the settlement pass are both skipped. The
-        # aggregate may therefore be behind by whatever is due; the badge
-        # is a summary, and the full read settles it.
-        return UserReputation(
-            [],
-            _aggregate_from_snapshot(user_id, snapshot),
-            None,
-            False,
-        )
-
-    # The single settlement pass for this request. Bounded, and it raises
-    # only on a permanent fault - a transient one is absorbed per record
-    # by the settlement itself.
-    if _publish_due_for_ratee(user_id):
-        # Something published, so the aggregate on the snapshot above is
-        # stale. This is the ONLY path that reads the user document twice,
-        # and it is the one where the second read is the point.
-        snapshot = user_ref.get()
-
-    items, next_cursor, has_more = _list_ratings_for_user(
+    answer = run_in_read_only_transaction(
+        _reputation_snapshot_body,
         user_id,
-        DEFAULT_RATINGS_PAGE_SIZE if limit is None else limit,
-        after=after,
-        settle=False,
     )
-    aggregate = _aggregate_from_snapshot(user_id, snapshot)
-    return UserReputation(items, aggregate, next_cursor, has_more)
+    if answer is None:
+        return None
+    items, aggregate = answer
+    return UserReputation(items, aggregate)
 
 
 def require_eligibility(
@@ -3687,23 +3810,24 @@ def require_eligibility(
     six-exception mapping every other endpoint uses, so the status and the
     detail stay correct however the prose changes.
 
-    Args:
-        transaction_id: The transaction the caller is asking about.
-        caller: Authenticated user.
+    THE GUARD ORDER IS THE SAME ONE THE WRITE PATH ENFORCES
+    -------------------------------------------------------------------
+    R1 is decided FIRST, before this function looks for the transaction at
+    all, and it is decided by :func:`_assess` - the single implementation
+    every caller shares - invoked with the transaction DEFERRED so the
+    sequence stops at the verification verdict without issuing a read.
 
-    Returns:
-        The full decision for every outcome except a missing transaction -
-        including an unverified caller, who receives ``eligible=False``
-        with the verification reason rather than a refusal, because
-        reporting ineligibility is the whole value of the endpoint.
-
-    Note that existence is settled BEFORE verification here, which is the
-    one place this feature's guard order is inverted, and deliberately: a
-    question about a transaction that does not exist has no answer to give
-    about the caller. It costs nothing - the transaction ID was supplied by
-    the caller and is an opaque identifier, so a 404 discloses nothing -
-    and it matches the endpoint's published failure modes, which are 401
-    and 404 and nothing else.
+    An earlier revision read the transaction first and raised
+    ``TransactionNotFound`` before verification was considered, on the
+    reasoning that a question about a transaction that does not exist has
+    no answer to give about the caller. That inverted the feature's
+    published guard order for one endpoint: an unverified caller citing an
+    unknown transaction received a 404 here and a 403 from the write path,
+    so the endpoint whose entire purpose is to predict what submission will
+    do could disagree with it - and the interface would show "no such
+    transaction" to somebody whose actual, actionable problem is that their
+    account is not verified. The most actionable failure wins, everywhere,
+    which is what makes the two paths one contract rather than two.
 
     Args:
         transaction_id: The transaction the caller is asking about.
@@ -3716,9 +3840,24 @@ def require_eligibility(
         reporting ineligibility is the whole value of the endpoint.
 
     Raises:
-        TransactionNotFound: No such transaction, or a transaction_id that
-            cannot name a document at all.
+        TransactionNotFound: The caller is verified and there is no such
+            transaction, or the ``transaction_id`` cannot name a document
+            at all.
     """
+    # Guard 1 (R1) first, from the shared guard sequence, with no read.
+    verification = _assess(transaction_id, caller, transaction=_DEFERRED)
+    if verification['error'] is not None:
+        return EligibilityDecision(
+            eligible=False,
+            reason=verification['error'].message,
+            ratee_id=None,
+            direction=None,
+            already_rated=False,
+        )
+
+    # Guard 2 - existence - is the one this endpoint reports as a status
+    # code rather than as a decision. A value that cannot name a document
+    # cannot name this transaction either, so it is the same verdict.
     if not _is_valid_document_id(transaction_id):
         raise TransactionNotFound()
     # ONE read, handed to the guard sequence below rather than repeated.
@@ -3734,32 +3873,133 @@ def require_eligibility(
 
 def list_transaction_ratings(
     transaction_id: str,
-    caller_id: Optional[str] = None,
+    caller: User,
 ) -> List[Rating]:
     """List the ratings on one transaction, for a participant. PUBLIC.
 
-    The supported entry point for the per-transaction read. Authorization
-    is the router's concern - it proves the caller is the buyer or the
-    seller before calling - and the double-blind projection is this
-    module's: the caller's own rating is returned whether or not it has
-    been revealed, and the counterparty's only once it publishes.
+    The supported entry point for the per-transaction read, and it owns
+    the AUTHORIZATION as well as the projection. That is deliberate, and it
+    is a change from the router doing the gate itself.
+
+    AUTHORIZATION IS HELD ACROSS THE READ, NOT TAKEN BEFORE IT
+    -------------------------------------------------------------------
+    The gate is the participant check the transactions router already
+    applies to reading a transaction: the caller must be its buyer or its
+    seller. What matters here is WHEN it holds. Previously the router read
+    the transaction, decided the caller was a participant, and then called
+    this module, which settled publications and ran its own query - so the
+    decision was taken against one snapshot and the data was returned from
+    another. Between the two, the transaction could be reassigned to
+    different parties, and the response would carry ratings the caller at
+    that point had no right to see.
+
+    So the check is applied twice around the read, against two independent
+    reads of the authorizing document, and BOTH must pass:
+
+    1. before anything is read, so an outsider cannot even provoke the
+       settlement writes the read performs;
+    2. again after the ratings are in hand and before they are returned,
+       so a caller whose participation ended while the read was in flight
+       is refused rather than served.
+
+    A read-only transaction cannot serve here the way it does for the
+    reputation read, because settlement WRITES - and a write path cannot
+    run inside a read-only snapshot. Re-authorizing is the form the same
+    guarantee takes when the operation is not read-only, and it is the
+    cheaper of the two anyway: one extra get-by-ID.
+
+    The double-blind projection is unchanged: the caller's own rating is
+    returned whether or not it has been revealed, and the counterparty's
+    only once it publishes - and not at all if moderation withheld it.
 
     Args:
         transaction_id: Transaction whose ratings are wanted.
-        caller_id: The authenticated caller, whose own rating is always
-            included. Omit it for an unprivileged view.
+        caller: The authenticated caller, whose participation is the
+            authorization and whose own rating is always included.
 
     Returns:
         The ratings this caller may see, newest first.
+
+    Raises:
+        TransactionNotFound: No such transaction, or a ``transaction_id``
+            that cannot name a document. The router reports it as 404.
+        NotATransactionParticipant: The caller is neither the buyer nor the
+            seller - on either check. The router reports it as 403.
     """
-    return _list_ratings_for_transaction(transaction_id, caller_id)
+    caller_id = getattr(caller, 'id', None)
+    # A raw path parameter has passed no validated model, so the grammar is
+    # applied before the value can reach ``document()``: a slash makes
+    # Firestore read it as a nested path, addressing something other than
+    # the document the URL appears to name.
+    if not _is_valid_document_id(transaction_id):
+        raise TransactionNotFound()
+
+    _require_participant(transaction_id, caller_id)
+
+    # One read serves both the settlement and the answer; a second read
+    # is issued only when settlement actually published something and the
+    # snapshots in hand are therefore stale.
+    snapshots, changed = _settle_transaction(transaction_id)
+    if changed:
+        snapshots = _transaction_rating_snapshots(transaction_id)
+
+    # Re-authorized against a FRESH read of the authorizing document,
+    # immediately before the data leaves this function. See above.
+    _require_participant(transaction_id, caller_id)
+
+    return _project_transaction_ratings(snapshots, caller_id)
+
+
+def _require_participant(
+    transaction_id: str,
+    caller_id: Optional[str],
+) -> Dict[str, Any]:
+    """Prove the caller is a party to the transaction, or refuse.
+
+    A structural clone of the guard ``app/api/transactions.py`` applies
+    before disclosing a transaction, with a typed exception in place of its
+    ``HTTPException``, and it keeps that module's ordering: a transaction
+    that does not exist is "not found", and only an existing transaction
+    the caller is not party to is "not a participant".
+
+    Note what that ordering does and does not achieve. It does NOT hide
+    existence from an outsider - the two verdicts are distinguishable - and
+    it is followed because it is the behaviour already published for the
+    same resource. Transaction IDs are opaque scatter-allocated
+    identifiers, so enumerating them is not a practical attack, and a
+    refusal already reveals that the caller is not a party.
+
+    Args:
+        transaction_id: Transaction to authorize against.
+        caller_id: The authenticated caller's ID.
+
+    Returns:
+        The transaction document body, for a caller that needs it.
+
+    Raises:
+        TransactionNotFound: No such transaction.
+        NotATransactionParticipant: The caller is not one of its parties.
+    """
+    transaction = _load_transaction(transaction_id)
+    if transaction is None:
+        raise TransactionNotFound()
+    # Read with ``.get`` rather than by subscript, so a transaction
+    # document missing a participant field fails CLOSED instead of raising
+    # a ``KeyError``. A document that cannot name its parties authorizes
+    # nobody.
+    participants = [
+        transaction.get('buyer_id'),
+        transaction.get('seller_id'),
+    ]
+    if not caller_id or caller_id not in participants:
+        raise NotATransactionParticipant()
+    return transaction
 
 
 def moderate_rating(
     rating_id: str,
     status: Any,
     reason: Optional[str] = None,
-    note: Optional[str] = None,
 ) -> Optional[Rating]:
     """Move a rating's moderation state, recording why. PUBLIC. F010-4.
 
@@ -3771,20 +4011,21 @@ def moderate_rating(
         rating_id: Rating document ID to transition.
         status: Target state - a :class:`ModerationStatus` member or its
             value string.
-        reason: The policy reason CODE justifying the transition, required
-            when rejecting. See :func:`_moderate_rating` for the permitted
-            codes and why free text is not accepted.
-        note: Optional operator note giving the specifics behind the code.
+        reason: The policy reason justifying the transition, describing the
+            violation in the review CONTENT. Required when rejecting and
+            refused on any other state - see :func:`_moderate_rating` for
+            both halves of that matrix.
 
     Returns:
         The rating in its new state, or ``None`` when no rating exists at
         that ID.
 
     Raises:
-        ValueError: The status is unrecognised, the reason is not a
-            permitted policy code, or a rejection carries no reason.
+        ValueError: The status is unrecognised, a rejection carries no
+            reason, or a reason accompanies a state that displays the
+            review.
     """
-    return _moderate_rating(rating_id, status, reason, note)
+    return _moderate_rating(rating_id, status, reason)
 
 
 def _aggregate_from_snapshot(
@@ -3841,18 +4082,19 @@ def _aggregate_from_snapshot(
     return RatingAggregate(average=average, count=count)
 
 
-def _list_ratings_for_transaction(
-    transaction_id: str,
+def _project_transaction_ratings(
+    snapshots: Iterable[Any],
     caller_id: Optional[str] = None,
 ) -> List[Rating]:
-    """List the ratings attached to one transaction, newest first.
+    """Project one transaction's ratings for one reader, newest first.
 
-    Intended for the participant view, whose authorization the router
-    performs. The double-blind model is preserved even for a
-    participant: a caller sees their own rating whether or not it has
-    been revealed, because it is theirs, but the counterparty's stays
-    hidden until it publishes. Returning both unconditionally here would
-    hand a participant exactly the early look the model exists to deny.
+    The visibility half of the per-transaction read, split from the
+    authorization and the settlement so each has one owner. The
+    double-blind model is preserved even for a participant: a caller sees
+    their own rating whether or not it has been revealed, because it is
+    theirs, but the counterparty's stays hidden until it publishes.
+    Returning both unconditionally would hand a participant exactly the
+    early look the model exists to deny.
 
     Two distinct rules therefore apply, and which one a rating gets
     depends only on authorship:
@@ -3863,12 +4105,12 @@ def _list_ratings_for_transaction(
       explanation, leaving its author unable to tell whether it was ever
       received.
     * Anyone else's is subject to the same policy as the public read:
-      visible once published, with its score always shown and its
-      unapproved review content and the internal moderation note
-      removed. See :func:`_visible_projection`.
+      visible once published, with unapproved review content and the
+      internal moderation reason removed, and withheld entirely once
+      moderation has rejected it. See :func:`_visible_projection`.
 
     Args:
-        transaction_id: Transaction whose ratings are wanted.
+        snapshots: Rating document snapshots for one transaction.
         caller_id: The authenticated caller, when there is one. Their own
             rating is always included in full. Omit it for an
             unprivileged view, which then contains published ratings with
@@ -3877,30 +4119,21 @@ def _list_ratings_for_transaction(
     Returns:
         Visible ratings ordered by creation time descending.
     """
-    # Raw-path-parameter guard FIRST, exactly as on the eligibility
-    # endpoint: a value that is not a usable document ID cannot identify
-    # a transaction, and must not reach a query - or a publication
-    # attempt - built from it.
-    if not _is_valid_document_id(transaction_id):
-        return []
-
-    # One read serves both the settlement and the answer; a second read
-    # is issued only when settlement actually published something and the
-    # snapshots in hand are therefore stale.
-    snapshots, changed = _settle_transaction(transaction_id)
-    if changed:
-        snapshots = _transaction_rating_snapshots(transaction_id)
-
-    ratings = _ratings_from_snapshots(snapshots)
-
     visible: List[Rating] = []
-    for rating in ratings:
+    for rating in _ratings_from_snapshots(snapshots):
         if caller_id and rating.rater_id == caller_id:
             visible.append(rating)
             continue
         if not rating.is_published:
             continue
-        visible.append(_visible_projection(rating))
+        projected = _visible_projection(rating)
+        # ``None`` means the record is withheld from this reader - a
+        # moderator ruled a policy violation in it. The authorship branch
+        # above has already returned the caller's OWN withheld rating in
+        # full, so the only records dropped here are somebody else's.
+        if projected is None:
+            continue
+        visible.append(projected)
 
     visible.sort(key=_sort_key, reverse=True)
     return visible
@@ -3929,50 +4162,11 @@ def _get_rating(rating_id: str) -> Optional[Rating]:
     return _rating_from_dict(_body_with_document_id(snapshot))
 
 
-def _moderation_reason_code(reason: Any) -> Optional[str]:
-    """Resolve a moderation reason to a permitted policy code.
-
-    The enforcement point for sentiment neutrality. A reason is a CODE
-    from :data:`MODERATION_REASON_CODES` or it is refused - there is no
-    free-text path, so "low score" and "unflattering" are not expressible
-    justifications for withholding a review.
-
-    Args:
-        reason: Candidate reason, of any type. ``None`` and whitespace
-            both mean "no reason given".
-
-    Returns:
-        The canonical code, or ``None`` when nothing was given.
-
-    Raises:
-        ValueError: A reason was given and is not a permitted code. The
-            message lists the permitted codes, because a moderator acting
-            in good faith needs to know which one applies, and states that
-            a low score is not among them.
-    """
-    if reason is None:
-        return None
-    code = str(reason).strip().lower().replace('-', '_').replace(' ', '_')
-    if not code:
-        return None
-    if code not in MODERATION_REASON_CODES:
-        raise ValueError(
-            'Unknown moderation reason {0!r}. A rejection must cite one '
-            'of the policy codes {1}. A low score is never itself a '
-            'policy violation and cannot be a reason.'.format(
-                reason,
-                list(MODERATION_REASON_CODES),
-            )
-        )
-    return code
-
-
 def _moderation_transaction_body(
     transaction: firestore.Transaction,
     rating_id: str,
     status_value: str,
-    reason_code: Optional[str],
-    note: Optional[str],
+    reason: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Read, validate and write the moderation state under one lock.
 
@@ -3998,8 +4192,12 @@ def _moderation_transaction_body(
             by :func:`app.db.firestore.run_in_transaction`.
         rating_id: Rating document to transition.
         status_value: Validated target state.
-        reason_code: Validated policy code, or ``None``.
-        note: Validated operator note, or ``None``.
+        reason: Validated policy reason, or ``None`` - which is the only
+            value permitted on a state other than ``rejected``, and is
+            written explicitly so a transition out of a rejection clears
+            the justification in the SAME write that moves the state.
+            There is no instant at which a displayed review has a
+            violation recorded against it.
 
     Returns:
         The updated document body, or ``None`` when no rating exists at
@@ -4027,8 +4225,7 @@ def _moderation_transaction_body(
 
     updates: Dict[str, Any] = {
         'moderation_status': status_value,
-        'moderation_reason': reason_code,
-        'moderation_note': note,
+        'moderation_reason': reason,
         'updated_at': firestore.SERVER_TIMESTAMP,
     }
     transaction.update(rating_ref, updates)
@@ -4045,7 +4242,6 @@ def _moderate_rating(
     rating_id: str,
     status: Any,
     reason: Optional[str] = None,
-    note: Optional[str] = None,
 ) -> Optional[Rating]:
     """Move a rating's moderation state, recording why. F010-4.
 
@@ -4080,16 +4276,13 @@ def _moderate_rating(
             value string. Validated here, because an unrecognised value
             would otherwise be written straight onto the document and
             silently disable every state check that reads it.
-        reason: The policy basis for the transition, as a CODE from
-            :data:`MODERATION_REASON_CODES`. MANDATORY when withholding a
-            rating, and constrained to that allow-list rather than
-            accepted as free text - see :func:`_moderation_reason_code`
-            for why a free-text reason cannot enforce a policy. Cleared
-            when omitted, so approving a rating does not leave a stale
-            rejection reason behind.
-        note: Optional operator note carrying the specifics behind the
-            code. Bounded plain text. It is where the human detail goes,
-            which is what lets the code stay closed.
+        reason: The policy basis for the transition, as bounded plain
+            text describing the violation in the CONTENT. MANDATORY when
+            rejecting, and REFUSED on any other state - see
+            :data:`MODERATION_REASON_REQUIRED_STATUS` for both halves of
+            that matrix and why it is a matrix rather than a default.
+            Any previously stored reason is cleared by the transition
+            that leaves ``rejected``, in the same write.
 
     Returns:
         The rating in its new state, or ``None`` when no rating exists at
@@ -4097,11 +4290,12 @@ def _moderate_rating(
         router reports as not found. Nothing is written on either path.
 
     Raises:
-        ValueError: ``status`` is not a recognised moderation state, the
-            reason is not a permitted policy code, or a rejection was
-            requested without one. Raised before anything is read, let
-            alone written, so a rating is never withheld first and
-            justified afterwards.
+        ValueError: ``status`` is not a recognised moderation state, a
+            rejection was requested without a reason, or a reason was
+            supplied for a state that may not carry one. Raised before
+            anything is read, let alone written, so a rating is never
+            withheld first and justified afterwards - and never displayed
+            with a violation recorded against it.
     """
     if isinstance(status, ModerationStatus):
         status_value = status.value
@@ -4114,36 +4308,40 @@ def _moderate_rating(
             'Unknown moderation status: {0!r}'.format(status)
         )
 
-    # Validated BEFORE the document is even read, so there is no path on
-    # which a rating is withheld and the justification is left for later.
-    # A rejection is the one transition that removes somebody's words from
-    # view; it cites a policy code from the allow-list or it does not
-    # happen.
-    reason_code = _moderation_reason_code(reason)
-    if (
-        status_value == ModerationStatus.REJECTED.value
-        and reason_code is None
-    ):
-        raise ValueError(
-            'Rejecting a rating requires one of the policy reason codes '
-            '{0}, describing the violation in the CONTENT. A low score is '
-            'never itself a violation.'.format(
-                list(MODERATION_REASON_CODES)
-            )
-        )
-
-    # The operator's note is held to the same bounded plain-text contract
-    # as the review itself, rather than merely stripped. A bare
-    # ``.strip()`` leaves embedded control characters, un-normalised
-    # Unicode and an unbounded length in a value that is PERSISTED on the
-    # rating document - so an unbounded note is an unbounded write into a
-    # document Firestore caps at 1 MiB, and a newline in it is a forged
-    # line in any log or export that renders it.
-    recorded_note = as_plain_text(
-        note,
-        max_length=MODERATION_NOTE_MAX_LENGTH,
-        label='Moderation note',
+    # The reason is held to the same bounded plain-text contract as the
+    # review itself, rather than merely stripped. A bare ``.strip()``
+    # leaves embedded control characters, un-normalised Unicode and an
+    # unbounded length in a value that is PERSISTED on the rating document
+    # - so an unbounded reason is an unbounded write into a document
+    # Firestore caps at 1 MiB, and a newline in it is a forged line in any
+    # log or export that renders it. Whitespace-only normalises to
+    # ``None``, which is what makes the requirement below meaningful: a
+    # reason of "   " is no reason.
+    recorded_reason = as_plain_text(
+        reason,
+        max_length=MODERATION_REASON_MAX_LENGTH,
+        label='Moderation reason',
     )
+
+    # The reason/state matrix, enforced in BOTH directions and BEFORE the
+    # document is even read - so there is no path on which a rating is
+    # withheld and the justification is left for later, and none on which a
+    # displayed review carries a violation.
+    withholding = status_value == MODERATION_REASON_REQUIRED_STATUS
+    if withholding and recorded_reason is None:
+        raise ValueError(
+            'Rejecting a rating requires a reason describing the policy '
+            'violation in the CONTENT - abuse, personally identifying '
+            'information, profanity. A low score is never itself a '
+            'violation and cannot be a reason.'
+        )
+    if not withholding and recorded_reason is not None:
+        raise ValueError(
+            'A moderation reason may only accompany a rejection. State '
+            '{0!r} displays the review, so recording a policy violation '
+            'against it would leave a record that contradicts '
+            'itself.'.format(status_value)
+        )
 
     # The document ID grammar is applied before the value reaches
     # ``document()``. A rating's ID is the COMPOSITE key, so it is held to
@@ -4159,8 +4357,7 @@ def _moderate_rating(
             _moderation_transaction_body,
             rating_id,
             status_value,
-            reason_code,
-            recorded_note,
+            recorded_reason,
         )
     except NotFound:
         # The document was deleted between the locked read and the commit.
@@ -4180,6 +4377,6 @@ def _moderate_rating(
         'Rating %s moderation status set to %s (reason=%s)',
         rating_id,
         status_value,
-        reason_code or 'none',
+        recorded_reason or 'none',
     )
     return _rating_from_dict(body)

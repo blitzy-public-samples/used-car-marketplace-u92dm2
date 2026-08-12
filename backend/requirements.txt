@@ -5,8 +5,12 @@
 # This manifest repairs an already-referenced-but-missing file. Two committed
 # tool invocations read it, and neither can work without it:
 #
-#   .github/workflows/backend_ci.yml:L24  ->  pip install -r requirements.txt
-#   scripts/setup_environment.sh:L28      ->  pip install -r requirements.txt
+#   .github/workflows/backend_ci.yml:L27-L31  ->  pip install -r
+#                                                 requirements.txt, from
+#                                                 working-directory: backend
+#   scripts/setup_environment.sh:L33-L35      ->  pip install -r
+#                                                 "${REPO_ROOT}/backend/
+#                                                 requirements.txt"
 #
 # Every requirement below is an exact `==` pin. There are deliberately no
 # ranges, no `latest`, and no unpinned names: the whole set is resolved and
@@ -45,8 +49,8 @@
 #
 #   * python-dotenv is ALREADY in the closure. `uvicorn[standard]==0.23.2`
 #     declares `python-dotenv>=0.13` in its `standard` extra, which is what
-#     makes the `env_file = ".env"` declaration at app/core/config.py:L21-L23
-#     work. It needs no line of its own.
+#     makes the `env_file = ".env"` declaration at
+#     app/core/config.py:L467-L469 work. It needs no line of its own.
 #   * redis is NOT needed. See the background-tasks section below.
 #
 # -----------------------------------------------------------------------------
@@ -71,15 +75,26 @@
 # anywhere to widen it - so this manifest honours the documented runtime.
 #
 # -----------------------------------------------------------------------------
-# RECORDED FINDING 2: CI resolves this path from the repository root
+# RESOLVED FINDING 2: both consumers now resolve this exact file
 # -----------------------------------------------------------------------------
-# .github/workflows/backend_ci.yml declares no `working-directory:` key, so its
-# L24 `pip install -r requirements.txt` resolves to ./requirements.txt at the
-# repository root rather than to backend/requirements.txt. scripts/
-# setup_environment.sh:L28 has the same problem. This is a PRE-EXISTING
-# workflow defect and it is recorded, not fixed: the workflow files are
-# explicitly no-change, and this manifest's path is fixed at
-# backend/requirements.txt. No duplicate copy is placed at the repository root.
+# This note previously recorded a live defect: neither consumer reached
+# backend/requirements.txt. The workflow declared no `working-directory:` key,
+# so its `pip install -r requirements.txt` resolved to ./requirements.txt at
+# the repository root, where no manifest exists; and setup_environment.sh
+# installed the same bare filename, so it depended on the caller's working
+# directory. Both are repaired in the tree:
+#
+#   * .github/workflows/backend_ci.yml:L28 declares `working-directory:
+#     backend` on the install step, and on the lint and test steps beside it,
+#     so all three run where the manifest, the `app` package and the test
+#     suite actually live;
+#   * scripts/setup_environment.sh:L26 resolves REPO_ROOT from its own
+#     location and L35 installs "${REPO_ROOT}/backend/requirements.txt"
+#     explicitly.
+#
+# So this manifest's path stays fixed at backend/requirements.txt and no
+# duplicate copy is placed at the repository root - not as a workaround now,
+# but because both callers name it correctly.
 #
 # -----------------------------------------------------------------------------
 # RESOLVED FINDING 3: passlib 1.7.4 drives only bcrypt < 4.1 cleanly
@@ -87,7 +102,7 @@
 # `passlib[bcrypt]==1.7.4` below resolves bcrypt through passlib's own extra,
 # which declares `bcrypt>=3.1.0` with NO upper bound. A clean resolution on
 # CPython 3.9.25 therefore installs bcrypt 5.0.0 today, and that combination
-# does not work. Measured against the CryptContext at app/api/auth.py:L13:
+# does not work. Measured against the CryptContext at app/api/auth.py:L16:
 #
 #   bcrypt 4.0.1          -> hash()/verify() correct and silent
 #   bcrypt 4.1.1 - 4.3.0  -> correct, but each call logs a "(trapped) error
@@ -100,7 +115,7 @@
 #                            than 72 bytes` instead of truncating, so
 #                            hash()/verify() raise instead of working
 #
-# The blast radius today is zero: app/api/auth.py:L21 mounts a router with NO
+# The blast radius today is zero: app/api/auth.py:L41 mounts a router with NO
 # routes, so verify_password(), get_password_hash() and authenticate_user() are
 # not reachable from any endpoint - registration and login are F-001 work and
 # are out of scope. It becomes load-bearing the moment a login handler lands.
@@ -157,7 +172,7 @@ fastapi==0.103.2
 uvicorn[standard]==0.23.2
 
 # Multipart/form-data parsing. FastAPI requires it for the
-# OAuth2PasswordRequestForm imported at app/api/auth.py:L2.
+# OAuth2PasswordRequestForm imported at app/api/auth.py:L3.
 #
 # Raised 0.0.6 -> 0.0.20 for code review finding M8. 0.0.6 is affected by
 # CVE-2024-24762 (ReDoS in Content-Type option parsing, fixed in 0.0.7) and
@@ -189,11 +204,12 @@ python-multipart==0.0.20
 # Note on `.env` support, which pydantic v1 delegates to python-dotenv: reading
 # an `env_file` without python-dotenv installed raises `ImportError:
 # python-dotenv is not installed, run pip install pydantic[dotenv]` from
-# pydantic/env_settings.py, and app/core/config.py:L21-L23 declares
+# pydantic/env_settings.py, and app/core/config.py:L467-L469 declares
 # `env_file = ".env"` while the repository's own instructions produce that file
-# (scripts/setup_environment.sh:L40 runs `cp .env.example .env`; README.md:
-# L48-L49 says the same). No separate requirement is needed for it: python-
-# dotenv arrives in the closure through the `uvicorn[standard]` extra above,
+# (scripts/setup_environment.sh:L49 copies backend/.env.example to
+# backend/.env; README.md:L48 says the same). No separate requirement is
+# needed for it: python-dotenv arrives in the closure through the
+# `uvicorn[standard]` extra above,
 # which declares `python-dotenv>=0.13`. Verified on CPython 3.9.25 - installing
 # this manifest yields a working python-dotenv, so the documented
 # `cp .env.example .env` path configures the application rather than breaking
@@ -203,7 +219,7 @@ pydantic==1.10.13
 
 # --- Authentication ----------------------------------------------------------
 
-# JWT encode/decode - app/api/auth.py:L3 and app/core/security.py:L2. The
+# JWT encode/decode - app/api/auth.py:L4 and app/core/security.py:L2. The
 # [cryptography] extra supplies the signing backend the HS256 algorithm needs.
 #
 # Raised 3.3.0 -> 3.5.0 for code review finding m8. 3.3.0 is affected by
@@ -217,7 +233,7 @@ pydantic==1.10.13
 # claims, and a tampered signature raises JWTError instead of validating.
 python-jose[cryptography]==3.5.0
 
-# Password hashing - app/api/auth.py:L4,L13 and app/core/security.py:L3,L9
+# Password hashing - app/api/auth.py:L5,L16 and app/core/security.py:L3,L9
 # build a CryptContext(schemes=['bcrypt']). The `[bcrypt]` extra brings the
 # bcrypt backend into the closure, but declares only `bcrypt>=3.1.0` with no
 # upper bound - so the backend has to be pinned explicitly on its own line
@@ -238,21 +254,23 @@ bcrypt==4.0.1
 
 # --- Google Cloud ------------------------------------------------------------
 
-# Firestore client - app/db/firestore.py:L1. Also supplies the two primitives
+# Firestore client - app/db/firestore.py:L3. Also supplies the two primitives
 # the rating feature is built on: DocumentReference.create(), whose create-only
 # semantics raise google.api_core.exceptions.AlreadyExists on a duplicate
 # document ID (mapped to HTTP 409), and the transactional runner used for the
 # atomic rating-plus-aggregate write.
 google-cloud-firestore==2.13.1
 
-# Declared DIRECTLY even though Firestore already pulls it in, because
-# app/services/rating.py imports google.api_core.exceptions by name to
-# translate AlreadyExists into DuplicateRating and to classify transient
-# provider faults. Exception IDENTITY is what those decisions turn on, so
-# the version a duplicate vote and a retry classification depend on must
-# not float with a transitive resolution. This pin satisfies
-# google-cloud-firestore==2.13.1's own google-api-core[grpc]>=1.34.0,<3.0.0
-# requirement and is the version the validated environment resolves.
+# Declared DIRECTLY even though Firestore already pulls it in, because two
+# modules import google.api_core.exceptions BY NAME:
+# app/services/rating.py:L201 translates AlreadyExists into DuplicateRating and
+# classifies transient provider faults, and app/db/firestore.py:L2 imports
+# Aborted to report contention exhaustion as the transient fault it is.
+# Exception IDENTITY is what both decisions turn on, so the version a duplicate
+# vote and a retry classification depend on must not float with a transitive
+# resolution. This pin satisfies google-cloud-firestore==2.13.1's own
+# google-api-core[grpc]>=1.34.0,<3.0.0 requirement and is the version the
+# validated environment resolves.
 google-api-core==2.30.3
 
 # Object storage client - app/db/cloud_storage.py:L1.
@@ -273,33 +291,41 @@ google-cloud-documentai==2.20.1
 # `Stripe` class to import from it - `from stripe import Stripe` raises
 # ImportError - and no `StripeClient` either; that arrived in 8.x.
 #
-# RECORDED, NOT FIXED: app/services/payment.py:L1,L12 is written against that
-# non-existent `Stripe` class, so importing it raises ImportError, and with it
+# This note previously recorded a live mismatch: payment.py imported that
+# non-existent `Stripe` class, so the module raised ImportError, and with it
 # the transactions router that imports process_payment and therefore app.main.
-# The pin is the plan's version and is not moved to accommodate the module,
-# and the module is not rewritten here either: it is a reference-only file
-# outside this feature's scope, so the mismatch belongs to a change that owns
-# it. Nothing in the rating feature imports payment.py.
+# The module is now written against the API this pin actually ships -
+# app/services/payment.py:L17 assigns `stripe.api_key`, and every call already
+# went through the module - so the pin and the code agree and `import
+# app.services.payment` succeeds. The version is unchanged: nothing was moved
+# to accommodate the module, and nothing needs to be.
 stripe==7.9.0
 
 
 # --- Background tasks --------------------------------------------------------
 
-# Task queue - app/tasks/background_jobs.py:L1-L2 (`from celery import Celery`
+# Task queue - app/tasks/background_jobs.py:L3-L4 (`from celery import Celery`
 # and `from celery.schedules import crontab`).
 #
-# Declared BARE, with no broker extra. The worker tier is aspirational in this
-# build and nothing may depend on it: no task is ever dispatched, no
-# .delay()/apply_async() call exists anywhere, and the module cannot even be
-# imported. app/tasks/background_jobs.py:L9 constructs
-# `Celery(..., broker=settings.CELERY_BROKER_URL)` at import time against a
-# field app/core/config.py never declares, so the import raises AttributeError
-# long before any transport is selected - which is also why no `redis://` URL
-# is ever handed to kombu and no redis client is ever loaded. Adding a broker
-# extra here would install a client for a broker that is neither configured
-# (CELERY_BROKER_URL is a commented recorded finding in backend/.env.example,
-# not a Settings field) nor provisioned. The rating feature is correct without
-# it: the read paths publish an expired rating opportunistically on encounter.
+# Declared BARE, with no broker extra, and that is a decision about the broker
+# rather than about the import. The module imports cleanly: it names the
+# in-memory transport `memory://` directly at construction, so no configuration
+# is consulted and no transport package is needed to DEFINE and register its
+# tasks. What it cannot do is run them anywhere real, and nothing in this build
+# asks it to - no task is ever dispatched and no `.delay()`/`apply_async()`
+# call exists anywhere.
+#
+# A broker extra here would therefore install a client for a broker that is
+# neither configured nor provisioned. `CELERY_BROKER_URL` is deliberately not a
+# Settings field and not an entry in backend/.env.example: nothing reads it, so
+# declaring it would imply a choice the deployment does not offer. A deployment
+# that does provision a broker sets Celery's own `CELERY_BROKER_URL`
+# environment variable, which Celery honours over the constructor argument, and
+# adds the matching transport extra as its own reviewed change.
+#
+# The rating feature is correct without any of that: the read paths publish an
+# expired rating opportunistically on encounter, so window expiry does not
+# depend on a worker running.
 celery==5.3.6
 
 
@@ -314,13 +340,13 @@ PyPDF2==3.0.1
 
 # --- Development and CI tooling ----------------------------------------------
 
-# Test runner invoked by .github/workflows/backend_ci.yml:L31-L34.
+# Test runner invoked by .github/workflows/backend_ci.yml:L39-L43.
 pytest==7.4.4
 
-# Required transitively by fastapi.testclient.TestClient, imported at
-# backend/tests/test_api.py:L2 and by the ratings test modules. Without it
-# TestClient construction fails.
+# Required transitively by fastapi.testclient.TestClient, which
+# backend/tests/test_api.py:L2 imports and which every router-level test in
+# this suite is built on. Without it TestClient construction fails.
 httpx==0.25.2
 
-# Linter invoked by .github/workflows/backend_ci.yml:L26-L29.
+# Linter invoked by .github/workflows/backend_ci.yml:L33-L37.
 flake8==6.1.0

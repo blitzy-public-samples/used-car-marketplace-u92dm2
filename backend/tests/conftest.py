@@ -80,10 +80,36 @@ unproven claim:
   ``google.api_core.exceptions.AlreadyExists`` on a collision. The
   one-vote-per-transaction rule is enforced by document-ID collision and
   by nothing else, so a double that quietly overwrote would make that
-  test meaningless.
+  test meaningless. The precondition is evaluated AT COMMIT, against the
+  state the batch is applied to, exactly as it is on the wire - not when
+  the write is staged, which would answer a question production never
+  asks.
 * ``run_in_transaction`` commits or rolls back. Staged writes become
   visible together on success and vanish entirely if the callback
   raises, so a test can observe the absence of a partial write.
+* CONTENTION IS MODELLED, NOT ASSUMED AWAY. Every document is version
+  stamped, every transactional read records the version it observed, and
+  a commit whose reads have since moved on is rejected with the real
+  ``google.api_core.exceptions.Aborted`` - so the production retry
+  wrapper reruns the callback for real and a test can PROVE that
+  rerunning it is safe. A read-only transaction pins a snapshot when it
+  begins and serves every read from it, which is the coherence
+  ``get_user_reputation`` depends on. Interference is injected
+  deterministically through ``fake_db.arm_commit_interference`` and
+  ``fake_db.arm_commit_conflict`` rather than raced for, because a test
+  that had to win a race would be a flaky test. See
+  :class:`FakeTransaction` for what this models faithfully and what it
+  cannot.
+* RESOURCE PATHS ARE PARSED, NOT TREATED AS KEYS. A document ID is
+  resolved the way the real client resolves it, so ``'a/b'`` is
+  rejected with the client's own ``ValueError`` while ``'a/b/c'`` -
+  which real Firestore ACCEPTS as a nested path - is refused with a
+  message saying so, never flattened into a key that would conceal
+  production writing somewhere else entirely. IDs the SERVER refuses
+  (empty, ``.``, ``..``, the reserved ``__*__`` namespace) construct and
+  then raise ``InvalidArgument`` on every read and write, as they do on
+  the wire. See :func:`verify_document_path` and
+  :func:`require_usable_resource_id`.
 * Firestore's ordering rules are honoured: a document missing a filtered
   field matches no filter, a document missing an ``order_by`` field is
   excluded from the result, and ``__name__`` breaks ties in the
@@ -119,7 +145,16 @@ Bootstrap
     :func:`install_external_client_doubles`, ``InertExternalClient``,
     ``EXTERNAL_CLIENT_TARGETS``,
     :func:`install_firestore_double`, :func:`rebind_firestore_holders`,
-    and the session-scoped ``restore_process_state`` fixture.
+    :func:`capture_app_modules`, :func:`purge_app_modules`,
+    :func:`refuse_second_bootstrap`, and the session-scoped
+    ``restore_process_state`` fixture. Every installer that mutates a
+    process global returns the reversal for it, and the bootstrap
+    collects those reversals so the session leaves no trace on its host.
+
+Resource paths
+    :func:`verify_document_path`, :func:`verify_collection_path` and
+    :func:`require_usable_resource_id`, which a test may call directly to
+    assert what a live datastore would accept.
 
 Index declarations
     ``DECLARED_COMPOSITE_INDEXES`` (parsed at import),
@@ -136,13 +171,18 @@ The double
     ``fake_db.raw()``, ``fake_db.documents(collection)``,
     ``fake_db.document_body(collection, doc_id)``,
     ``fake_db.document_ids(collection)``,
-    ``fake_db.exists(collection, doc_id)`` and
-    ``fake_db.count(collection)``.
+    ``fake_db.exists(collection, doc_id)``,
+    ``fake_db.count(collection)`` and
+    ``fake_db.version(collection, doc_id)``. Contention is driven with
+    ``fake_db.arm_commit_interference(mutate)`` and
+    ``fake_db.arm_commit_conflict()``, and observed with
+    ``fake_db.commit_attempts``.
 
 Per-test isolation
     The autouse :func:`reset_firestore_double` fixture resets every
     piece of mutable state this module shares, before and after each
-    test: the stored documents and ``fake_db.project`` through
+    test: the stored documents, their version counters, the commit tally,
+    any armed interference and ``fake_db.project`` through
     ``fake_db.reset()``, the server-timestamp cursor through
     :func:`reset_server_timestamps`, and the rating tunables on
     ``settings``.
@@ -168,8 +208,13 @@ stock ``flake8``; and this module never imports
 ``app.tasks.background_jobs``, because nothing in the rating feature's
 correctness depends on the worker tier - the read paths publish
 opportunistically instead - so a test module that wants the task can
-import it for itself. It is importable: ``CELERY_BROKER_URL`` is now a
-declared optional setting with a documented in-memory fallback.
+import it for itself. It is importable without configuration: that
+module names its broker itself, so importing it provisions nothing and
+reaches no network.
+
+Nor is this file safe to import twice under two module names, and it
+says so rather than misbehaving - see :func:`refuse_second_bootstrap`.
+Import it as pytest already has (``from conftest import ...``).
 """
 
 import copy
@@ -178,6 +223,7 @@ import importlib
 import json
 
 import os
+import re
 import socket
 import sys
 import threading
@@ -187,8 +233,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from google.api_core.exceptions import (
+    Aborted,
     AlreadyExists,
     FailedPrecondition,
+    InvalidArgument,
     NotFound,
 )
 from google.cloud import firestore
@@ -398,6 +446,21 @@ FakeWriteResult = namedtuple('FakeWriteResult', ('update_time',))
 _StagedWrite = namedtuple(
     '_StagedWrite',
     ('kind', 'collection_id', 'document_id', 'data', 'merge'),
+)
+
+# One recorded transactional read, checked again when the transaction
+# commits. A document read pins one document at the version it was
+# observed at. A query read pins the whole result set - its membership
+# AND each member's version - because a transactional query read covers
+# the range it scanned, so a document ARRIVING in that range is as much
+# a conflict as one changing inside it.
+_DocumentExpectation = namedtuple(
+    '_DocumentExpectation',
+    ('collection_id', 'document_id', 'version'),
+)
+_QueryExpectation = namedtuple(
+    '_QueryExpectation',
+    ('query', 'members'),
 )
 
 
@@ -726,6 +789,164 @@ def generate_document_id():
     return uuid.uuid4().hex[:20]
 
 
+# Firestore's resource-path separator, and the server-side rules a
+# resource ID must satisfy once the CLIENT-side path parse has accepted
+# it. Both halves are reproduced rather than approximated, because the
+# double's purpose is to refuse what production refuses - and to refuse
+# it for the same reason, at the same moment. Every message below is the
+# one a live datastore actually returned for that case, verified against
+# the Firestore emulator on the pinned client
+# (``google-cloud-firestore==2.13.1``).
+PATH_DELIMITER = '/'
+RELATIVE_ID_SEGMENTS = ('.', '..')
+RESERVED_ID_PATTERN = re.compile(r'^__.*__$')
+
+
+def verify_document_path(collection_id, document_id):
+    """Hold a document ID to Firestore's CLIENT-side path rules.
+
+    The real client does not treat a document ID as an opaque key. It
+    appends the ID to the collection path, splits the result on ``/``,
+    and requires the resulting path to have an EVEN number of elements
+    - ``google.cloud.firestore_v1._helpers.verify_path``. So a
+    slash-bearing ID is not uniformly rejected, and that asymmetry is
+    exactly what a double must not paper over:
+
+    * ``document('a/b')`` resolves to a three-element path and is
+      REJECTED with ``ValueError``;
+    * ``document('a/b/c')`` resolves to a four-element path and is
+      ACCEPTED, addressing document ``c`` of subcollection
+      ``<collection>/a/b`` - a completely different location from any
+      flat key, written silently and read back by nobody.
+
+    The second case is the dangerous one. A double that raised for it
+    would tell a test the datastore protects against a composed
+    identifier when production would in fact write somewhere else
+    entirely. This double therefore reproduces the rejection for the
+    first case verbatim, and for the second REFUSES EXPLICITLY while
+    saying in the message that real Firestore would have accepted it -
+    so the refusal is read as "this double has no subcollections", never
+    as "the datastore would have stopped you".
+
+    Args:
+        collection_id: Collection the ID is being resolved against.
+        document_id: The ID as production composed it.
+
+    Raises:
+        ValueError: The ID is not a string, resolves to a path with an
+            odd number of elements, or resolves to a nested path this
+            double does not implement.
+    """
+    if not isinstance(document_id, str):
+        raise ValueError(
+            'A path element must be a string. Received {0!r}, which is '
+            'a {1}.'.format(document_id, type(document_id).__name__)
+        )
+    segments = document_id.split(PATH_DELIMITER)
+    if (1 + len(segments)) % 2 == 1:
+        raise ValueError(
+            'A document must have an even number of path elements'
+        )
+    if len(segments) == 1:
+        return
+    resolved = '{0}{1}{2}'.format(
+        collection_id, PATH_DELIMITER, document_id
+    )
+    raise ValueError(
+        'Real Firestore ACCEPTS the document ID {0!r} and resolves it '
+        'to the nested path {1!r}, addressing document {2!r} of a '
+        'subcollection rather than a key in {3!r}. This in-memory '
+        'double implements no subcollections, so it refuses the ID '
+        'rather than flattening it into a key - a flat key would hide '
+        'the fact that production would silently write to a different '
+        'location. Do not read this refusal as datastore protection: '
+        'validate the identifier before composing it.'.format(
+            document_id, resolved, segments[-1], collection_id
+        )
+    )
+
+
+def verify_collection_path(collection_id):
+    """Hold a collection name to Firestore's CLIENT-side path rules.
+
+    The mirror image of :func:`verify_document_path`: a collection path
+    must have an ODD number of elements, so ``collection('a/b')`` is
+    rejected by the real client while ``collection('a/b/c')`` is
+    accepted as a subcollection. The double implements neither, and
+    distinguishes the two refusals for the same reason.
+
+    Args:
+        collection_id: The name as the caller supplied it.
+
+    Raises:
+        ValueError: The name is not a non-empty string, resolves to a
+            path with an even number of elements, or names a
+            subcollection this double does not implement.
+    """
+    if not isinstance(collection_id, str) or not collection_id:
+        raise ValueError(
+            'A collection name must be a non-empty string, got '
+            '{0!r}.'.format(collection_id)
+        )
+    segments = collection_id.split(PATH_DELIMITER)
+    if len(segments) % 2 == 0:
+        raise ValueError(
+            'A collection must have an odd number of path elements'
+        )
+    if len(segments) > 1:
+        raise ValueError(
+            'Real Firestore ACCEPTS the collection path {0!r} as a '
+            'subcollection. This in-memory double implements no '
+            'subcollections, so pass a single collection name '
+            'instead.'.format(collection_id)
+        )
+
+
+def require_usable_resource_id(collection_id, document_id):
+    """Refuse a document ID the Firestore SERVER would refuse.
+
+    Three ID forms pass the client-side path parse and are then rejected
+    by the datastore itself, at every use - read as well as write. They
+    are reproduced here, with the server's own wording, because
+    ``app/schema/rating.py``'s document-ID grammar exists precisely to
+    keep them out: a double that accepted them as ordinary dictionary
+    keys would let the suite pass while the grammar guard was removed.
+
+    * an empty ID, which leaves the resource name with a trailing ``/``;
+    * ``.`` or ``..``, which the server reads as relative path segments;
+    * anything matching ``__*__``, a namespace the server reserves.
+
+    An ID containing an empty INNER segment - ``a//b`` - is refused
+    earlier, by :func:`verify_document_path`, because the real client
+    resolves it to a nested path first.
+
+    Args:
+        collection_id: Collection being addressed.
+        document_id: The ID being used.
+
+    Raises:
+        google.api_core.exceptions.InvalidArgument: The datastore would
+            refuse this resource name.
+    """
+    name = 'documents/{0}/{1}'.format(collection_id, document_id)
+    if not document_id:
+        raise InvalidArgument(
+            '400 Document name "{0}" has invalid trailing "/".'.format(
+                name
+            )
+        )
+    if document_id in RELATIVE_ID_SEGMENTS:
+        raise InvalidArgument(
+            '400 Document name "{0}" contains a resource id '
+            '"{1}".'.format(name, document_id)
+        )
+    if RESERVED_ID_PATTERN.match(document_id):
+        raise InvalidArgument(
+            '400 Resource id "{0}" is invalid because it is '
+            'reserved.'.format(document_id)
+        )
+
+
 def load_declared_indexes(path=None):
     """Parse the composite index declarations, or fail loudly.
 
@@ -755,7 +976,7 @@ def load_declared_indexes(path=None):
     location = path
     if location is None:
         location = os.path.join(
-            os.path.dirname(ensure_backend_on_sys_path()),
+            os.path.dirname(ensure_backend_on_sys_path()[0]),
             INDEX_DECLARATION_RELATIVE_PATH,
         )
     try:
@@ -1122,28 +1343,25 @@ class FakeDocumentReference:
     def __init__(self, client, collection_id, document_id):
         """Bind a reference to one document.
 
+        The ID is resolved through :func:`verify_document_path`, which
+        reproduces the real client's path arithmetic rather than
+        treating the ID as an opaque key - see that function for why the
+        distinction between a rejected and a nested slash-bearing ID
+        matters. Server-side ID rules are NOT applied here, because the
+        real client does not apply them here either: they are enforced at
+        every use, by :func:`require_usable_resource_id`.
+
         Args:
             client: The owning :class:`FakeFirestoreClient`.
             collection_id: Collection the document lives in.
             document_id: The document's ID.
 
         Raises:
-            ValueError: The ID is empty, not a string, or contains a
-                forward slash - which Firestore reads as a path
-                separator rather than as part of an ID.
+            ValueError: The ID is not a string, resolves to an invalid
+                path, or names a nested document this double does not
+                implement.
         """
-        if not isinstance(document_id, str) or not document_id:
-            raise ValueError(
-                'A document ID must be a non-empty string, got '
-                '{0!r}.'.format(document_id)
-            )
-        if '/' in document_id:
-            raise ValueError(
-                'A document ID may not contain "/", which Firestore '
-                'reads as a path separator, got {0!r}.'.format(
-                    document_id
-                )
-            )
+        verify_document_path(collection_id, document_id)
         self._client = client
         self._collection_id = collection_id
         self.id = document_id
@@ -1162,21 +1380,35 @@ class FakeDocumentReference:
     def get(self, transaction=None):
         """Read the document, optionally through a transaction.
 
-        A transactional read sees COMMITTED state, not the transaction's
-        own staged writes, because Firestore transactions have no
-        read-your-own-writes behaviour. Passing ``transaction`` also
-        enforces Firestore's ordering rule that every read precede every
-        write in the same transaction.
+        A read-write transactional read sees COMMITTED state, not the
+        transaction's own staged writes, because Firestore transactions
+        have no read-your-own-writes behaviour. Passing ``transaction``
+        also enforces Firestore's ordering rule that every read precede
+        every write in the same transaction, and RECORDS the version
+        observed, which is what lets the commit detect that another
+        writer changed the document in between - see
+        :meth:`FakeTransaction.read_document`.
+
+        A read-only transactional read is served from the snapshot the
+        transaction pinned when it began, so two reads in one read-only
+        transaction cannot straddle a concurrent commit.
 
         Args:
             transaction: Open :class:`FakeTransaction`, or ``None``.
 
         Returns:
             A :class:`FakeDocumentSnapshot`, existing or not.
+
+        Raises:
+            google.api_core.exceptions.InvalidArgument: The datastore
+                would refuse this resource name - see
+                :func:`require_usable_resource_id`.
         """
         if transaction is not None:
-            transaction.note_read(self.path)
-        body = self._client.peek(self._collection_id, self.id)
+            body = transaction.read_document(self)
+        else:
+            require_usable_resource_id(self._collection_id, self.id)
+            body = self._client.peek(self._collection_id, self.id)
         return FakeDocumentSnapshot(self, body)
 
     def set(self, document_data, merge=False):
@@ -1482,7 +1714,7 @@ class FakeQuery:
             A list of :class:`FakeDocumentSnapshot`.
         """
         if transaction is not None:
-            transaction.note_read(self._describe())
+            return transaction.read_query(self)
         return self._evaluate()
 
     def stream(self, transaction=None):
@@ -1496,7 +1728,7 @@ class FakeQuery:
             ``id`` and ``to_dict()``.
         """
         if transaction is not None:
-            transaction.note_read(self._describe())
+            return iter(transaction.read_query(self))
         return iter(self._evaluate())
 
     def _describe(self):
@@ -1643,13 +1875,20 @@ class FakeQuery:
             return outcome < 0
         return outcome <= 0
 
-    def _evaluate(self):
-        """Run the query against current state.
+    def _evaluate(self, source=None):
+        """Run the query against current state, or against a snapshot.
 
         The index requirement is checked FIRST, and here rather than in
         ``where``/``order_by``, because that is where Firestore decides
         it: a query is a value until something asks for its results, and
         only the finished shape can be matched against an index.
+
+        Args:
+            source: Where to read documents from - anything exposing
+                ``items(collection_id)``. Defaults to the live client.
+                A transactional read passes a version-stamped snapshot
+                instead, so the result set and the versions recorded
+                alongside it describe ONE instant.
 
         Returns:
             A list of :class:`FakeDocumentSnapshot` in query order.
@@ -1664,7 +1903,8 @@ class FakeQuery:
             self._orders,
         )
         rows = []
-        for document_id, body in self._client.items(self._collection_id):
+        reader = self._client if source is None else source
+        for document_id, body in reader.items(self._collection_id):
             if not self._passes(body, document_id):
                 continue
             if self._orders:
@@ -1722,21 +1962,12 @@ class FakeCollectionReference(FakeQuery):
             collection_id: Collection name.
 
         Raises:
-            ValueError: The name is empty, not a string, or contains a
-                forward slash. Subcollections are not implemented, and a
-                path is refused rather than flattened into a name.
+            ValueError: The name is not a non-empty string, resolves to
+                an invalid path, or names a subcollection, which this
+                double does not implement - see
+                :func:`verify_collection_path`.
         """
-        if not isinstance(collection_id, str) or not collection_id:
-            raise ValueError(
-                'A collection name must be a non-empty string, got '
-                '{0!r}.'.format(collection_id)
-            )
-        if '/' in collection_id:
-            raise ValueError(
-                'Subcollections are not implemented by the in-memory '
-                'Firestore double; pass a single collection name, not '
-                'the path {0!r}.'.format(collection_id)
-            )
+        verify_collection_path(collection_id)
         FakeQuery.__init__(self, client, collection_id)
         self.id = collection_id
 
@@ -1814,6 +2045,46 @@ class FakeTransaction:
     load-bearing: ``app/services/rating.py:submit_rating`` catches
     ``AlreadyExists`` to report a duplicate vote, and would never see it.
     So the rollback is tolerant and idempotent by design.
+
+    CONCURRENCY: WHAT IS MODELLED, AND HOW FAITHFULLY
+    -------------------------------------------------------------------
+    Every read taken through this transaction is RECORDED together with
+    the version of what it observed, and :meth:`_commit` checks each
+    record against committed state before applying anything. If a
+    recorded document has moved on, or a recorded query's result set has
+    changed, the commit is rejected with the real
+    ``google.api_core.exceptions.Aborted`` - so the production retry
+    wrapper reruns the callback for real, and a test can prove that
+    ``fn`` is safe to run more than once instead of asserting that it
+    ought to be.
+
+    The mechanism is optimistic where Firestore's Native-mode Standard
+    edition is pessimistic: a live datastore would have BLOCKED the
+    other writer at read time, whereas an in-memory double driven by one
+    thread has no other writer to block, so the conflict can only be
+    noticed at commit. The modelling choice is deliberate and its limit
+    is worth naming: this double cannot demonstrate lock contention or
+    lock-wait ordering. What it does reproduce is the outcome production
+    code has to survive - ``ABORTED`` at commit, followed by a rerun of
+    the whole callback - which is the only part of contention that
+    reaches the application.
+
+    Interference is INJECTED rather than raced for, through
+    ``FakeFirestoreClient.arm_commit_interference`` (mutate committed
+    state just before the commit's checks run, producing a genuine
+    version conflict) and ``arm_commit_conflict`` (raise ``Aborted``
+    outright). Determinism is the point: a test that had to win a race to
+    exercise the retry path would be a flaky test.
+
+    A READ-ONLY transaction behaves differently, and correctly so. It
+    pins a snapshot of the whole store when it begins and serves every
+    read from that snapshot, so two reads inside it cannot straddle
+    another writer's commit - which is precisely the guarantee
+    ``app/services/rating.py:get_user_reputation`` depends on to return
+    an ``items``/``aggregate`` pair that agree. It takes no locks and
+    holds nothing back, so it has nothing to conflict with, and its
+    commit performs no checks. The real client agrees: it excludes
+    ``Aborted`` from the retryable set when ``read_only`` is set.
     """
 
     def __init__(self, client, max_attempts=MAX_ATTEMPTS, read_only=False):
@@ -1822,7 +2093,8 @@ class FakeTransaction:
         Args:
             client: The owning :class:`FakeFirestoreClient`.
             max_attempts: Attempts the decorator may make.
-            read_only: Refuse writes when ``True``.
+            read_only: Refuse writes, and pin a read snapshot, when
+                ``True``.
         """
         self._client = client
         self._max_attempts = max_attempts
@@ -1830,7 +2102,8 @@ class FakeTransaction:
         self._id = None
         self._writes = []
         self._reads = []
-        self._staged_creates = set()
+        self._snapshot = None
+        self.attempts = 0
 
     @property
     def in_progress(self):
@@ -1842,15 +2115,25 @@ class FakeTransaction:
 
         Called by the decorator before every attempt, which is what makes
         a retry start from an empty staging area rather than replaying
-        the previous attempt's writes.
+        the previous attempt's writes - and from an empty READ record,
+        so a rerun is checked against what it actually re-read rather
+        than against a stale observation from the attempt that failed.
+
+        ``attempts`` deliberately survives: it counts attempts made with
+        this transaction object, which is what a test asserting that a
+        conflict was retried needs to read.
         """
         self._id = None
         self._writes = []
         self._reads = []
-        self._staged_creates = set()
+        self._snapshot = None
 
     def _begin(self, retry_id=None):
         """Open the transaction.
+
+        A read-only transaction pins its read snapshot here, at the
+        instant it begins, which is where the real client fixes its
+        ``read_time``.
 
         Args:
             retry_id: ID of the attempt being retried, carried by the
@@ -1871,9 +2154,16 @@ class FakeTransaction:
         self._id = 'fake-txn-{0}-{1}'.format(
             uuid.uuid4().hex[:12], suffix
         ).encode('ascii')
+        self.attempts += 1
+        if self._read_only:
+            self._snapshot = self._client.snapshot()
 
     def _commit(self):
-        """Apply every staged write atomically, then close.
+        """Check every recorded read, then apply the batch atomically.
+
+        The check and the apply happen in ONE locked step inside
+        :meth:`FakeFirestoreClient.apply`, so a conflict cannot be
+        missed by something committing between the two.
 
         Returns:
             A list of :class:`FakeWriteResult`, one per staged write,
@@ -1881,6 +2171,10 @@ class FakeTransaction:
 
         Raises:
             ValueError: The transaction is not in progress.
+            google.api_core.exceptions.Aborted: Something this
+                transaction read changed before it committed. Nothing is
+                applied, and the production retry wrapper reruns the
+                callback.
             google.api_core.exceptions.AlreadyExists: A staged create
                 collided. Nothing is applied - not the create and not
                 any write staged beside it.
@@ -1891,7 +2185,11 @@ class FakeTransaction:
         if not self.in_progress:
             raise ValueError('Cannot commit an unstarted transaction.')
         staged = list(self._writes)
-        moment = self._client.apply(staged)
+        moment = self._client.apply(
+            staged,
+            expectations=() if self._read_only else tuple(self._reads),
+            transactional=not self._read_only,
+        )
         self._clean_up()
         return [FakeWriteResult(moment) for _ in staged]
 
@@ -1906,12 +2204,16 @@ class FakeTransaction:
         self._clean_up()
 
     def note_read(self, subject):
-        """Record a read and enforce Firestore's read/write ordering.
+        """Enforce Firestore's read-before-write ordering for one read.
 
         Firestore requires every read in a transaction to precede every
         write in it. Enforcing that here turns a rule that would
         otherwise be violated silently - and only discovered against a
         real datastore - into an immediate, named failure.
+
+        This is the ordering gate alone. What was read, and at which
+        version, is recorded by :meth:`read_document` and
+        :meth:`read_query`, which call this first.
 
         Args:
             subject: What is being read, for the error message.
@@ -1933,7 +2235,96 @@ class FakeTransaction:
                     len(self._writes), subject
                 )
             )
-        self._reads.append(subject)
+
+    def _read_snapshot(self):
+        """Return the version-stamped view this read should be served by.
+
+        A read-only transaction reads from the snapshot pinned when it
+        began, so every read inside it describes one instant. A
+        read-write transaction takes a fresh snapshot per read, which is
+        what a live datastore's read-time lock gives it: the body and the
+        version recorded alongside it cannot disagree, even though a
+        later read in the same transaction may see newer data.
+
+        Returns:
+            A ``_StoreSnapshot``.
+        """
+        if self._snapshot is not None:
+            return self._snapshot
+        return self._client.snapshot()
+
+    def read_document(self, reference):
+        """Read one document, recording the version it was observed at.
+
+        The version is what makes the commit able to tell that another
+        writer changed this document in between. A document that does
+        not exist is recorded too, at version ``0`` if it has never
+        existed - so a document CREATED by someone else after this read
+        is a conflict, not an invisible surprise.
+
+        Args:
+            reference: The :class:`FakeDocumentReference` being read.
+
+        Returns:
+            The document body, or ``None`` when it does not exist.
+
+        Raises:
+            ValueError: The read violates the transaction's lifecycle or
+                Firestore's read-before-write ordering.
+            google.api_core.exceptions.InvalidArgument: The datastore
+                would refuse this resource name.
+        """
+        self.note_read(reference.path)
+        require_usable_resource_id(
+            reference.collection_id, reference.id
+        )
+        snapshot = self._read_snapshot()
+        body, version = snapshot.read_versioned(
+            reference.collection_id, reference.id
+        )
+        self._reads.append(
+            _DocumentExpectation(
+                reference.collection_id, reference.id, version
+            )
+        )
+        return body
+
+    def read_query(self, query):
+        """Evaluate a query, recording its result set and their versions.
+
+        Both halves are recorded because a transactional query read
+        covers the RANGE it scanned, not just the documents it happened
+        to return: a document arriving in that range before the commit
+        changes the answer just as much as one of the returned documents
+        changing, and both must therefore abort the commit.
+
+        Args:
+            query: The :class:`FakeQuery` being evaluated.
+
+        Returns:
+            A list of :class:`FakeDocumentSnapshot` in query order.
+
+        Raises:
+            ValueError: The read violates the transaction's lifecycle or
+                Firestore's read-before-write ordering.
+            FailedPrecondition: No index serves the query.
+        """
+        self.note_read(query._describe())
+        snapshot = self._read_snapshot()
+        results = query._evaluate(source=snapshot)
+        self._reads.append(
+            _QueryExpectation(
+                query,
+                tuple(
+                    (
+                        result.id,
+                        snapshot.version(query.collection_id, result.id),
+                    )
+                    for result in results
+                ),
+            )
+        )
+        return results
 
     def get(self, ref_or_query):
         """Read a document or a query through this transaction.
@@ -1967,33 +2358,31 @@ class FakeTransaction:
     def create(self, reference, document_data):
         """Stage a create-only write.
 
-        The collision is detected here, when the write is staged, rather
-        than at commit time as it would be on the wire. The outcome a
-        caller sees is identical - the decorator rolls the transaction
-        back and re-raises, so nothing is written either way - and
-        detecting it early keeps the failure attributable to the create
-        that caused it.
+        Nothing is checked here. The must-not-exist precondition is
+        evaluated at COMMIT time, against the state the batch is applied
+        to, exactly as it is on the wire - and that timing is not a
+        detail. An earlier version of this double refused the create
+        while staging it, by reading committed state at the moment
+        ``create`` was called, and that made the double answer a
+        question production never asks: it could report a collision that
+        a live commit would not have seen, and it could NOT report one
+        that arrived between the staging call and the commit. Two
+        concurrent creates of the same deterministic rating ID are the
+        one-vote-per-transaction rule's whole test case, so the moment
+        the collision is detected has to be the real one.
+
+        Two creates staged for the same document in a single transaction
+        collide for the same reason and in the same place: the first
+        applies, and the second's precondition then fails.
 
         Args:
             reference: Document to create.
             document_data: Body to write.
 
         Raises:
-            google.api_core.exceptions.AlreadyExists: The document
-                already exists, or this transaction already staged a
-                create for it.
+            ValueError: The transaction has not begun, or is read-only.
         """
         self._require_writable()
-        if self._client.exists(reference.collection_id, reference.id):
-            raise AlreadyExists(
-                'Document already exists: {0}'.format(reference.path)
-            )
-        if reference.path in self._staged_creates:
-            raise AlreadyExists(
-                'Document already staged for creation in this '
-                'transaction: {0}'.format(reference.path)
-            )
-        self._staged_creates.add(reference.path)
         self._stage('create', reference, document_data)
 
     def set(self, reference, document_data, merge=False):
@@ -2062,10 +2451,96 @@ class FakeTransaction:
     def __repr__(self):
         """Return a debugging representation of the staging area."""
         return (
-            '<FakeTransaction in_progress={0} reads={1} '
-            'staged_writes={2}>'.format(
-                self.in_progress, len(self._reads), len(self._writes)
+            '<FakeTransaction in_progress={0} read_only={1} '
+            'attempt={2} reads={3} staged_writes={4}>'.format(
+                self.in_progress,
+                self._read_only,
+                self.attempts,
+                len(self._reads),
+                len(self._writes),
             )
+        )
+
+
+class _StoreSnapshot:
+    """An immutable, version-stamped view of the whole store.
+
+    Handed out by :meth:`FakeFirestoreClient.snapshot`. Every
+    transactional read is served by one of these, which is what lets a
+    read and the version recorded beside it describe the same instant -
+    and what gives a read-only transaction its fixed ``read_time``
+    behaviour, so two reads inside it cannot straddle another writer's
+    commit.
+
+    The data is already a private copy, and every accessor copies again
+    on the way out, so a caller cannot reach stored state through it.
+    """
+
+    def __init__(self, data, versions, read_time):
+        """Bind a snapshot over already-copied state.
+
+        Args:
+            data: ``{collection: {document_id: body}}``, privately owned.
+            versions: ``{collection: {document_id: version}}``, likewise.
+            read_time: The instant this view describes.
+        """
+        self._data = data
+        self._versions = versions
+        self.read_time = read_time
+
+    def peek(self, collection_id, document_id):
+        """Return one document body as of this snapshot, or ``None``.
+
+        Args:
+            collection_id: Collection to read.
+            document_id: Document to read.
+
+        Returns:
+            A fresh dict, or ``None``.
+        """
+        body = self._data.get(collection_id, {}).get(document_id)
+        return None if body is None else copy.deepcopy(body)
+
+    def items(self, collection_id):
+        """Return every document in a collection as of this snapshot.
+
+        Args:
+            collection_id: Collection to read.
+
+        Returns:
+            A list of ``(document_id, body)`` pairs in insertion order.
+        """
+        return [
+            (document_id, copy.deepcopy(body))
+            for document_id, body
+            in self._data.get(collection_id, {}).items()
+        ]
+
+    def version(self, collection_id, document_id):
+        """Return the version of one document as of this snapshot.
+
+        Args:
+            collection_id: Collection to read.
+            document_id: Document to read.
+
+        Returns:
+            The version, ``0`` for a document that has never existed.
+        """
+        return self._versions.get(collection_id, {}).get(document_id, 0)
+
+    def read_versioned(self, collection_id, document_id):
+        """Return one document's body and version together.
+
+        Args:
+            collection_id: Collection to read.
+            document_id: Document to read.
+
+        Returns:
+            A ``(body, version)`` pair describing one instant.
+        """
+        return (
+            self.peek(collection_id, document_id),
+            self.version(collection_id, document_id),
         )
 
 
@@ -2074,7 +2549,10 @@ class FakeFirestoreClient:
 
     State is a nested dict, ``{collection: {document_id: body}}``, and
     Python's insertion-ordered dicts give an unordered query a stable,
-    reproducible result order.
+    reproducible result order. Beside it runs a parallel map of
+    per-document VERSION counters, which is what turns "has this changed
+    since it was read" from a question the double cannot answer into one
+    it decides at commit - see :class:`FakeTransaction`.
 
     Every read hands out deep copies and every write stores deep copies,
     so no test can reach into stored state by holding on to a dict it
@@ -2103,6 +2581,22 @@ class FakeFirestoreClient:
             else project
         )
         self._data = {}
+        # Per-document version counters, ``{collection: {id: version}}``.
+        # Monotonic, bumped by every write that touches the document,
+        # and NOT reset by a delete - a document that was read as absent,
+        # created by someone else and then deleted again must still read
+        # as changed, or a transaction that saw the gap would commit over
+        # the top of it. Absent from the mapping means version 0, never
+        # written.
+        self._versions = {}
+        # Transactional commits attempted, for a test that needs to prove
+        # a conflict was retried rather than swallowed.
+        self._commit_attempts = 0
+        # Deterministic interference, armed by a test. See
+        # :meth:`arm_commit_conflict` and
+        # :meth:`arm_commit_interference`.
+        self._armed_conflicts = 0
+        self._armed_interference = []
         self._lock = threading.RLock()
 
     def collection(self, collection_id):
@@ -2165,8 +2659,112 @@ class FakeFirestoreClient:
                 in self._data.get(collection_id, {}).items()
             ]
 
-    def apply(self, writes):
-        """Apply a batch of writes atomically.
+    def version(self, collection_id, document_id):
+        """Return the current version of one document.
+
+        Args:
+            collection_id: Collection to inspect.
+            document_id: Document to inspect.
+
+        Returns:
+            The version, ``0`` for a document that has never been
+            written.
+        """
+        with self._lock:
+            return self._versions.get(
+                collection_id, {}
+            ).get(document_id, 0)
+
+    def read_versioned(self, collection_id, document_id):
+        """Return one document's body and version, read together.
+
+        Args:
+            collection_id: Collection to read.
+            document_id: Document to read.
+
+        Returns:
+            A ``(body, version)`` pair describing one instant.
+        """
+        with self._lock:
+            return (
+                self.peek(collection_id, document_id),
+                self.version(collection_id, document_id),
+            )
+
+    def snapshot(self):
+        """Return an immutable, version-stamped view of the whole store.
+
+        Returns:
+            A ``_StoreSnapshot`` describing this instant.
+        """
+        with self._lock:
+            return _StoreSnapshot(
+                copy.deepcopy(self._data),
+                copy.deepcopy(self._versions),
+                utc_now(),
+            )
+
+    @property
+    def commit_attempts(self):
+        """Return how many transactional commits have been attempted.
+
+        A conflict that the production wrapper retried shows up here as
+        more than one attempt, which is how a test proves the retry
+        happened rather than assuming it.
+        """
+        with self._lock:
+            return self._commit_attempts
+
+    def arm_commit_conflict(self, times=1):
+        """Make the next transactional commits fail with ``Aborted``.
+
+        Injects contention deterministically. A test that had to win a
+        race against another thread to exercise the retry path would be
+        a flaky test; arming the failure makes the same code path
+        reproducible.
+
+        The exception is the real
+        ``google.api_core.exceptions.Aborted``, so the production
+        wrapper's retry logic - which keys on exactly that type - runs
+        unchanged.
+
+        Args:
+            times: How many consecutive transactional commits to fail.
+
+        Returns:
+            This client, so a test can arm and act on one line.
+        """
+        with self._lock:
+            self._armed_conflicts += times
+        return self
+
+    def arm_commit_interference(self, mutate, times=1):
+        """Run ``mutate`` just before the next commits check their reads.
+
+        This is the honest way to prove conflict detection: rather than
+        injecting the exception, the test changes committed state at the
+        one instant that matters, and the double reaches its own verdict.
+        Use it to prove that a transaction which read a document does NOT
+        commit over another writer's change to it.
+
+        The callback runs while the store's lock is held, so it must not
+        block; ``mutate(client)`` is expected to do something small and
+        direct, typically a ``seed``.
+
+        Args:
+            mutate: Callable taking this client.
+            times: How many consecutive transactional commits to
+                interfere with.
+
+        Returns:
+            This client, so a test can arm and act on one line.
+        """
+        with self._lock:
+            self._armed_interference.append([mutate, times])
+        return self
+
+    def apply(self, writes, expectations=(), transactional=False):
+        """Check recorded reads, then apply a batch of writes atomically.
 
         Atomicity is achieved by building the whole next state on a deep
         copy and swapping it in only once every write has succeeded. A
@@ -2174,36 +2772,135 @@ class FakeFirestoreClient:
         visible store exactly as it was, which is what lets a test prove
         that a rolled-back transaction wrote nothing at all.
 
+        The read check runs in the SAME locked step as the writes, so
+        nothing can commit between deciding there is no conflict and
+        acting on that decision.
+
         Every ``SERVER_TIMESTAMP`` in the batch resolves to ONE instant,
         matching Firestore, which stamps a whole commit with a single
         commit time.
 
         Args:
             writes: An iterable of ``_StagedWrite``.
+            expectations: Recorded transactional reads to verify -
+                ``_DocumentExpectation`` and ``_QueryExpectation``
+                values. Empty for a standalone write, which Firestore
+                does not condition on anything either.
+            transactional: This is a transaction's commit rather than a
+                standalone write, so it counts towards
+                :attr:`commit_attempts` and is subject to armed
+                interference.
 
         Returns:
             The instant the batch committed.
 
         Raises:
+            google.api_core.exceptions.Aborted: Something a caller read
+                changed before it committed. Nothing is applied.
             google.api_core.exceptions.AlreadyExists: A create collided.
             google.api_core.exceptions.NotFound: An update addressed a
                 document that does not exist.
+            google.api_core.exceptions.InvalidArgument: A write
+                addressed a resource name the datastore would refuse.
             TypeError: A field carried an unsupported transform.
             ValueError: A write kind is unrecognised.
         """
         with self._lock:
+            if transactional:
+                self._commit_attempts += 1
+                self._run_armed_interference()
+                self._raise_armed_conflict()
+            self._verify_expectations(expectations)
             moment = _server_timestamp()
             working = copy.deepcopy(self._data)
+            versions = copy.deepcopy(self._versions)
             for write in writes:
-                self._apply_one(working, write, moment)
+                self._apply_one(working, versions, write, moment)
             self._data = working
+            self._versions = versions
             return moment
 
-    def _apply_one(self, working, write, moment):
+    def _run_armed_interference(self):
+        """Run any armed interference callback, then retire it."""
+        for entry in list(self._armed_interference):
+            if entry[1] <= 0:
+                self._armed_interference.remove(entry)
+                continue
+            entry[1] -= 1
+            entry[0](self)
+            if entry[1] <= 0:
+                self._armed_interference.remove(entry)
+
+    def _raise_armed_conflict(self):
+        """Raise ``Aborted`` if a conflict has been armed for this commit.
+
+        Raises:
+            google.api_core.exceptions.Aborted: A conflict was armed.
+        """
+        if self._armed_conflicts <= 0:
+            return
+        self._armed_conflicts -= 1
+        raise Aborted(
+            '409 Aborted due to cross-transaction contention '
+            '(injected by arm_commit_conflict, with {0} injection(s) '
+            'remaining).'.format(self._armed_conflicts)
+        )
+
+    def _verify_expectations(self, expectations):
+        """Refuse the batch if anything a caller read has since changed.
+
+        Args:
+            expectations: ``_DocumentExpectation`` and
+                ``_QueryExpectation`` values recorded during the
+                transaction.
+
+        Raises:
+            google.api_core.exceptions.Aborted: A recorded document has
+                moved on, or a recorded query's result set has changed.
+        """
+        for expectation in expectations or ():
+            if isinstance(expectation, _DocumentExpectation):
+                current = self.version(
+                    expectation.collection_id, expectation.document_id
+                )
+                if current == expectation.version:
+                    continue
+                raise Aborted(
+                    '409 Aborted due to cross-transaction contention: '
+                    '{0}/{1} was read at version {2} and is now at '
+                    'version {3}. Nothing was written; the client '
+                    'reruns the callback.'.format(
+                        expectation.collection_id,
+                        expectation.document_id,
+                        expectation.version,
+                        current,
+                    )
+                )
+            query = expectation.query
+            collection_id = query.collection_id
+            current_members = tuple(
+                (result.id, self.version(collection_id, result.id))
+                for result in query._evaluate()
+            )
+            if current_members == expectation.members:
+                continue
+            raise Aborted(
+                '409 Aborted due to cross-transaction contention: the '
+                'result of {0} changed after it was read - {1} became '
+                '{2}. Nothing was written; the client reruns the '
+                'callback.'.format(
+                    query._describe(),
+                    expectation.members,
+                    current_members,
+                )
+            )
+
+    def _apply_one(self, working, versions, write, moment):
         """Apply one write to a working copy of the store.
 
         Args:
             working: Mutable copy of all state.
+            versions: Mutable copy of all version counters.
             write: The ``_StagedWrite`` to apply.
             moment: Instant to resolve ``SERVER_TIMESTAMP`` to.
 
@@ -2211,12 +2908,19 @@ class FakeFirestoreClient:
             google.api_core.exceptions.AlreadyExists: A create collided.
             google.api_core.exceptions.NotFound: An update addressed a
                 document that does not exist.
+            google.api_core.exceptions.InvalidArgument: The resource
+                name is one the datastore would refuse.
             ValueError: The write kind is unrecognised.
         """
+        require_usable_resource_id(
+            write.collection_id, write.document_id
+        )
         collection = working.setdefault(write.collection_id, {})
         path = '{0}/{1}'.format(write.collection_id, write.document_id)
         if write.kind == 'delete':
-            collection.pop(write.document_id, None)
+            if write.document_id in collection:
+                collection.pop(write.document_id)
+                self._bump(versions, write)
             return
         if write.kind == 'create':
             if write.document_id in collection:
@@ -2226,6 +2930,7 @@ class FakeFirestoreClient:
             collection[write.document_id] = _resolve_value(
                 write.data, moment
             )
+            self._bump(versions, write)
             return
         if write.kind == 'set':
             body = _resolve_value(write.data, moment)
@@ -2234,6 +2939,7 @@ class FakeFirestoreClient:
                 existing.update(body)
             else:
                 collection[write.document_id] = body
+            self._bump(versions, write)
             return
         if write.kind == 'update':
             if write.document_id not in collection:
@@ -2244,9 +2950,23 @@ class FakeFirestoreClient:
                 collection[write.document_id],
                 _resolve_value(write.data, moment),
             )
+            self._bump(versions, write)
             return
         raise ValueError(
             'Unrecognised write kind {0!r}.'.format(write.kind)
+        )
+
+    @staticmethod
+    def _bump(versions, write):
+        """Advance one document's version counter by one.
+
+        Args:
+            versions: Mutable copy of all version counters.
+            write: The ``_StagedWrite`` that touched the document.
+        """
+        counters = versions.setdefault(write.collection_id, {})
+        counters[write.document_id] = (
+            counters.get(write.document_id, 0) + 1
         )
 
     def seed(self, collection_id, document_id, body):
@@ -2289,9 +3009,20 @@ class FakeFirestoreClient:
         a client for some other project would otherwise leave that label
         on the shared double and any later assertion about what the
         application requested would read the previous test's value.
+
+        The version counters, the commit tally and any armed interference
+        go with them. Surviving versions would make a fresh test's first
+        read of a reused document ID look like a read of a document that
+        had already changed; a surviving armed conflict would abort an
+        unrelated later test's commit, from a line nobody would think to
+        look at.
         """
         with self._lock:
             self._data = {}
+            self._versions = {}
+            self._commit_attempts = 0
+            self._armed_conflicts = 0
+            self._armed_interference = []
             self.project = REQUIRED_SETTINGS['GOOGLE_CLOUD_PROJECT']
 
     def raw(self):
@@ -2432,8 +3163,12 @@ def rebind_firestore_holders():
     every ``app.db.firestore`` lookup in the process.
 
     Returns:
-        The names of the modules that were rebound, which is empty in the
-        normal case where the double was installed first.
+        A list of ``(module name, module, previous value)`` triples, one
+        per module rebound - empty in the normal case where the double
+        was installed before anything imported ``db``. The previous value
+        travels with the triple so the rebinding is reversible: it is
+        process-global state like any other, and
+        :func:`restore_process_state` puts it back.
     """
     rebound = []
     for name, module in list(sys.modules.items()):
@@ -2446,7 +3181,7 @@ def rebind_firestore_holders():
             current, (REAL_FIRESTORE_CLIENT, FakeFirestoreClient)
         ):
             setattr(module, 'db', fake_db)
-            rebound.append(name)
+            rebound.append((name, module, current))
     return rebound
 
 
@@ -2461,15 +3196,27 @@ def ensure_backend_on_sys_path():
     ``backend/`` under ``python -m pytest`` and to fail from the
     repository root, which is how CI runs it.
 
+    ``sys.path`` is process-global, so the entry is removed again when
+    the session ends - see :func:`restore_process_state`.
+
     Returns:
-        The absolute path to the ``backend`` directory.
+        A ``(backend_dir, restore)`` pair. ``restore`` removes the entry
+        this call inserted, and does nothing when the directory was
+        already importable.
     """
     backend_dir = os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))
     )
-    if backend_dir not in sys.path:
-        sys.path.insert(0, backend_dir)
-    return backend_dir
+    if backend_dir in sys.path:
+        return (backend_dir, lambda: None)
+    sys.path.insert(0, backend_dir)
+
+    def restore():
+        """Remove the entry this call inserted, if it is still there."""
+        while backend_dir in sys.path:
+            sys.path.remove(backend_dir)
+
+    return (backend_dir, restore)
 
 
 def seed_required_settings():
@@ -2734,8 +3481,19 @@ def neutralise_google_credentials():
     :func:`install_firestore_double` - a guard that silently failed to
     take effect is worse than no guard, because it reads as protection.
 
+    The PREVIOUS value of every variable written is returned, in the same
+    shape :func:`seed_required_settings` returns and
+    :func:`restore_seeded_settings` consumes, so the run can hand the
+    process's credential environment back untouched when the session
+    ends. That matters for the same reason the settings are restored:
+    pytest is often embedded in a longer-lived process, and a suite that
+    permanently pointed its host's ``GOOGLE_APPLICATION_CREDENTIALS`` at
+    a file that does not exist would have broken every Google Cloud call
+    made after it - a failure whose cause is nowhere near its symptom.
+
     Returns:
-        The names of the environment variables this call set.
+        A dict mapping every variable this call wrote to its previous
+        value, or to ``None`` where the variable was absent.
 
     Raises:
         RuntimeError: Credentials still resolve, so the process can still
@@ -2747,14 +3505,16 @@ def neutralise_google_credentials():
         'GCE_METADATA_IP': METADATA_IP_GUARD,
         'GCE_METADATA_TIMEOUT': METADATA_TIMEOUT_GUARD,
     }
+    previous = {}
     for name, value in guards.items():
+        previous[name] = os.environ.get(name)
         os.environ[name] = value
     import google.auth
     from google.auth.exceptions import DefaultCredentialsError
     try:
         credentials, project = google.auth.default()
     except DefaultCredentialsError:
-        return sorted(guards)
+        return previous
     raise RuntimeError(
         'Google application default credentials still resolve after '
         'neutralisation, to {0} for project {1!r}. The test suite must '
@@ -2867,22 +3627,32 @@ def install_external_client_doubles():
     such a module is holding a real, credentialed client and every test
     that followed would run against it while appearing to pass.
 
+    What each symbol held BEFORE the replacement is captured, and the
+    returned callable puts it back. In the normal ordering that value is
+    the blocked class :func:`install_google_client_guards` installed a
+    moment earlier, whose own restore reinstates the real class - so the
+    two undos compose, LIFO, back to the state the process started in.
+    Capturing here anyway is deliberate rather than redundant: the two
+    installers read from two separate target constants, and relying on
+    one to clean up after the other would make either list a silent
+    single point of failure the moment they diverge.
+
     Returns:
-        The dotted names of the constructors that were replaced.
+        A callable that restores every replaced attribute.
 
     Raises:
         RuntimeError: A consuming ``app.*`` module was imported before
             this ran.
     """
-    replaced = []
+    restorers = []
     premature = []
     for module_name, attribute, consumer in EXTERNAL_CLIENT_TARGETS:
         if consumer in sys.modules:
             premature.append(consumer)
         module = __import__(module_name, fromlist=[attribute])
         label = '{0}.{1}'.format(module_name, attribute)
+        restorers.append((module, attribute, getattr(module, attribute)))
         setattr(module, attribute, external_client_factory(label))
-        replaced.append(label)
     if premature:
         raise RuntimeError(
             'These modules were imported before the external-client '
@@ -2890,7 +3660,13 @@ def install_external_client_doubles():
             'client: {0}. Ensure nothing imports app.* before '
             'tests/conftest.py runs.'.format(', '.join(premature))
         )
-    return replaced
+
+    def restore():
+        """Put every replaced constructor symbol back."""
+        for module, attribute, original in restorers:
+            setattr(module, attribute, original)
+
+    return restore
 
 
 def install_firestore_double():
@@ -2914,12 +3690,20 @@ def install_firestore_double():
     arrangement exists to prevent - so it is reported as an error instead
     of being quietly repaired.
 
+    Every global this touches is captured on the way in, so the returned
+    callable can hand the process back as it was: the ``Client`` symbol,
+    ``app.db.firestore.db``, and the ``db`` of any module that had to be
+    rebound.
+
     Returns:
-        The shared :class:`FakeFirestoreClient`.
+        A ``(client, restore)`` pair - the shared
+        :class:`FakeFirestoreClient`, and a callable that reverses every
+        replacement this made.
 
     Raises:
         RuntimeError: ``app.db.firestore`` was imported before this ran.
     """
+    original_client = firestore.Client
     firestore.Client = firestore_client_factory
     from app.db import firestore as data_layer
     constructed = data_layer.db
@@ -2932,9 +3716,127 @@ def install_firestore_double():
             'client of type {0}. Every test after this point would run '
             'against a real project. Ensure nothing imports app.* '
             'before tests/conftest.py runs. Modules rebound: '
-            '{1}.'.format(type(constructed).__name__, rebound or 'none')
+            '{1}.'.format(
+                type(constructed).__name__,
+                ', '.join(name for name, _, _ in rebound) or 'none',
+            )
         )
-    return fake_db
+
+    def restore():
+        """Reverse every Firestore replacement this call made."""
+        for _, module, previous in rebound:
+            setattr(module, 'db', previous)
+        data_layer.db = constructed
+        firestore.Client = original_client
+
+    return (fake_db, restore)
+
+
+def capture_app_modules():
+    """Record which ``app.*`` modules are already imported.
+
+    Returns:
+        A frozenset of module names, which is empty in the normal case
+        where the bootstrap runs before anything imports the
+        application.
+    """
+    return frozenset(
+        name for name in list(sys.modules)
+        if name == 'app' or name.startswith('app.')
+    )
+
+
+def purge_app_modules(previous):
+    """Forget every ``app.*`` module this run imported.
+
+    ``sys.modules`` is process-global, and the application modules in it
+    are not ordinary cache entries: each was imported while the Google
+    Cloud constructors were replaced, so ``app.db.firestore.db`` IS the
+    in-memory double and three other modules hold objects that refuse
+    every call. Restoring the constructor symbols does not undo that -
+    a module is executed once, and the client it built at module scope
+    outlives the patch. Leaving those modules behind would hand a
+    longer-lived host process an application wired to a dead test
+    double, from a mutation it never made.
+
+    Dropping the entries is the reversal: the next ``import app.*`` in
+    that process re-executes the module against the restored, real
+    constructors. Modules that were already imported BEFORE the
+    bootstrap are left alone - they are not this run's to remove.
+
+    Args:
+        previous: The frozenset :func:`capture_app_modules` returned.
+
+    Returns:
+        The sorted names of the modules that were forgotten.
+    """
+    doomed = sorted(
+        name for name in list(sys.modules)
+        if (name == 'app' or name.startswith('app.'))
+        and name not in previous
+    )
+    for name in reversed(doomed):
+        sys.modules.pop(name, None)
+    return doomed
+
+
+# Set on this module object once its bootstrap has completed.
+# :func:`refuse_second_bootstrap` looks for it on any OTHER module
+# loaded from this same file.
+BOOTSTRAP_MARKER = '_RATING_SUITE_BOOTSTRAPPED'
+
+
+def refuse_second_bootstrap():
+    """Refuse to run this bootstrap twice in one process.
+
+    A ``conftest.py`` is normally imported once, under the module name
+    pytest derives for it. But nothing stops a test module from
+    importing it a SECOND time under a different name - ``from
+    tests.conftest import verified_buyer`` resolves through the implicit
+    ``tests`` namespace package and produces a whole new module object,
+    with its own class definitions, its own ``fake_db``, and its own run
+    of the bootstrap below. Both failure modes that follow are silent
+    enough to cost hours:
+
+    * the second run captures ``REAL_FIRESTORE_CLIENT`` from an ALREADY
+      PATCHED ``firestore.Client``, so it captures a factory function
+      rather than a class, and ``rebind_firestore_holders`` then dies
+      inside ``isinstance`` with ``arg 2 must be a type or tuple of
+      types`` - an error that names nothing about the actual cause;
+    * and if it got past that, there would be TWO doubles. The
+      application's modules would keep writing to the first while the
+      test asserted against the second, so every "no document was
+      written" assertion would pass without proving anything - the exact
+      class of false green this whole bootstrap exists to prevent.
+
+    So the second import fails immediately, loudly, and with the remedy
+    in the message.
+
+    Raises:
+        RuntimeError: This file has already been imported and
+            bootstrapped under a different module name.
+    """
+    here = os.path.abspath(__file__)
+    for name, module in list(sys.modules.items()):
+        if module is None or name == __name__:
+            continue
+        origin = getattr(module, '__file__', None)
+        if not origin or os.path.abspath(origin) != here:
+            continue
+        if not getattr(module, BOOTSTRAP_MARKER, False):
+            continue
+        raise RuntimeError(
+            'tests/conftest.py is already imported as {0!r} and has '
+            'run its bootstrap. Importing it again as {1!r} would '
+            'build a SECOND in-memory Firestore double, so the '
+            'application would write to one store while assertions '
+            'read the other and every "nothing was written" check '
+            'would pass vacuously. Import the existing module instead '
+            '- "from {0} import ..." - or take the shared double from '
+            'the firestore_double fixture or get_fake_db().'.format(
+                name, __name__
+            )
+        )
 
 
 # Identifiers the builders default to. Each satisfies the document-ID
@@ -3553,6 +4455,9 @@ def reset_firestore_double():
     * The datastore is cleared, so no test can depend on - or be broken
       by - another's writes, and in particular so that two tests may
       write the same deterministic rating ID in sequence.
+    * The version counters, the commit tally and any armed interference
+      go with it - see :meth:`FakeFirestoreClient.reset` for what each
+      would otherwise do to the test that ran next.
     * ``fake_db.project`` is restored by the same call, since
       :func:`firestore_client_factory` records whatever a caller
       constructed with.
@@ -3606,18 +4511,40 @@ def firestore_double():
 def restore_process_state():
     """Leave the process exactly as the run found it.
 
-    The bootstrap below deliberately mutates process-global state - three
-    environment variables' worth of settings plus the emulator guard, two
-    ``socket`` methods, and three class attributes on ``google.cloud``
-    modules - because every one of those has to be in place before the
-    first ``app.*`` import, which happens while this module is still being
-    imported. Mutating globals that early is the only way to be early
-    enough; leaving them mutated afterwards is a separate choice, and the
-    wrong one. pytest is frequently embedded in a longer-lived process
-    (an editor's test runner, a tooling harness), so a suite that
-    permanently rewrote its host's environment, blocked its sockets and
-    stubbed its Google clients would have escaped its own boundary and
-    would silently change the behaviour of whatever ran next.
+    The bootstrap below deliberately mutates process-global state,
+    because every one of those mutations has to be in place before the
+    first ``app.*`` import, which happens while this module is still
+    being imported. Mutating globals that early is the only way to be
+    early enough; leaving them mutated afterwards is a separate choice,
+    and the wrong one. pytest is frequently embedded in a longer-lived
+    process - an editor's test runner, a tooling harness - so a suite
+    that permanently rewrote its host's environment, blocked its
+    sockets, stubbed its Google clients and left its application wired
+    to a dead test double would have escaped its own boundary and would
+    silently change the behaviour of whatever ran next.
+
+    EVERYTHING the bootstrap touches is therefore reversed here, and the
+    list is exhaustive rather than representative:
+
+    * the ``sys.path`` entry that makes ``app`` importable;
+    * the settings environment, including the emulator guard;
+    * the credential and metadata-server environment, whose neutralised
+      ``GOOGLE_APPLICATION_CREDENTIALS`` would otherwise break every
+      Google Cloud call the host process made afterwards;
+    * the two patched ``socket`` methods;
+    * the blocked Vision, Document AI and Cloud Storage classes, and the
+      inert doubles installed over them;
+    * every ``app.*`` module this run imported, each of which holds a
+      client built while the constructors were replaced and so cannot be
+      repaired by restoring the constructors alone;
+    * the ``firestore.Client`` symbol, ``app.db.firestore.db``, and the
+      ``db`` of any module that had to be rebound.
+
+    The undo steps run in reverse of the order they were applied, and
+    every one of them runs even if an earlier one fails - a teardown
+    that gave up half way would leave the process in a state neither the
+    suite nor its host had ever intended. The first failure is re-raised
+    once they have all been attempted, so it is still reported.
 
     Session-scoped and autouse, so it wraps the entire run whatever is
     collected, and the teardown runs even when tests fail.
@@ -3628,9 +4555,14 @@ def restore_process_state():
     try:
         yield
     finally:
-        _restore_google_client_guards()
-        _restore_network_guard()
-        restore_seeded_settings(_SEEDED_SETTINGS)
+        failures = []
+        for undo in reversed(_BOOTSTRAP_UNDO):
+            try:
+                undo()
+            except Exception as error:            # noqa: BLE001
+                failures.append(error)
+        if failures:
+            raise failures[0]
 
 
 # ---------------------------------------------------------------------
@@ -3661,16 +4593,43 @@ def restore_process_state():
 # repository's deployment-contract check for the file: it has no other
 # runtime reader.
 #
-# The undo-capable steps return what is needed to reverse them, and
-# `restore_process_state` above puts the process back when the session
-# ends.
+# EVERY step returns what is needed to reverse it, those reversals are
+# collected in `_BOOTSTRAP_UNDO` in application order, and
+# `restore_process_state` above runs them LIFO when the session ends, so
+# the run leaves no trace on its host. A step that mutates nothing -
+# parsing the index declarations - contributes nothing to undo.
+#
+# The whole sequence is refused outright if this file has already been
+# bootstrapped under another module name: see
+# :func:`refuse_second_bootstrap` for the two silent failures that
+# prevents.
 # ---------------------------------------------------------------------
-ensure_backend_on_sys_path()
+refuse_second_bootstrap()
+_BACKEND_DIR, _restore_sys_path = ensure_backend_on_sys_path()
 DECLARED_COMPOSITE_INDEXES = load_declared_indexes()
 _SEEDED_SETTINGS = seed_required_settings()
-neutralise_google_credentials()
+_CREDENTIAL_GUARDS = neutralise_google_credentials()
 _restore_network_guard = install_network_guard()
 _restore_google_client_guards = install_google_client_guards()
-install_external_client_doubles()
+_restore_external_clients = install_external_client_doubles()
+# Captured immediately before the first app.* import, which happens
+# inside install_firestore_double, so the purge below removes exactly
+# the modules this run brought in.
+_PRE_EXISTING_APP_MODULES = capture_app_modules()
+_INSTALLED_DOUBLE, _restore_firestore_double = install_firestore_double()
 
-install_firestore_double()
+_BOOTSTRAP_UNDO = (
+    _restore_sys_path,
+    lambda: restore_seeded_settings(_SEEDED_SETTINGS),
+    lambda: restore_seeded_settings(_CREDENTIAL_GUARDS),
+    _restore_network_guard,
+    _restore_google_client_guards,
+    _restore_external_clients,
+    lambda: purge_app_modules(_PRE_EXISTING_APP_MODULES),
+    _restore_firestore_double,
+)
+
+# Read by :func:`refuse_second_bootstrap` on any other module loaded
+# from this file. Last, so a bootstrap that failed part way through is
+# not mistaken for a completed one.
+_RATING_SUITE_BOOTSTRAPPED = True

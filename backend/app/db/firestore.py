@@ -209,6 +209,58 @@ def run_in_transaction(fn, *args, **kwargs):
         raise
 
 
+def run_in_read_only_transaction(fn, *args, **kwargs):
+    """Run ``fn`` against ONE pinned snapshot of the datastore.
+
+    The read counterpart of :func:`run_in_transaction`, and it exists for
+    a different reason: not atomicity of writes, but CONSISTENCY of
+    reads. A response assembled from two independent reads can straddle a
+    commit that happened between them, so it can report a count taken
+    after a change beside a list taken before it - not a stale answer but
+    a self-contradictory one. Every read inside ``fn`` observes the same
+    instant, so an envelope built here cannot disagree with itself.
+
+    ``fn`` is invoked as ``fn(transaction, *args, **kwargs)`` exactly as
+    for the write primitive, and every read inside it must go through
+    that transaction - ``ref.get(transaction=transaction)``,
+    ``query.stream(transaction=transaction)`` or
+    ``transaction.get(ref_or_query)`` - because an unenrolled read is
+    simply a separate read at a separate instant, which is the very thing
+    this call exists to prevent.
+
+    The transaction is READ-ONLY, which is a stronger statement than "it
+    happens not to write":
+
+    * a write attempted inside ``fn`` raises rather than committing, so
+      the guarantee cannot be eroded by a later edit that adds one;
+    * Firestore takes no locks for it, so a public read path does not
+      contend with the write paths it runs beside;
+    * and the client's own retry loop does not retry it, because there is
+      no contention verdict to retry - a read-only transaction reads a
+      consistent snapshot instead of competing for one.
+
+    Verified against the pinned client (``google-cloud-firestore==2.13.1``)
+    and a live Firestore emulator: document reads, ``Query.stream`` and
+    ``Transaction.get`` all work through a read-only transaction, and it
+    commits cleanly with no writes staged.
+
+    Args:
+        fn: Callable taking the ``Transaction`` as its first positional
+            argument. It must only read.
+        *args: Additional positional arguments forwarded to ``fn``.
+        **kwargs: Keyword arguments forwarded to ``fn``.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    Raises:
+        ValueError: ``fn`` attempted a write. The transaction is read-only
+            and the client refuses it.
+        Exception: Anything ``fn`` raises propagates unchanged.
+    """
+    return transactional(fn)(db.transaction(read_only=True), *args, **kwargs)
+
+
 async def initialize_db() -> None:
     """Satisfy this module's startup contract, awaited by ``app.main``.
 
@@ -227,12 +279,14 @@ async def initialize_db() -> None:
     ``infrastructure/firestore.indexes.json`` and installed as a
     deployment step, not from application code.
 
-    That separation leaves the declaration file with no runtime reader,
-    which is why the test suite parses it and refuses any query shape it
-    does not declare: index drift then fails a test run instead of
-    surfacing as ``FailedPrecondition`` against a real deployment.
-    ``scripts/deploy.sh`` is where the installation belongs, and it does
-    not currently reach that step - repairing it is out of this feature's
-    scope, so the check is the guarantee that the file stays correct.
+    That separation leaves the declaration file with no runtime reader
+    inside the application, which is why the test suite parses it and
+    refuses any query shape it does not declare: index drift then fails a
+    test run instead of surfacing as ``FailedPrecondition`` against a
+    real deployment. ``scripts/deploy.sh`` is where the installation
+    happens, and it derives one
+    ``gcloud firestore indexes composite create`` invocation per declared
+    index from that same file, so the declaration is both the deployment
+    input and the shape the suite enforces.
     """
     return None

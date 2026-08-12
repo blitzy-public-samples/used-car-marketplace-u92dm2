@@ -1,5 +1,11 @@
 import { VehicleListingSchema } from '../schema/listing';
-import { RatingCreateSchema, type RatingCreate } from '../schema/rating';
+import {
+  RatingCreateSchema,
+  REVIEW_MAX_LENGTH,
+  normalizeReviewText,
+  textLength,
+  type RatingCreate,
+} from '../schema/rating';
 import DOMPurify from 'dompurify';
 
 /**
@@ -75,6 +81,83 @@ export const sanitizeUserInput = (input: string): string => {
 };
 
 /**
+ * One review, prepared: the exact value that will be submitted, and its length.
+ *
+ * Returned by `prepareReviewText`, which is the single place a review is turned
+ * from what somebody typed into what the server will receive.
+ */
+export interface PreparedReview {
+  /**
+   * The prepared review, or `undefined` when nothing was written.
+   *
+   * `undefined` rather than `''` because `review` is OPTIONAL on the wire and the
+   * two say different things: omitting the key states that no review was written,
+   * while a present empty string states that one was written and is blank.
+   */
+  value: string | undefined;
+
+  /**
+   * The prepared review's length in NFC-composed Unicode code points — the figure
+   * a character counter must show, because it is the figure the bound is applied
+   * to on both sides of the boundary.
+   */
+  length: number;
+
+  /** Whether `length` exceeds `REVIEW_MAX_LENGTH`, i.e. the server would refuse it. */
+  isOverLimit: boolean;
+}
+
+/**
+ * Prepare one review once, for the counter, the submit gate AND the payload.
+ *
+ * THE POINT IS THAT THERE IS ONLY ONE OF THESE. The submission path sanitises
+ * before it validates, so the string the schema bounds and the server stores is
+ * the sanitised, normalised one — but the interface used to measure the RAW text
+ * for its character counter and its disabled state. The two therefore disagreed
+ * whenever sanitisation shrank the value, which is exactly what it does to the
+ * text people paste: `<b>Great car</b>` is 17 raw characters and 10 prepared ones,
+ * so a review could be counted over the limit, have its submit button disabled and
+ * be reported as too long while the payload that would actually have been sent was
+ * comfortably inside the bound. The user was blocked by a measurement of a string
+ * that was never going to be transmitted.
+ *
+ * The three steps are the submission path's own, in its order:
+ *
+ *   1. `sanitizeUserInput` — DOMPurify with no tag and no attribute allowed, whose
+ *      result is plain TEXT rather than markup. This is the step the counter was
+ *      missing.
+ *   2. `normalizeReviewText` — the schema's faithful port of the server's
+ *      `as_plain_text` normalisation: NFC composition, CRLF folding, removal of
+ *      control and format characters other than newline and tab, collapsing runs
+ *      of blank lines, and a trim. It is also why no separate `.trim()` is needed
+ *      here or at any call site.
+ *   3. `textLength` — CODE POINTS, not UTF-16 code units, because `String.length`
+ *      is wrong for exactly the text people write: an emoji is one code point
+ *      stored as a surrogate pair, so a `.length` counter would tell someone who
+ *      wrote 1200 emoji they had used 2400 of their 2000 characters.
+ *
+ * It reports rather than refuses. `isOverLimit` is what a form needs in order to
+ * explain the problem while the user is still typing, and refusing here would
+ * force a `try`/`catch` around a keystroke. `validateRatingInput` remains the
+ * authority, and it applies the identical steps to whatever it is handed, so
+ * passing `value` to it is idempotent and the guarantee that no unsanitised text
+ * can reach the wire stays structural rather than a matter of call order.
+ *
+ * @param raw Review text exactly as typed, including the empty string.
+ * @returns The prepared value, its code-point length, and whether it is too long.
+ */
+export const prepareReviewText = (raw: string): PreparedReview => {
+  const prepared = normalizeReviewText(sanitizeUserInput(raw));
+  const length = textLength(prepared);
+
+  return {
+    value: prepared.length > 0 ? prepared : undefined,
+    length,
+    isOverLimit: length > REVIEW_MAX_LENGTH,
+  };
+};
+
+/**
  * Validate one rating submission and return it ready to send.
  *
  * Mirrors the bounds `POST /api/ratings` enforces — a whole-number score within
@@ -97,7 +180,10 @@ export const sanitizeUserInput = (input: string): string => {
  * returned value carries it already passed through `sanitizeUserInput`. Doing
  * that inside this function makes the guarantee structural — no caller can
  * forward an unsanitised review by forgetting a step, and no caller needs to
- * sanitise separately.
+ * sanitise separately. A caller that has already prepared its review with
+ * `prepareReviewText` loses nothing by that: sanitising plain text and normalising
+ * normalised text are both idempotent, so the value it measured is the value that
+ * is validated and sent.
  *
  * SANITISATION RUNS BEFORE VALIDATION, so the bound is applied to the value that
  * is actually returned, sent and stored. Order matters and the previous order was

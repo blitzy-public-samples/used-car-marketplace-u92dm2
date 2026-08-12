@@ -25,8 +25,19 @@ import { RATING_MIN, RATING_MAX } from '../schema/rating';
  * radio group: `role="radiogroup"` with an accessible name, five `role="radio"`
  * children each carrying its own accessible name and `aria-checked`, ARIA
  * Authoring-Practices keyboard semantics, a roving tabindex so the group is a
- * single Tab stop, a visible focus indicator at every position, and a redundant
- * textual echo of the value.
+ * single Tab stop, a visible focus indicator at every position, `aria-required`
+ * with matching visible copy when the owning form makes the score mandatory, and a
+ * redundant textual echo of the value.
+ *
+ * FOCUS CAN BE MOVED IN, BECAUSE A PARENT SOMETIMES HAS TO
+ * -----------------------------------------------------------------------------
+ * The component forwards a ref exposing one method, `focus()`, which lands on the
+ * group's current tab stop. `RatingSubmissionForm` needs it for a case rendering
+ * cannot solve: when its retry succeeds, the button the user was standing on is
+ * removed from the page, and focus would otherwise fall back to the document body,
+ * losing a keyboard user's place entirely (WCAG 2.4.3). Exposing the method here
+ * is what keeps the parent from querying into this component's markup for
+ * `[role="radio"]`, which would couple it to internals it does not own.
  *
  * SELECTION IS NEVER CARRIED BY COLOUR ALONE
  * -----------------------------------------------------------------------------
@@ -93,6 +104,54 @@ interface StarRatingInputProps {
    * `onChange`. Defaults to `false`.
    */
   disabled?: boolean;
+
+  /**
+   * Declares the score mandatory in the form that owns this control. Defaults to
+   * `false`.
+   *
+   * When set, the requirement is expressed TWICE, in the two channels that carry
+   * it independently: `aria-required="true"` on the group, and the word
+   * "(required)" inside the visible label — which is the element the group is
+   * named by, so the accessible name becomes "Your rating (required)" and a screen
+   * reader states the obligation as part of the name rather than only as a
+   * property.
+   *
+   * Both are needed. A sighted user never hears `aria-required`, and WCAG 3.3.2
+   * asks for the instruction to be visible; a screen-reader user benefits from the
+   * attribute because it is announced on entry, before the label is re-read. And a
+   * form whose submit button is simply disabled until a score is chosen explains
+   * nothing about WHY — the requirement has to be stated before the attempt, not
+   * discovered by its absence.
+   *
+   * It is deliberately NOT the native `required` attribute on each option. These
+   * options are `<button role="radio">` rather than `<input type="radio">`, so
+   * `required` neither validates nor announces anything on them, and a native
+   * constraint would additionally invite the browser's own validation bubble into
+   * a form that reports its refusals through its own live region.
+   */
+  required?: boolean;
+}
+
+/**
+ * The imperative surface this control exposes to the form that owns it.
+ *
+ * Deliberately one method. A parent that needs to move focus INTO the group — after
+ * a control it was standing on has been removed from the page, which is the case
+ * `RatingSubmissionForm` has — cannot do it by rendering: focus is not derivable
+ * from state, and querying into another component's DOM for `[role="radio"]` would
+ * couple the parent to markup it does not own.
+ */
+export interface StarRatingInputHandle {
+  /**
+   * Moves focus to the group's single tab stop — the selected option, or the first
+   * option when nothing is selected yet.
+   *
+   * A no-op while the group is disabled, because focusing an inert control is a
+   * dead end for a keyboard user: it reports "not now" and offers nowhere to go.
+   * The caller therefore does not have to know the group's state to call this
+   * safely.
+   */
+  focus: () => void;
 }
 
 /**
@@ -206,12 +265,13 @@ const optionStateClasses = (isFilled: boolean, isDisabled: boolean): string => {
     : 'text-gray-500 hover:text-yellow-800 active:text-yellow-900';
 };
 
-const StarRatingInput: React.FC<StarRatingInputProps> = ({
-  value,
-  onChange,
-  label = 'Rating',
-  disabled = false,
-}) => {
+const StarRatingInput = React.forwardRef<
+  StarRatingInputHandle,
+  StarRatingInputProps
+>(function StarRatingInput(
+  { value, onChange, label = 'Rating', disabled = false, required = false },
+  ref,
+) {
   /**
    * Ties the visible label to the group's `aria-labelledby`. `useId` keeps that
    * association correct when several of these controls share a page — two
@@ -288,6 +348,32 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
     onChange(score);
     optionRefs.current[score - RATING_MIN]?.focus();
   };
+
+  /**
+   * The imperative handle, wired to the same tab stop keyboard navigation uses.
+   *
+   * `activeScore` rather than a fixed first option, so focus lands where the group
+   * says it is: on the selected star once one is chosen, and on the first otherwise.
+   * That is the element carrying `tabIndex={0}`, so a Tab press afterwards leaves
+   * the group from where the user actually is.
+   *
+   * The dependency list is `[disabled, activeScore]` because both are read; React
+   * re-applies the handle when either changes, so a stale closure cannot focus the
+   * wrong option or focus a group that has since been disabled.
+   */
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => {
+        if (disabled) {
+          return;
+        }
+
+        optionRefs.current[activeScore - RATING_MIN]?.focus();
+      },
+    }),
+    [disabled, activeScore],
+  );
 
   /**
    * ARIA Authoring-Practices keyboard semantics for a radio group.
@@ -379,14 +465,47 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
 
   return (
     <div className="flex flex-col gap-2">
+      {/*
+        The visible label, and the group's accessible name via `aria-labelledby`.
+
+        When the score is required the word is INSIDE this element rather than
+        beside it, so it is part of the name the group is announced with — "Your
+        rating (required)" — and a sighted reader sees the same fact. A separate
+        node marked `aria-hidden`, or an asterisk with a legend elsewhere, would
+        split one requirement across two channels that can drift apart.
+
+        The marker is a word rather than a `*`: an asterisk is announced
+        inconsistently across screen readers, means nothing without a key, and is
+        easy to miss at this size. Its colour is not the signal either — the text
+        carries the meaning, so it survives greyscale and colour-blindness.
+
+        The gap is a LITERAL SPACE rather than a margin utility, which is a
+        difference an eye cannot see and a screen reader can: an accessible name is
+        computed by concatenating text nodes, so a margin produced the name "Your
+        rating(required)" — announced as one run-together word — while a real space
+        produces "Your rating (required)". Chrome's accessibility tree was the check
+        that caught it.
+      */}
       <span id={labelId} className="text-base font-semibold text-gray-800">
         {label}
+        {required ? (
+          <>
+            {' '}
+            <span className="font-normal text-gray-600">(required)</span>
+          </>
+        ) : null}
       </span>
 
       <div
         role="radiogroup"
         aria-labelledby={labelId}
         aria-disabled={disabled}
+        /*
+         * Present only when the score is required, because `aria-required="false"`
+         * is not the same statement as its absence to every assistive technology
+         * and there is nothing to gain by asserting the negative.
+         */
+        aria-required={required ? true : undefined}
         className="flex items-center gap-1"
       >
         {SCORES.map((score, index) => {
@@ -446,6 +565,6 @@ const StarRatingInput: React.FC<StarRatingInputProps> = ({
       <p className="text-sm text-gray-600">{scoreEcho}</p>
     </div>
   );
-};
+});
 
 export default StarRatingInput;

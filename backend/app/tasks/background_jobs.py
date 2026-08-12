@@ -2,7 +2,6 @@ import logging
 from typing import List
 from celery import Celery
 from celery.schedules import crontab
-from app.core.config import settings
 from app.db.firestore import db
 from app.services.ai_vision import analyze_vehicle_photo
 from app.services.document_processing import process_maintenance_document
@@ -16,19 +15,32 @@ from app.services.rating import publish_expired_ratings
 
 logger = logging.getLogger(__name__)
 
-# Transport used when no broker is configured. Celery requires a broker URL
-# at construction, and ``CELERY_BROKER_URL`` is an OPTIONAL setting because
-# no broker is provisioned for this deployment. The in-memory transport is
-# enough to DEFINE and import the tasks below, and deliberately not enough
-# to run them anywhere real - which is honest, because nothing in this
-# codebase dispatches a task. The rating feature's correctness does not
-# depend on a worker: its read paths publish opportunistically instead.
-DEFAULT_CELERY_BROKER_URL = 'memory://'
+# The transport this application's tasks are DEFINED against. Celery requires
+# a broker URL at construction, and this one is stated outright rather than
+# read from configuration because there is nothing to configure: no broker is
+# provisioned for this deployment and no task in this codebase is ever
+# dispatched - there is no ``.delay()`` or ``apply_async`` call anywhere.
+#
+# A settings field was briefly introduced for it. That was the wrong shape
+# twice over: the field would have been unset in every environment, so it
+# configured nothing while implying a broker could be chosen, and reading it
+# with a fallback made the transport look negotiable when the deployment has
+# only one answer. Naming the in-memory transport here is the honest form -
+# enough to DEFINE and import the tasks below, and deliberately not enough to
+# run them anywhere real.
+#
+# Nothing is lost by not reading a setting, because Celery already provides
+# the escape hatch: its own ``CELERY_BROKER_URL`` environment variable takes
+# precedence over this argument (verified against the pinned celery 5.3.6), so
+# a deployment that genuinely provisions a broker selects it the standard
+# Celery way without this codebase carrying a configuration field for a
+# capability it does not use.
+#
+# The rating feature's correctness never depends on a worker: its read paths
+# publish an expired rating opportunistically when they encounter one.
+CELERY_BROKER_URL = 'memory://'
 
-celery_app = Celery(
-    'used_car_marketplace',
-    broker=settings.CELERY_BROKER_URL or DEFAULT_CELERY_BROKER_URL,
-)
+celery_app = Celery('used_car_marketplace', broker=CELERY_BROKER_URL)
 
 
 @celery_app.task
@@ -173,9 +185,10 @@ def publish_expired_rating_window() -> int:
     not publish - a transient datastore fault, or a body that cannot be
     proved against its transaction - aborted the whole pass, stranding
     every rating behind it indefinitely. The service's entry point is
-    bounded by ``settings.RATING_SWEEP_SCAN_LIMIT``, walks a cursor so no
-    record starves behind a run of not-yet-due ones, and absorbs a failed
-    record at the severity its cause deserves before continuing.
+    bounded by a ceiling declared beside the query it walks, advances a
+    cursor so every candidate is seen once per pass rather than the same
+    first page being re-read while later records starve, and absorbs a
+    failed record at the severity its cause deserves before continuing.
 
     Correctness does not depend on this task running, and that is
     deliberate: no task in this codebase is ever dispatched, there is no

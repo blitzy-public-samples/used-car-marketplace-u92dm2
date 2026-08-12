@@ -16,14 +16,6 @@
         { "fieldPath": "transaction_id", "order": "ASCENDING" },
         { "fieldPath": "rater_id", "order": "ASCENDING" }
       ]
-    },
-    {
-      "collectionGroup": "ratings",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "is_published", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "ASCENDING" }
-      ]
     }
   ],
   "fieldOverrides": []
