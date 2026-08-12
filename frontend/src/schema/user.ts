@@ -7,7 +7,10 @@ export const UserSchema = z.object({
   lastName: z.string(),
   role: z.string(),
   createdAt: z.date(),
-  updatedAt: z.date()
+  updatedAt: z.date(),
+  isVerified: z.boolean(),
+  ratingAverage: z.number().nullable(),
+  ratingCount: z.number().int()
 });
 
 export type User = z.infer<typeof UserSchema>;

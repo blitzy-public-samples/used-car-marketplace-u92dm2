@@ -70,6 +70,32 @@ python-multipart==0.0.6
 # preferential - see the LOAD-BEARING CONSTRAINT note above.
 pydantic==1.10.13
 
+# Backs the `env_file = ".env"` declaration at app/core/config.py:L21-L23.
+# This is NOT optional tooling - it is the file half of `Settings()`, and its
+# absence is a hard failure rather than a graceful degradation. Measured on
+# CPython 3.9.25 against app/core/config.py:
+#
+#   pydantic 1.10.13 alone, no .env present   -> imports fine, values are read
+#                                                from the process environment
+#   pydantic 1.10.13 alone, .env PRESENT      -> HARD FAILURE:
+#                                                `from app.core.config import
+#                                                settings` raises
+#                                                `ImportError: python-dotenv is
+#                                                not installed, run pip install
+#                                                pydantic[dotenv]` from
+#                                                pydantic/env_settings.py's
+#                                                read_env_file()
+#   pydantic 1.10.13 + python-dotenv 1.0.0    -> .env is parsed, defaults intact
+#
+# A .env file is exactly what the repository's own instructions produce -
+# scripts/setup_environment.sh:L40 runs `cp .env.example .env` and
+# README.md:L48-L49 tells the reader to do the same - so without this pin the
+# documented setup path breaks the application instead of configuring it.
+# 1.0.0 is pinned rather than floated because it satisfies pydantic's own
+# `[dotenv]` extra floor of >=0.10.4, supports Python 3.8+, and resolves
+# cleanly alongside every other pin in this manifest.
+python-dotenv==1.0.0
+
 
 # --- Authentication ----------------------------------------------------------
 
