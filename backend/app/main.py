@@ -1,21 +1,31 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.auth import auth_router
-from app.api.listings import listings_router
-from app.api.transactions import transactions_router
-from app.api.messages import messages_router
+import logging
+# Each api module exports its APIRouter as `router`; alias on import so the
+# names used below stay unchanged. Importing `auth_router` etc. directly raised
+# ImportError: cannot import name 'auth_router' on every start.
+from app.api.auth import router as auth_router
+from app.api.listings import router as listings_router
+from app.api.transactions import router as transactions_router
+from app.api.messages import router as messages_router
 from app.core.config import settings
-from app.db.firestore import initialize_db
-from app.services.ai_vision import initialize_vision_model
-from app.services.document_processing import initialize_document_processor
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 @app.on_event('startup')
 async def startup_event():
-    await initialize_db()
-    await initialize_vision_model()
-    await initialize_document_processor()
+    # HUMAN DECISION RECORDED: initialize_db / initialize_vision_model /
+    # initialize_document_processor were imported and awaited here but are
+    # defined nowhere in the repository. The Firestore client
+    # (app/db/firestore.py) and the Cloud Vision client
+    # (app/services/ai_vision.py) are already constructed at module import, and
+    # app/services/document_processing.py needs no client, so there is no
+    # remaining work for an initializer. The awaits are therefore removed
+    # rather than stubbed. Reinstate real initializers here if lazy or
+    # health-checked startup is wanted.
+    logger.info('startup complete: firestore and vision clients initialised at import')
 
 @app.on_event('shutdown')
 async def shutdown_event():
