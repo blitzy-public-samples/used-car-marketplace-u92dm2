@@ -1268,6 +1268,90 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
     return bool(snapshot.exists)
 
 
+def _reported_publication_state(
+    document_id: str,
+    published_ids: Iterable[str],
+) -> bool:
+    """Report a just-created rating's TRUE visibility to its author.
+
+    "Did this call publish it?" and "is it published?" are different
+    questions, and answering the first while appearing to answer the
+    second is wrong in exactly one situation - the one that matters
+    here. When both counterparties submit at the same instant, one call
+    performs the reveal and the other finds the work already done, so
+    :func:`publish_if_reciprocal` returns nothing to it. Reading that
+    empty result as "unpublished" tells the second author their rating
+    is still hidden while the datastore says otherwise, and the two
+    submissions - identical in every respect that matters - would be
+    answered differently purely on timing.
+
+    So the list is consulted first, because when this call did the
+    publishing no read can add anything, and only otherwise is the
+    stored flag read. That read costs one get-by-ID on a write path,
+    which is the price of the response describing the record rather
+    than describing this call's part in producing it.
+
+    What it reports is the state at the instant it reads, which is the
+    most any response can honestly claim: two exactly simultaneous
+    submissions do not share an instant, so a caller whose reciprocal
+    check ran before the counterparty's rating was visible has nothing
+    to reveal and nothing revealed to find, and ``False`` is correct for
+    it. Publication never reverses, so a ``True`` here stays true.
+
+    NOTHING escapes this function. It runs after the rating has already
+    committed, and the whole point of the deferred publication design is
+    that a failure to REVEAL a rating is never reported as a failure to
+    RECORD it - see :func:`submit_rating`. Raising here would undo that
+    at the last step: the caller would see an error for work that
+    succeeded, retry, and be answered with a duplicate conflict. Every
+    failure therefore degrades to ``False``, which is the safe direction
+    - it under-reports visibility for one response, and the very next
+    read of the rating or of the eligibility decision reports the truth.
+
+    Args:
+        document_id: The rating's deterministic document ID.
+        published_ids: IDs published by this call's reciprocal check.
+
+    Returns:
+        ``True`` when the rating is published, ``False`` when it is not
+        or when its state could not be established.
+    """
+    if document_id in set(published_ids or ()):
+        return True
+    try:
+        snapshot = (
+            db.collection(RATINGS_COLLECTION).document(document_id).get()
+        )
+        if not snapshot.exists:
+            # The rating was committed a moment ago, so this is either a
+            # read served before the write was visible or a foreign
+            # deletion. Neither is a reason to fail the response.
+            return False
+        return _locked_publication_flag(
+            document_id,
+            snapshot.to_dict() or {},
+        )
+    except DEFERRABLE_PUBLICATION_ERRORS as error:
+        # A transient fault, or a stored flag that is not a boolean and
+        # must never be guessed at. Reported at the severity its cause
+        # deserves by the shared helper, exactly as the publication
+        # paths report it.
+        _log_publication_failure(document_id, error)
+        return False
+    except Exception:
+        # Not transient and not a data invariant, so it is a defect in
+        # this module. Recorded with a stack trace and an explicit
+        # marker so it cannot pass for routine deferred work - but still
+        # not raised, because the rating itself is safely recorded.
+        logger.exception(
+            'BUG: unexpected failure while reading the publication '
+            'state of rating %s. The rating is recorded; reporting it '
+            'as unpublished.',
+            document_id,
+        )
+        return False
+
+
 def _submit_transaction_body(
     transaction: firestore.Transaction,
     transaction_id: str,
@@ -1557,8 +1641,12 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
         real UTC timestamp rather than the server-side sentinel that was
         written, because the sentinel is not a serialisable value; the
         authoritative times are whatever the server stamped.
-        ``is_published`` reflects whether the counterparty's rating was
-        already waiting, in which case both went live during this call.
+        ``is_published`` reports the rating's STORED visibility, so it
+        is ``True`` both when this call revealed the pair and when the
+        counterparty's simultaneous call got there first. It degrades to
+        ``False`` rather than raising if that state cannot be
+        established, so a client that needs certainty should read the
+        rating or its eligibility decision back.
 
     Raises:
         RaterNotVerified: The caller's account is not verified (R1).
@@ -1662,7 +1750,15 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
 
     stamped = datetime.now(timezone.utc)
     result = dict(body)
-    result['is_published'] = document_id in published_ids
+    # The STORED state, not this call's contribution to it. Under an
+    # exact reciprocal race the counterparty's call performs the reveal
+    # and this one is handed an empty list, so the list alone would
+    # report a published rating as hidden; see
+    # :func:`_reported_publication_state`, which never raises.
+    result['is_published'] = _reported_publication_state(
+        document_id,
+        published_ids,
+    )
     result['created_at'] = stamped
     result['updated_at'] = stamped
     return Rating(**result)

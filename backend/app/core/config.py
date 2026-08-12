@@ -1,16 +1,56 @@
-from pydantic import BaseSettings, Field, validator
-from typing import List, Optional
+from pydantic import BaseSettings, Field, constr, validator
+from typing import Any, List, Optional
+
+# A required setting whose value must actually be present. Declaring one
+# of these as a bare ``str`` makes it required in NAME only: pydantic
+# accepts the empty string, so an environment that exports the key with
+# nothing after the equals sign starts the application with a setting
+# that is configured and unusable at the same time. That is the worst of
+# the three possible states - a missing key fails loudly at import, a
+# real value works, and a blank one boots and then misbehaves somewhere
+# far away from the cause.
+RequiredSetting = constr(strict=True, min_length=1)
+
+# The JWT signing key, held to a real minimum length rather than merely
+# to being present. This is a security boundary, not tidiness: every
+# access token is signed with this value and
+# ``app/api/auth.py:get_current_user`` resolves whatever ``sub`` a valid
+# token carries into a real user document. With an empty or trivially
+# short key, a token can be forged OFFLINE by anyone - no knowledge of
+# any secret required - and the forged ``sub`` may name a verified user,
+# which defeats the verified-rater gate the rating feature enforces.
+# Failing at import is the only safe response, because there is no later
+# point at which a weak signing key becomes detectable from inside a
+# request.
+#
+# 32 characters is the length ``backend/.env.example`` already publishes
+# for this key, and it matches the 256-bit output of HS256, the
+# algorithm ``ALGORITHM`` below defaults to; a key shorter than the hash
+# it feeds weakens the construction.
+SigningSecret = constr(strict=True, min_length=32)
+
+# Every required setting that must not be blank, named once so the field
+# declarations and the whitespace validator below cannot drift apart.
+BLANK_INTOLERANT_SETTINGS = (
+    'PROJECT_NAME',
+    'API_V1_STR',
+    'SECRET_KEY',
+    'GOOGLE_CLOUD_PROJECT',
+    'GOOGLE_CLOUD_STORAGE_BUCKET',
+    'STRIPE_API_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+)
 
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str
-    API_V1_STR: str
-    SECRET_KEY: str
+    PROJECT_NAME: RequiredSetting
+    API_V1_STR: RequiredSetting
+    SECRET_KEY: SigningSecret
     ACCESS_TOKEN_EXPIRE_MINUTES: int
-    GOOGLE_CLOUD_PROJECT: str
-    GOOGLE_CLOUD_STORAGE_BUCKET: str
-    STRIPE_API_KEY: str
-    STRIPE_WEBHOOK_SECRET: str
+    GOOGLE_CLOUD_PROJECT: RequiredSetting
+    GOOGLE_CLOUD_STORAGE_BUCKET: RequiredSetting
+    STRIPE_API_KEY: RequiredSetting
+    STRIPE_WEBHOOK_SECRET: RequiredSetting
     SENTRY_DSN: Optional[str] = None
     ALGORITHM: str = "HS256"
 
@@ -46,6 +86,47 @@ class Settings(BaseSettings):
     RATING_WINDOW_DAYS: int = Field(14, ge=0, le=365)
 
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+
+    @validator(*BLANK_INTOLERANT_SETTINGS)
+    def required_setting_must_not_be_blank(
+        cls,
+        value: str,
+        field: Any,
+    ) -> str:
+        """Reject a required setting whose value is only whitespace.
+
+        The length constraints on the fields above stop the empty
+        string, and this stops the near-miss that a length alone cannot
+        see: a value of forty spaces satisfies ``min_length=32`` and is
+        no more usable as a signing key than the empty string was, while
+        a tab in place of a project id produces a Firestore client
+        pointed at nothing.
+
+        The value is checked but deliberately NOT trimmed. A secret is
+        compared byte for byte, so silently rewriting one would change
+        the key the application signs with relative to the key the
+        operator configured - and any other service sharing that secret
+        would then disagree about every token. Refusing is honest;
+        rewriting is a surprise.
+
+        Args:
+            value: The configured value, already length-checked.
+            field: The pydantic field being validated, used to name the
+                offending setting in the error.
+
+        Returns:
+            ``value`` unchanged when it carries something real.
+
+        Raises:
+            ValueError: The value is entirely whitespace.
+        """
+        if not value.strip():
+            raise ValueError(
+                '{0} must not be blank: the value is only whitespace, '
+                'which is configured and unusable at the same '
+                'time'.format(field.name)
+            )
+        return value
 
     @validator("RATING_MAX")
     def rating_max_must_not_precede_rating_min(

@@ -35,12 +35,25 @@ REVIEW TEXT IS PLAIN TEXT
 ``review`` carries no markup semantics of any kind. It is normalised to
 plain text server-side before it is persisted - Unicode composed,
 control characters removed, line endings and blank runs collapsed - and
-the length bound is re-applied to the normalised value. Nothing in the
+the length bound is applied to the normalised value. Nothing in the
 stored value may be interpreted as markup by a consumer: every render
 path must output-encode it, which React does by default, and no
 consumer may pass it to ``dangerouslySetInnerHTML`` or an equivalent.
 The client also sanitises before submitting, but that is a convenience;
 this module is the authoritative control.
+
+The review therefore carries TWO bounds, and they are not the same
+bound twice. ``settings.RATING_REVIEW_MAX_LENGTH`` is the semantic
+limit, enforced by ``as_plain_text`` against the normalised text - the
+value that is actually stored, and the value a reader counts.
+``REVIEW_RAW_MAX_LENGTH`` is a much larger ceiling on the raw request
+body, present only so an unbounded string cannot reach the normaliser.
+Collapsing the two, by giving the field a ``max_length`` equal to the
+semantic limit, would quietly make the raw length the binding
+constraint: pydantic v1 evaluates a field length constraint before any
+validator on that field, so decomposed Unicode, zero-width characters,
+CRLF line endings and trailing whitespace would each consume a
+reviewer's allowance even though none of them survives normalisation.
 
 Pydantic v1 semantics apply throughout. ``pydantic==1.10.13`` is pinned
 in ``backend/requirements.txt`` because ``backend/app/core/config.py``
@@ -87,6 +100,47 @@ RatingScore = conint(
 # are legitimate in prose. ``\r`` is not listed because line endings are
 # normalised to ``\n`` first.
 _ALLOWED_CONTROL_CHARACTERS = ('\n', '\t')
+
+# Headroom the RAW submitted review is allowed over the bound that
+# actually applies to it, expressed as a multiple of
+# ``settings.RATING_REVIEW_MAX_LENGTH``.
+#
+# Two bounds govern the review, and they answer different questions.
+# ``as_plain_text`` applies the SEMANTIC bound to the NORMALISED value -
+# the text that is actually persisted and read back - and that is the
+# limit the product means by "2000 characters". The ceiling below is a
+# denial-of-service guard on the raw request body, and nothing more: it
+# stops an unbounded string reaching the normaliser at all.
+#
+# Both are needed, and putting the semantic bound on the raw value
+# instead - which is what a ``max_length`` equal to
+# ``RATING_REVIEW_MAX_LENGTH`` on the field does - silently makes the
+# raw length the binding constraint, because pydantic v1 evaluates a
+# field's length constraint BEFORE any ``@validator`` on that field. The
+# normaliser then never sees a value it could have brought into range,
+# and every one of these legitimate submissions is refused despite
+# normalising to 2000 characters or fewer: text typed on macOS or iOS,
+# which emits decomposed (NFD) Unicode, so each accented letter costs
+# two code points until it is composed; text pasted with trailing
+# whitespace, zero-width characters or CRLF line endings; and text with
+# long runs of blank lines that collapse. A reviewer writing in a
+# diacritic-heavy language would lose roughly half of a stated
+# allowance, and the client's character counter - which counts what the
+# reader sees - would disagree with the server about what "2000
+# characters" means.
+#
+# The factor is 4 because a decomposed character can carry more than one
+# combining mark (Vietnamese, for instance, reaches three code points
+# for one letter), so a raw string up to four times the bound can still
+# normalise into range, while anything beyond that is not prose that got
+# longer in transit - it is a payload.
+REVIEW_RAW_LENGTH_FACTOR = 4
+
+# The raw ceiling itself. Bound at import, from the same setting the
+# semantic limit comes from, so the two can never drift apart.
+REVIEW_RAW_MAX_LENGTH = (
+    REVIEW_RAW_LENGTH_FACTOR * settings.RATING_REVIEW_MAX_LENGTH
+)
 
 
 # A Firestore document ID, validated against the grammar Firestore itself
@@ -260,8 +314,15 @@ def as_plain_text(
     * Text that is empty once normalised becomes ``None``, so "no
       review" is one state rather than two.
 
-    The length bound is re-applied afterwards rather than trusted from
-    before, because normalisation is not guaranteed to shorten a string.
+    The length bound is applied HERE, to the normalised text, and not to
+    the raw input: the normalised value is what gets persisted, read
+    back and counted by a reader, so it is the only value the limit can
+    honestly describe. Normalisation is not guaranteed to shorten a
+    string either, so the check cannot be inferred from the input
+    length in either direction. The raw input carries a separate, far
+    larger ceiling declared on the fields below
+    (``REVIEW_RAW_MAX_LENGTH``), whose only job is to keep an unbounded
+    body away from this function.
 
     The same normalisation serves every field of author-supplied prose
     on a rating - the public review and the moderator's reason - because
@@ -336,9 +397,11 @@ class Rating(BaseModel):
     ratee_id: str
     direction: str
     score: RatingScore
-    review: Optional[str] = Field(
-        None, max_length=settings.RATING_REVIEW_MAX_LENGTH
-    )
+    # ``max_length`` here is the RAW denial-of-service ceiling, not the
+    # review limit. The limit that means "2000 characters" is applied by
+    # ``as_plain_text`` in the validator below, to the normalised text
+    # this field actually stores; see ``REVIEW_RAW_MAX_LENGTH``.
+    review: Optional[str] = Field(None, max_length=REVIEW_RAW_MAX_LENGTH)
     # Created unpublished: under the double-blind model a rating
     # becomes visible only once the counterparty submits theirs or the
     # rating window elapses. The aggregate reflects published ratings
@@ -463,8 +526,11 @@ class RatingCreate(BaseModel):
     These bounds are the authoritative ones - the client-side Zod
     mirror is a convenience, not a substitute. Because Pydantic
     validates the request body before the handler body runs, an
-    out-of-range or non-integer score, or an over-long review, surfaces
-    as a 422 with no handler logic reached at all.
+    out-of-range or non-integer score, or a review that is over-long
+    once normalised, surfaces as a 422 with no handler logic reached at
+    all. "Once normalised" is the operative phrase: the limit is
+    measured on the text that would be stored, so the server and the
+    client's character counter agree about what it means.
 
     Two properties of this model are security properties rather than
     house style, because this is the one place in the feature where a
@@ -493,9 +559,15 @@ class RatingCreate(BaseModel):
 
     transaction_id: DocumentId
     score: RatingScore
-    review: Optional[str] = Field(
-        None, max_length=settings.RATING_REVIEW_MAX_LENGTH
-    )
+    # The RAW ceiling, which exists only to keep an unbounded body away
+    # from the normaliser. The bound the caller is actually held to is
+    # applied to the NORMALISED value by ``as_plain_text`` in the
+    # validator below, so a review that arrives long only because of
+    # decomposed Unicode, zero-width characters, CRLF line endings or
+    # trailing whitespace is accepted when the text itself fits - and
+    # the client's character counter agrees with the server about what
+    # the limit means. See ``REVIEW_RAW_MAX_LENGTH``.
+    review: Optional[str] = Field(None, max_length=REVIEW_RAW_MAX_LENGTH)
 
     class Config:
         # Pydantic's default is to DROP unrecognised keys silently,
