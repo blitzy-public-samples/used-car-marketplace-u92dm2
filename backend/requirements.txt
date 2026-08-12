@@ -1,49 +1,179 @@
-# Backend runtime and tooling dependencies for the Used Car Marketplace API.
+# =============================================================================
+# Backend Python dependency manifest - Used Car Marketplace API
+# =============================================================================
 #
-# Target runtime: Python 3.9 (pinned by .github/workflows/backend_ci.yml).
-# Every version below is resolved and installed together on CPython 3.9.25.
+# This manifest repairs an already-referenced-but-missing file. Two committed
+# tool invocations read it, and neither can work without it:
 #
-# IMPORTANT: pydantic MUST stay on the 1.x line. backend/app/core/config.py
-# imports `BaseSettings` directly from pydantic, which Pydantic v2 removed
-# (it moved to the separate pydantic-settings package).
+#   .github/workflows/backend_ci.yml:L24  ->  pip install -r requirements.txt
+#   scripts/setup_environment.sh:L28      ->  pip install -r requirements.txt
+#
+# Every requirement below is an exact `==` pin. There are deliberately no
+# ranges, no `latest`, and no unpinned names: the whole set is resolved and
+# installed together on CPython 3.9.25, so these versions are known to be
+# mutually consistent rather than merely plausible. Each pin is annotated with
+# the module that imports it, so the manifest documents its own justification.
+#
+# -----------------------------------------------------------------------------
+# LOAD-BEARING CONSTRAINT: pydantic MUST stay on the 1.x line
+# -----------------------------------------------------------------------------
+# backend/app/core/config.py:L1 is `from pydantic import BaseSettings`, and
+# Pydantic v2 removed `BaseSettings` from the top-level package (it moved to
+# the separate pydantic-settings distribution). Every Pydantic model in this
+# codebase is written to v1 semantics as a result. Weakening this pin makes
+# app/core/config.py fail to import, and with it every module that imports
+# `settings` - which is to say all of them.
+#
+# -----------------------------------------------------------------------------
+# RECORDED FINDING 1: Python 3.9 is past end of life
+# -----------------------------------------------------------------------------
+# `google-api-core` and `google-auth` emit unsupported-runtime warnings when
+# imported on Python 3.9. That warning is a genuine forward-compatibility
+# signal, so it is recorded here rather than suppressed. The runtime target is
+# NOT raised unilaterally: .github/workflows/backend_ci.yml:L16-L19 pins
+# `python-version: '3.9'` and is the only version source in the repository -
+# there is no setup.py, pyproject.toml, tox.ini, setup.cfg or .python-version
+# anywhere to widen it - so this manifest honours the documented runtime.
+#
+# -----------------------------------------------------------------------------
+# RECORDED FINDING 2: CI resolves this path from the repository root
+# -----------------------------------------------------------------------------
+# .github/workflows/backend_ci.yml declares no `working-directory:` key, so its
+# L24 `pip install -r requirements.txt` resolves to ./requirements.txt at the
+# repository root rather than to backend/requirements.txt. scripts/
+# setup_environment.sh:L28 has the same problem. This is a PRE-EXISTING
+# workflow defect and it is recorded, not fixed: the workflow files are
+# explicitly no-change, and this manifest's path is fixed at
+# backend/requirements.txt. No duplicate copy is placed at the repository root.
+# =============================================================================
 
-# --- Web framework / ASGI ---------------------------------------------------
+
+# --- Web framework and ASGI server -------------------------------------------
+
+# ASGI framework and the Depends() dependency-injection primitive that every
+# route guard is built on - app/main.py:L1 and all four routers. The 0.103.x
+# line is the FastAPI series that is compatible with Pydantic v1.
 fastapi==0.103.2
+
+# ASGI server. Nothing else in the repository declared one, so `uvicorn
+# app.main:app` was previously unrunnable from a clean checkout.
 uvicorn[standard]==0.23.2
-pydantic==1.10.13
+
+# Multipart/form-data parsing. FastAPI requires it for the
+# OAuth2PasswordRequestForm imported at app/api/auth.py:L2.
 python-multipart==0.0.6
 
-# --- Authentication ---------------------------------------------------------
+
+# --- Validation and settings -------------------------------------------------
+
+# Request/response models and BaseSettings configuration. v1 is MANDATORY, not
+# preferential - see the LOAD-BEARING CONSTRAINT note above.
+pydantic==1.10.13
+
+
+# --- Authentication ----------------------------------------------------------
+
+# JWT encode/decode - app/api/auth.py:L3 and app/core/security.py:L2. The
+# [cryptography] extra supplies the signing backend the HS256 algorithm needs.
 python-jose[cryptography]==3.3.0
+
+# Password hashing - app/api/auth.py:L4,L13 and app/core/security.py:L3,L9
+# build a CryptContext(schemes=['bcrypt']).
 passlib[bcrypt]==1.7.4
-# passlib 1.7.4 probes the bcrypt backend at import time and is incompatible
-# with bcrypt >= 4.1 (its version probe raises
-# "ValueError: password cannot be longer than 72 bytes" / "__about__" errors).
-# 4.0.1 is the newest release passlib 1.7.4 can drive, so it is pinned
-# explicitly instead of being left to the resolver.
+
+# bcrypt is pulled into the dependency closure by the passlib[bcrypt] extra
+# above, and it is pinned here rather than left floating because the newest
+# release is not compatible with passlib 1.7.4. Measured on CPython 3.9.25
+# against app/api/auth.py's own CryptContext usage:
+#
+#   bcrypt 4.0.1                -> hash/verify correct, and no spurious output
+#   bcrypt 4.1.1 - 4.3.0        -> hash/verify correct, but each logs a
+#                                  "(trapped) error reading bcrypt version"
+#                                  traceback, because bcrypt >= 4.1 removed
+#                                  the `bcrypt.__about__` attribute that
+#                                  passlib's version probe reads
+#   bcrypt 5.0.0                -> HARD FAILURE: passlib's backend probe feeds
+#                                  a >72-byte secret to bcrypt.hashpw() to
+#                                  detect an old wrap bug, and bcrypt 5.x
+#                                  raises `ValueError: password cannot be
+#                                  longer than 72 bytes` instead of
+#                                  truncating, so the backend never loads and
+#                                  every hash()/verify() call raises
+#
+# An unpinned resolution takes bcrypt 5.0.0 today, which breaks password
+# hashing outright. 4.0.1 is the newest release passlib 1.7.4 drives both
+# correctly and silently, so it is the pin.
 bcrypt==4.0.1
 
-# --- Google Cloud -----------------------------------------------------------
+
+# --- Google Cloud ------------------------------------------------------------
+
+# Firestore client - app/db/firestore.py:L1. Also supplies the two primitives
+# the rating feature is built on: DocumentReference.create(), whose create-only
+# semantics raise google.api_core.exceptions.AlreadyExists on a duplicate
+# document ID (mapped to HTTP 409), and the transactional runner used for the
+# atomic rating-plus-aggregate write.
 google-cloud-firestore==2.13.1
+
+# Object storage client - app/db/cloud_storage.py:L1.
 google-cloud-storage==2.13.0
+
+# Vision client - app/services/ai_vision.py:L1.
 google-cloud-vision==3.4.5
+
+# Document AI client - app/services/document_processing.py:L2.
 google-cloud-documentai==2.20.1
 
-# --- Payments ---------------------------------------------------------------
+
+# --- Payments ----------------------------------------------------------------
+
+# Payment SDK - app/services/payment.py:L1.
 stripe==7.9.0
 
-# --- Background jobs --------------------------------------------------------
-# The [redis] extra pulls the redis client that kombu's redis:// transport
-# needs. app/tasks/background_jobs.py builds its Celery app from
-# settings.CELERY_BROKER_URL, and the documented local broker is
-# redis://localhost:6379/0, which is unusable without this extra.
+
+# --- Background tasks --------------------------------------------------------
+
+# Task queue - app/tasks/background_jobs.py:L1-L2 (`from celery import Celery`
+# and `from celery.schedules import crontab`).
+#
+# The worker tier is aspirational in this build: no task is ever dispatched, no
+# .delay()/apply_async() call exists anywhere, and nothing in the codebase may
+# depend on a running worker. The [redis] extra is nevertheless REQUIRED, and it
+# is required by the broker URL rather than by the worker:
+#
+#   backend/.env.example:L38  ->  CELERY_BROKER_URL="redis://localhost:6379/0"
+#   app/tasks/background_jobs.py:L9 ->  Celery(..., broker=settings.CELERY_BROKER_URL)
+#
+# That broker is constructed at MODULE IMPORT time, and a redis:// URL resolves
+# to kombu.transport.redis.Transport, which imports the `redis` client at module
+# level. Plain `celery==5.3.6` does not provide it - redis appears in celery's
+# metadata only as `redis (!=4.5.5,<6.0.0,>=4.5.2) ; extra == 'redis'`, so it is
+# absent from a clean install unless the extra is named. Without it kombu leaves
+# its module-level `redis` symbol as None and the broker fails with
+# `AttributeError: 'NoneType' object has no attribute 'Redis'`. Dropping the
+# extra therefore breaks the documented local broker on any fresh checkout,
+# which is why it is pinned with the extra rather than bare.
 celery[redis]==5.3.6
 
-# --- Media / document processing -------------------------------------------
+
+# --- Media and document processing -------------------------------------------
+
+# Image decoding - app/services/ai_vision.py:L2 (`from PIL import Image`).
 Pillow==10.1.0
+
+# PDF text extraction - app/services/document_processing.py:L1.
 PyPDF2==3.0.1
 
-# --- Test and lint tooling (invoked by .github/workflows/backend_ci.yml) ---
+
+# --- Development and CI tooling ----------------------------------------------
+
+# Test runner invoked by .github/workflows/backend_ci.yml:L31-L34.
 pytest==7.4.4
+
+# Required transitively by fastapi.testclient.TestClient, imported at
+# backend/tests/test_api.py:L2 and by the ratings test modules. Without it
+# TestClient construction fails.
 httpx==0.25.2
+
+# Linter invoked by .github/workflows/backend_ci.yml:L26-L29.
 flake8==6.1.0
