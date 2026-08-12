@@ -27,14 +27,35 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
     if current_user.role != 'seller':
         raise HTTPException(status_code=403, detail="Only sellers can create listings")
 
-    # Analyze vehicle photos using AI vision service
-    photo_analysis = await analyze_vehicle_photo(listing.photos)
+    # One correlation id is generated per request and shared by every log line
+    # below, so a single failing listing can be traced across both the photo
+    # and the maintenance loop.
+    correlation_id = str(uuid.uuid4())
+
+    # Analyze vehicle photos. analyze_vehicle_photo is synchronous and accepts
+    # ONE image payload as bytes, so it is called without await, once per
+    # photo, with each entry normalised to bytes exactly as the maintenance
+    # loop below does. The previous
+    # `await analyze_vehicle_photo(listing.photos)` raised TypeError: object
+    # dict can't be used in 'await' expression on every request -- including
+    # with no photos at all -- so no listing could ever be created. Each call
+    # is guarded because the vision pipeline can still fail per photo, and a
+    # degraded analysis must never become a 500 for the seller.
+    photo_analysis = []
+    for photo in listing.photos:
+        payload = photo.encode('utf-8') if isinstance(photo, str) else photo
+        try:
+            photo_analysis.append(analyze_vehicle_photo(payload))
+        except Exception:
+            logger.exception(
+                "photo analysis failed",
+                extra={"correlation_id": correlation_id},
+            )
 
     # Process maintenance documents per record. process_maintenance_document is
     # synchronous, so it is called without await, and failures are handled here.
     # The record count and aggregate content size are bounded, and each content
     # value must be non-empty bytes-like after string encoding.
-    correlation_id = str(uuid.uuid4())
     records = listing.maintenance_records
     if len(records) > _MAX_MAINTENANCE_RECORDS:
         logger.warning(
