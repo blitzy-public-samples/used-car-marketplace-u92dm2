@@ -1,8 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.schema.transaction import Transaction
+from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
 from app.services.payment import process_payment
+
+# process_payment validates its currency argument against a fixed allow-list
+# and Transaction carries no currency field, so the value is named here rather
+# than buried in the call as a bare literal.
+_DEFAULT_CURRENCY = 'usd'
 
 router = APIRouter()
 
@@ -15,14 +21,27 @@ async def create_transaction(transaction: Transaction, current_user: User = Depe
         raise HTTPException(status_code=403, detail="You are not authorized to create this transaction")
 
     # Check if the vehicle listing is still available
-    vehicle_ref = db.collection('vehicles').document(transaction.vehicle_id)
+    # Transaction declares no vehicle_id; the listing reference field is
+    # vehicle_listing_id, so the old read raised AttributeError every request.
+    vehicle_ref = db.collection('vehicles').document(transaction.vehicle_listing_id)
     vehicle = vehicle_ref.get()
     if not vehicle.exists or vehicle.to_dict().get('status') != 'available':
         raise HTTPException(status_code=400, detail="Vehicle is not available for purchase")
 
     # Process the payment using the payment service
-    payment_result = await process_payment(transaction.amount, transaction.payment_method)
-    if not payment_result.success:
+    # process_payment is synchronous and takes (token, amount, currency). It
+    # was awaited with only two arguments, one of them payment_method, which is
+    # not a Transaction field at all, so the call raised AttributeError then
+    # TypeError before any payment could run. stripe_payment_intent_id is the
+    # only Stripe-credential-shaped field the schema declares.
+    payment_result = process_payment(
+        transaction.stripe_payment_intent_id,
+        transaction.amount,
+        _DEFAULT_CURRENCY,
+    )
+    # process_payment returns a plain dict, never an object with .success, and
+    # .get keeps a malformed result a payment failure rather than a KeyError.
+    if not payment_result.get('success'):
         raise HTTPException(status_code=400, detail="Payment processing failed")
 
     # Create a new transaction document in the database

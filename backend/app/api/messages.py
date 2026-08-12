@@ -1,8 +1,27 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
+# The SERVER_TIMESTAMP sentinel that send_message writes lives on the Google
+# Cloud package, not on this project's own app.db.firestore module -- that one
+# supplies the `db` client imported below. It was used here without ever being
+# imported, so this module raised NameError the moment it was imported and no
+# router could be mounted: the whole backend failed to boot.
+from google.cloud import firestore
 from app.schema.message import Message
+# `User` annotates the current_user parameter of both handlers, and Python
+# evaluates annotations when the `def` executes, so the absent import was
+# an import-time NameError, not a deferred one. Mirrors app/api/listings.py.
+from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
+
+# Both routes below are reachable again, but two pre-existing defects inside
+# their bodies still keep them non-functional: send_message returns the
+# SERVER_TIMESTAMP sentinel, which the response encoder cannot serialize, and
+# the persisted document already carries an `id` key, so get_messages' two
+# Message(**msg.to_dict(), id=msg.id) hydrations raise TypeError once any
+# message exists. Both are recorded for authorization in
+# documentation/ONBOARDING.md; repairing them means changing route logic that
+# this import-only fix is not scoped to touch.
 
 router = APIRouter()
 
