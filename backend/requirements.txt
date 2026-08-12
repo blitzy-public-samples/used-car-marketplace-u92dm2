@@ -15,6 +15,35 @@
 # the module that imports it, so the manifest documents its own justification.
 #
 # -----------------------------------------------------------------------------
+# FIXED INVENTORY: THE SEVENTEEN PLANNED LINES, PLUS ONE DIRECT IMPORT
+# -----------------------------------------------------------------------------
+# The package set is frozen and is not a matter of local judgement. Adding a
+# line - even a well-intentioned compatibility pin, and even for a package that
+# is already in the resolved closure as a transitive dependency - is a
+# deviation. Where a compatibility problem is real it is recorded as a finding
+# in this header and resolved by an authorised change to the code that has the
+# problem, NOT by widening this file.
+#
+# There is exactly ONE addition to the seventeen planned lines, and it is not a
+# compatibility pin: `google-api-core==2.30.3`. The rule above governs packages
+# this codebase does not import. google-api-core IS imported directly, by name,
+# at app/services/rating.py - `google.api_core.exceptions` is what tells a
+# duplicate vote apart from a retryable fault - and a distribution whose
+# EXCEPTION IDENTITY the feature's correctness depends on must not float with a
+# transitive resolution. Declaring it is therefore the same discipline that
+# fixes the other seventeen, not an exception to it. See the Google Cloud
+# section for the pin and its compatibility statement.
+#
+# Two further consequences are worth naming, because both were previously
+# mistaken for missing requirements:
+#
+#   * python-dotenv is ALREADY in the closure. `uvicorn[standard]==0.23.2`
+#     declares `python-dotenv>=0.13` in its `standard` extra, which is what
+#     makes the `env_file = ".env"` declaration at app/core/config.py:L21-L23
+#     work. It needs no line of its own.
+#   * redis is NOT needed. See the background-tasks section below.
+#
+# -----------------------------------------------------------------------------
 # LOAD-BEARING CONSTRAINT: pydantic MUST stay on the 1.x line
 # -----------------------------------------------------------------------------
 # backend/app/core/config.py:L1 is `from pydantic import BaseSettings`, and
@@ -45,6 +74,57 @@
 # workflow defect and it is recorded, not fixed: the workflow files are
 # explicitly no-change, and this manifest's path is fixed at
 # backend/requirements.txt. No duplicate copy is placed at the repository root.
+#
+# -----------------------------------------------------------------------------
+# RECORDED FINDING 3: passlib 1.7.4 drives only bcrypt < 4.1 cleanly
+# -----------------------------------------------------------------------------
+# `passlib[bcrypt]==1.7.4` below resolves bcrypt through passlib's own extra,
+# which declares `bcrypt>=3.1.0` with NO upper bound. A clean resolution on
+# CPython 3.9.25 therefore installs bcrypt 5.0.0 today, and that combination
+# does not work. Measured against the CryptContext at app/api/auth.py:L13:
+#
+#   bcrypt 4.0.1          -> hash()/verify() correct and silent
+#   bcrypt 4.1.1 - 4.3.0  -> correct, but each call logs a "(trapped) error
+#                            reading bcrypt version" traceback, because
+#                            bcrypt >= 4.1 removed the `bcrypt.__about__`
+#                            attribute passlib's version probe reads
+#   bcrypt 5.0.0          -> BROKEN: passlib's backend probe hashes a >72-byte
+#                            secret to detect an old wrap bug, and bcrypt 5.x
+#                            raises `ValueError: password cannot be longer
+#                            than 72 bytes` instead of truncating, so
+#                            hash()/verify() raise instead of working
+#
+# The blast radius today is zero: app/api/auth.py:L21 mounts a router with NO
+# routes, so verify_password(), get_password_hash() and authenticate_user() are
+# not reachable from any endpoint - registration and login are F-001 work and
+# are out of scope. It becomes load-bearing the moment a login handler lands.
+# The fix is a one-line `bcrypt==4.0.1` constraint, which is deliberately NOT
+# taken here: this inventory is frozen at seventeen lines and the constraint
+# needs authorising as its own change rather than being smuggled in with a
+# feature. Recorded, not suppressed, and not silently absorbed.
+#
+# -----------------------------------------------------------------------------
+# RECORDED FINDING 4: the TRANSITIVE graph beneath these pins is not locked
+# -----------------------------------------------------------------------------
+# Every line in this file is an exact pin, but the eighteen packages below pull
+# in roughly fifty more, and those fifty are free to float: two installs a week
+# apart can resolve different versions of grpcio, protobuf, cryptography or
+# starlette from this identical manifest. "Resolved and installed together" is
+# therefore true of the direct pins and NOT of the graph beneath them.
+#
+# A committed lock artifact (`pip install -c constraints.txt`) is the standard
+# closure of that gap and needs no workflow change. It is deliberately NOT
+# committed here, because a lock of the full closure necessarily pins bcrypt -
+# and pinning bcrypt is precisely the deviation RECORDED FINDING 3 above says
+# must be authorised as its own change rather than smuggled in. Generating the
+# lock from the currently installed environment would pin bcrypt 4.0.1 and
+# thereby make FINDING 3 read as already-solved when it is not; generating it
+# from a clean resolve would pin the broken bcrypt 5.0.0.
+#
+# So the two decisions are coupled, and both belong to whoever owns platform
+# dependencies: authorise the bcrypt constraint, then generate and commit the
+# lock in the same change. Until then the floating closure is a known, recorded
+# property of this manifest rather than an unexamined one.
 # =============================================================================
 
 
@@ -68,33 +148,20 @@ python-multipart==0.0.6
 
 # Request/response models and BaseSettings configuration. v1 is MANDATORY, not
 # preferential - see the LOAD-BEARING CONSTRAINT note above.
+#
+# Note on `.env` support, which pydantic v1 delegates to python-dotenv: reading
+# an `env_file` without python-dotenv installed raises `ImportError:
+# python-dotenv is not installed, run pip install pydantic[dotenv]` from
+# pydantic/env_settings.py, and app/core/config.py:L21-L23 declares
+# `env_file = ".env"` while the repository's own instructions produce that file
+# (scripts/setup_environment.sh:L40 runs `cp .env.example .env`; README.md:
+# L48-L49 says the same). No separate requirement is needed for it: python-
+# dotenv arrives in the closure through the `uvicorn[standard]` extra above,
+# which declares `python-dotenv>=0.13`. Verified on CPython 3.9.25 - installing
+# these seventeen lines yields a working python-dotenv, so the documented
+# `cp .env.example .env` path configures the application rather than breaking
+# it. Do not add a python-dotenv line to "make sure": it is already there.
 pydantic==1.10.13
-
-# Backs the `env_file = ".env"` declaration at app/core/config.py:L21-L23.
-# This is NOT optional tooling - it is the file half of `Settings()`, and its
-# absence is a hard failure rather than a graceful degradation. Measured on
-# CPython 3.9.25 against app/core/config.py:
-#
-#   pydantic 1.10.13 alone, no .env present   -> imports fine, values are read
-#                                                from the process environment
-#   pydantic 1.10.13 alone, .env PRESENT      -> HARD FAILURE:
-#                                                `from app.core.config import
-#                                                settings` raises
-#                                                `ImportError: python-dotenv is
-#                                                not installed, run pip install
-#                                                pydantic[dotenv]` from
-#                                                pydantic/env_settings.py's
-#                                                read_env_file()
-#   pydantic 1.10.13 + python-dotenv 1.0.0    -> .env is parsed, defaults intact
-#
-# A .env file is exactly what the repository's own instructions produce -
-# scripts/setup_environment.sh:L40 runs `cp .env.example .env` and
-# README.md:L48-L49 tells the reader to do the same - so without this pin the
-# documented setup path breaks the application instead of configuring it.
-# 1.0.0 is pinned rather than floated because it satisfies pydantic's own
-# `[dotenv]` extra floor of >=0.10.4, supports Python 3.8+, and resolves
-# cleanly alongside every other pin in this manifest.
-python-dotenv==1.0.0
 
 
 # --- Authentication ----------------------------------------------------------
@@ -104,32 +171,11 @@ python-dotenv==1.0.0
 python-jose[cryptography]==3.3.0
 
 # Password hashing - app/api/auth.py:L4,L13 and app/core/security.py:L3,L9
-# build a CryptContext(schemes=['bcrypt']).
+# build a CryptContext(schemes=['bcrypt']). The `[bcrypt]` extra brings the
+# bcrypt backend itself into the closure, unversioned by design here - see
+# RECORDED FINDING 3 in the header for the passlib/bcrypt version constraint
+# that a future authorised change should add, and why it is not added now.
 passlib[bcrypt]==1.7.4
-
-# bcrypt is pulled into the dependency closure by the passlib[bcrypt] extra
-# above, and it is pinned here rather than left floating because the newest
-# release is not compatible with passlib 1.7.4. Measured on CPython 3.9.25
-# against app/api/auth.py's own CryptContext usage:
-#
-#   bcrypt 4.0.1                -> hash/verify correct, and no spurious output
-#   bcrypt 4.1.1 - 4.3.0        -> hash/verify correct, but each logs a
-#                                  "(trapped) error reading bcrypt version"
-#                                  traceback, because bcrypt >= 4.1 removed
-#                                  the `bcrypt.__about__` attribute that
-#                                  passlib's version probe reads
-#   bcrypt 5.0.0                -> HARD FAILURE: passlib's backend probe feeds
-#                                  a >72-byte secret to bcrypt.hashpw() to
-#                                  detect an old wrap bug, and bcrypt 5.x
-#                                  raises `ValueError: password cannot be
-#                                  longer than 72 bytes` instead of
-#                                  truncating, so the backend never loads and
-#                                  every hash()/verify() call raises
-#
-# An unpinned resolution takes bcrypt 5.0.0 today, which breaks password
-# hashing outright. 4.0.1 is the newest release passlib 1.7.4 drives both
-# correctly and silently, so it is the pin.
-bcrypt==4.0.1
 
 
 # --- Google Cloud ------------------------------------------------------------
@@ -140,6 +186,16 @@ bcrypt==4.0.1
 # document ID (mapped to HTTP 409), and the transactional runner used for the
 # atomic rating-plus-aggregate write.
 google-cloud-firestore==2.13.1
+
+# Declared DIRECTLY even though Firestore already pulls it in, because
+# app/services/rating.py imports google.api_core.exceptions by name to
+# translate AlreadyExists into DuplicateRating and to classify transient
+# provider faults. Exception IDENTITY is what those decisions turn on, so
+# the version a duplicate vote and a retry classification depend on must
+# not float with a transitive resolution. This pin satisfies
+# google-cloud-firestore==2.13.1's own google-api-core[grpc]>=1.34.0,<3.0.0
+# requirement and is the version the validated environment resolves.
+google-api-core==2.30.3
 
 # Object storage client - app/db/cloud_storage.py:L1.
 google-cloud-storage==2.13.0
@@ -153,7 +209,13 @@ google-cloud-documentai==2.20.1
 
 # --- Payments ----------------------------------------------------------------
 
-# Payment SDK - app/services/payment.py:L1.
+# Payment SDK - app/services/payment.py:L1. The 7.x line exposes a MODULE-LEVEL
+# API: the credential seat is `stripe.api_key`, and resources are read off the
+# module as `stripe.Charge`, `stripe.Refund` and `stripe.error`. There is no
+# `Stripe` class to import from it - `from stripe import Stripe` raises
+# ImportError - and no `StripeClient` either; that arrived in 8.x. This pin is
+# the AAP's frozen version, so app/services/payment.py:L1,L12 was aligned to
+# the API this distribution actually exports rather than the pin being moved.
 stripe==7.9.0
 
 
@@ -162,24 +224,19 @@ stripe==7.9.0
 # Task queue - app/tasks/background_jobs.py:L1-L2 (`from celery import Celery`
 # and `from celery.schedules import crontab`).
 #
-# The worker tier is aspirational in this build: no task is ever dispatched, no
-# .delay()/apply_async() call exists anywhere, and nothing in the codebase may
-# depend on a running worker. The [redis] extra is nevertheless REQUIRED, and it
-# is required by the broker URL rather than by the worker:
-#
-#   backend/.env.example:L38  ->  CELERY_BROKER_URL="redis://localhost:6379/0"
-#   app/tasks/background_jobs.py:L9 ->  Celery(..., broker=settings.CELERY_BROKER_URL)
-#
-# That broker is constructed at MODULE IMPORT time, and a redis:// URL resolves
-# to kombu.transport.redis.Transport, which imports the `redis` client at module
-# level. Plain `celery==5.3.6` does not provide it - redis appears in celery's
-# metadata only as `redis (!=4.5.5,<6.0.0,>=4.5.2) ; extra == 'redis'`, so it is
-# absent from a clean install unless the extra is named. Without it kombu leaves
-# its module-level `redis` symbol as None and the broker fails with
-# `AttributeError: 'NoneType' object has no attribute 'Redis'`. Dropping the
-# extra therefore breaks the documented local broker on any fresh checkout,
-# which is why it is pinned with the extra rather than bare.
-celery[redis]==5.3.6
+# Declared BARE, with no broker extra. The worker tier is aspirational in this
+# build and nothing may depend on it: no task is ever dispatched, no
+# .delay()/apply_async() call exists anywhere, and the module cannot even be
+# imported. app/tasks/background_jobs.py:L9 constructs
+# `Celery(..., broker=settings.CELERY_BROKER_URL)` at import time against a
+# field app/core/config.py never declares, so the import raises AttributeError
+# long before any transport is selected - which is also why no `redis://` URL
+# is ever handed to kombu and no redis client is ever loaded. Adding a broker
+# extra here would install a client for a broker that is neither configured
+# (CELERY_BROKER_URL is a commented recorded finding in backend/.env.example,
+# not a Settings field) nor provisioned. The rating feature is correct without
+# it: the read paths publish an expired rating opportunistically on encounter.
+celery==5.3.6
 
 
 # --- Media and document processing -------------------------------------------

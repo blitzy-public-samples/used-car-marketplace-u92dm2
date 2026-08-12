@@ -41,11 +41,16 @@ response to something the datastore does or does not guarantee.
    REPORTING only and never gates a write.
 
 3. The aggregate on the user document is maintained by an INCREMENTAL
-   running mean applied inside a Firestore transaction. Recomputing it
-   by querying a user's ratings is impossible inside a transaction,
-   because only get-by-ID reads may be locked. Denormalising it is also
-   what keeps a profile read to a single get-by-ID, which the 200 ms
-   response budget in the SRS requires.
+   running mean applied inside a Firestore transaction. Note that a
+   query CAN be read through a transaction on the pinned
+   google-cloud-firestore 2.13.1 - verified empirically - so the reason
+   for the incremental mean is not a client limitation. It is that
+   recomputing from every rating cannot hold the SRS 200 ms budget as a
+   popular seller's rating count grows, and that locking a query would
+   widen the transaction's conflict footprint from one document to a
+   whole result set, making contention and reruns far more likely.
+   Denormalising is also what keeps a profile read to a single
+   get-by-ID.
 
 WHERE THE TRANSACTION IS, AND WHY IT IS NOT AT THE INSERT
 -------------------------------------------------------------------
@@ -81,7 +86,23 @@ This module owns no HTTP status codes and does not import ``fastapi``.
 Mapping domain failures onto responses belongs to the router, which
 translates ``RaterNotVerified`` and ``NotATransactionParticipant`` to
 403, ``TransactionNotFound`` to 404, ``TransactionNotCompleted`` and
-``DuplicateRating`` to 409, and ``SelfRatingNotAllowed`` to 422.
+``DuplicateRating`` to 409, and ``SelfRatingNotAllowed`` and
+``TransactionNotRatable`` to 422. Every one of them derives from
+``RatingError``, so a router that also catches the base class handles
+anything added here later rather than leaking a 500; each carries a
+``message`` fit to be shown to the caller.
+
+DATA THIS MODULE REFUSES TO WORK WITH
+-------------------------------------------------------------------
+A transaction document that does not satisfy its own contract is not
+evidence of anything, so it authorizes nothing: rather than substitute
+a placeholder for a missing participant or a missing listing reference
+and persist a rating that points nowhere, the guard sequence refuses it
+(``TransactionNotRatable``). The same principle governs the publication
+transition, which re-derives every authorization fact from the locked
+transaction and aborts rather than publish a rating it cannot prove.
+Substituting a default for absent data would turn a data-integrity
+problem into a permanent, invisible reputation error.
 
 MODERATION IS SENTIMENT-NEUTRAL BY CONSTRUCTION
 -------------------------------------------------------------------
@@ -91,7 +112,32 @@ The aggregate counts every published rating whatever its value. The FTC
 Rule on the Use of Consumer Reviews and Testimonials (16 CFR Part 465)
 prohibits suppressing reviews on the basis of rating or negative
 sentiment, so ``moderation_status`` may only ever move on a policy
-violation, with the reason recorded on the document.
+violation, with the reason recorded on the document - a rejection
+without one is refused outright rather than logged and accepted.
+
+THE VISIBILITY POLICY, STATED ONCE
+-------------------------------------------------------------------
+Three rules decide what a reader gets, and they are applied by
+``_is_withheld`` and ``_visible_projection`` alone:
+
+1. Publication gates the RECORD. Nothing unpublished is visible to
+   anybody but its author - that is the double-blind model.
+2. Moderation gates the CONTENT, not the score. A published rating's
+   score is always shown and always counted; its free-text review is
+   shown only once ``moderation_status`` is ``approved``, which is what
+   "moderation before display" means in practice. A number cannot carry
+   abuse or personal data, and withholding one for being low is the
+   suppression the FTC rule forbids; unreviewed prose can carry both,
+   so it waits. A rating REJECTED for a policy violation is withheld
+   entirely.
+3. Authorship overrides both, for the author only. A rater always sees
+   their own rating in full, including while it is unrevealed and
+   including when it was withheld, together with the reason - otherwise
+   a withheld review would vanish with no explanation to the person who
+   wrote it.
+
+``moderation_reason`` is an operator note and is never returned to
+anyone but the author.
 
 Reputation records are append-only. A submitted ``score`` or ``review``
 is never rewritten; a correction is a ``moderation_status`` transition
@@ -103,16 +149,25 @@ Pydantic v1 semantics apply throughout, matching the pin in
 Firestore client in ``app/db/firestore.py`` is.
 """
 import logging
-import time
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from google.api_core.exceptions import Aborted, AlreadyExists
+from google.api_core.exceptions import (
+    Aborted,
+    AlreadyExists,
+    Cancelled,
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    RetryError,
+    ServiceUnavailable,
+)
 from google.cloud import firestore
 from pydantic import ValidationError
 
 from app.core.config import settings
-from app.db.firestore import create_document_with_id, db, run_in_transaction
+from app.db.firestore import db, run_in_transaction
 from app.schema.rating import (
     EligibilityDecision,
     ModerationStatus,
@@ -120,6 +175,7 @@ from app.schema.rating import (
     RatingAggregate,
     RatingCreate,
     RatingDirection,
+    as_plain_text,
 )
 from app.schema.user import User
 
@@ -150,17 +206,58 @@ COMPLETED_STATUS = 'completed'
 DEFAULT_RATINGS_PAGE_SIZE = 50
 DEFAULT_SWEEP_PAGE_SIZE = 200
 
-# Firestore answers a write that lost a lock race with ABORTED rather
-# than with the outcome, and ABORTED means "retry", not "failed". Two
-# people submitting at the same instant - or one person double-clicking
-# - is exactly that race, so the create-only write is retried a bounded
-# number of times. Reproduced empirically: eight simultaneous
-# submissions of the same rating produced one success, six
-# AlreadyExists and one "409 Transaction lock timeout", which without
-# this retry would have surfaced as a server fault instead of the
-# duplicate conflict it actually was.
-CREATE_RETRY_ATTEMPTS = 4
-CREATE_RETRY_BASE_DELAY_SECONDS = 0.05
+# How far a visibility-filtered read may walk beyond what it returns.
+# Moderation state cannot be filtered in the query without an index that
+# is not declared, so withheld records are dropped after the read; this
+# is the multiple of the requested page size that may be examined while
+# collecting that many visible records, which bounds the work while
+# still letting the walk see past a run of withheld ones.
+MAX_VISIBILITY_SCAN_FACTOR = 10
+
+# How many DUE ratings a single public read may settle before answering.
+# Publication has no worker behind it, so a read that is about to report
+# a reputation settles what is already due first - but it runs on the
+# critical path of a public read against the SRS 200 ms budget, so the
+# work is bounded and the remainder drains across successive reads.
+SETTLE_BATCH_SIZE = 10
+
+# Ceiling on documents a single sweep pass may examine. The sweeps walk
+# a cursor rather than re-reading one unordered page, so a pass covers
+# every unpublished rating up to this bound instead of revisiting the
+# same records while later ones starve. A backlog larger than this
+# drains across successive passes, and each pass resumes from the start
+# of the ordering - which is stable, because a published rating leaves
+# the query.
+DEFAULT_SWEEP_SCAN_LIMIT = 5000
+
+# Ceiling on a caller-supplied page size. A lower bound alone is not a
+# bound: an unclamped ``limit`` is passed straight to Firestore and turns
+# a public read into a collection scan, so both ends are closed by
+# _page_size().
+MAX_RATINGS_PAGE_SIZE = 200
+
+# The Firestore document-ID grammar, mirrored from
+# ``app.schema.rating.DocumentId`` so the two entry points that receive a
+# raw path parameter - the eligibility check and the per-transaction
+# listing - are held to the same rule as a validated request body. An
+# unconstrained value reaches ``document()``, where a forward slash is
+# read as a NESTED PATH rather than an identifier, so it must be refused
+# before any lookup. ``\Z`` rather than ``$`` is load-bearing: ``$`` also
+# matches just before a trailing newline, which would admit "abc\n".
+DOCUMENT_ID_MAX_LENGTH = 128
+_DOCUMENT_ID_RE = re.compile(
+    r'^(?!\.\.?\Z)'          # not "." and not ".."
+    r'(?!__.*__\Z)'          # not Firestore's reserved __.*__ namespace
+    r'[^/\x00-\x1F\x7F]+\Z'  # no slash, no ASCII control characters
+)
+
+# Sentinel distinguishing "this argument was not supplied" from "it was
+# supplied as None". ``None`` cannot carry that distinction here, because
+# a transaction body of ``None`` is itself a decision: it means the
+# transaction document does not exist. Used by _assess() so the
+# transactional write path can hand over the snapshots it already holds
+# under the lock instead of issuing a second, unlocked read.
+_UNREAD = object()
 
 # The stored average is rounded to two decimals, matching how a
 # reputation figure is presented ("4.5/5"). Rounding the stored value
@@ -170,6 +267,26 @@ CREATE_RETRY_BASE_DELAY_SECONDS = 0.05
 # error. Recomputing exactly would require querying every rating, which
 # a Firestore transaction cannot do.
 AGGREGATE_PRECISION = 2
+
+# Provider faults that mean "this did not happen, try again" rather than
+# "this cannot happen". Only these are treated as deferrable by the
+# opportunistic publication paths; anything else is either a data
+# invariant failure that needs an operator or a programming error that
+# needs a developer, and conflating the three is how a permanent fault
+# hides behind a log line that reads like routine deferred work.
+#
+# ABORTED is the lock-contention verdict, RetryError is the client
+# giving up after its own retries, and the rest are the standard
+# transient gRPC conditions.
+TRANSIENT_PROVIDER_ERRORS = (
+    Aborted,
+    Cancelled,
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    RetryError,
+    ServiceUnavailable,
+)
 
 
 class RatingError(Exception):
@@ -260,7 +377,95 @@ class SelfRatingNotAllowed(RatingError):
     message = 'Self-rating is not permitted'
 
 
-def rating_document_id(transaction_id: str, rater_id: str) -> str:
+class PublicationInvariantError(Exception):
+    """A rating cannot be published because its record is not provable.
+
+    INTERNAL, and deliberately NOT a :class:`RatingError`: it is never
+    the answer to a request. Publication is a background transition
+    that happens to be triggered by requests, so every call site handles
+    this itself and no router ever sees it.
+
+    Raised from inside a publication transaction, which is what makes it
+    safe: Firestore rolls the transaction back, so a rating whose
+    authorization facts cannot be re-derived from its transaction, or
+    whose counterparty has no user document to credit, stays exactly as
+    it was - unpublished, contributing nothing, and available to be
+    published later once the data is repaired. The alternative, marking
+    it published and skipping the aggregate, is unrecoverable: the
+    idempotency check would then refuse to revisit it, so the score
+    would be permanently visible and permanently uncounted.
+    """
+
+
+# The only two failure classes an opportunistic publication may absorb.
+# Everything else - a TypeError, an AttributeError, a mistake in this
+# module - is a defect, and a defect that is logged as deferred work is a
+# defect nobody ever fixes, so those are left to propagate.
+DEFERRABLE_PUBLICATION_ERRORS = (
+    TRANSIENT_PROVIDER_ERRORS + (PublicationInvariantError,)
+)
+
+
+def _log_publication_failure(subject: str, error: BaseException) -> None:
+    """Record why a publication did not happen, at a matching severity.
+
+    Deferred work and permanently blocked work read identically in a log
+    unless they are written differently, and that is what lets a stalled
+    reputation go unnoticed. A transient datastore fault will clear by
+    itself, so it is a warning; a record that cannot be proved against
+    its transaction will never publish until somebody repairs the data,
+    so it is an error naming what is wrong.
+
+    In both cases the durable retry state is the rating document itself,
+    which stays unpublished and is revisited by the next read or sweep -
+    no separate queue is needed to remember the work.
+
+    Args:
+        subject: Rating document ID, or a description of what was being
+            published, for the log line.
+        error: The absorbed failure.
+    """
+    if isinstance(error, PublicationInvariantError):
+        logger.error(
+            'Publication blocked for %s - the record cannot be proved '
+            'against its transaction and needs repair: %s',
+            subject,
+            error,
+        )
+        return
+    logger.warning(
+        'Deferring publication for %s after a transient datastore '
+        'fault: %s',
+        subject,
+        error,
+    )
+
+
+class TransactionNotRatable(RatingError):
+    """The transaction document does not satisfy its own contract.
+
+    Raised when a transaction that is otherwise eligible - it exists,
+    names the caller as a participant and is completed - is missing data
+    the rating record requires, specifically the
+    ``vehicle_listing_id`` that every ``Transaction`` declares and that
+    a rating denormalises so it can be displayed with context.
+
+    The alternative would be to invent a value, and a rating carrying an
+    empty listing reference is worse than no rating at all: it satisfies
+    the model, persists silently, and can never be traced back to what
+    was actually bought. Nothing is written, and the eligibility
+    endpoint reports the same reason so the interface can explain it.
+
+    Router maps this to 422 - the request is well formed but the data it
+    cites cannot support the operation.
+    """
+
+    message = (
+        'This transaction is missing information required to rate it'
+    )
+
+
+def _rating_document_id(transaction_id: str, rater_id: str) -> str:
     """Compose the deterministic document ID for one rating.
 
     The natural key IS the document ID: one rating per rater per
@@ -353,6 +558,8 @@ def _assess(
     transaction_id: str,
     caller: User,
     supplied_ratee_id: Optional[str] = None,
+    transaction: Any = _UNREAD,
+    is_verified: Any = _UNREAD,
 ) -> Dict[str, Any]:
     """Run the ordered eligibility guard sequence exactly once.
 
@@ -378,6 +585,11 @@ def _assess(
        - else :class:`SelfRatingNotAllowed`.
     5. The transaction is ``completed`` - else
        :class:`TransactionNotCompleted`.
+    6. The transaction carries the data a rating record requires - else
+       :class:`TransactionNotRatable`. LAST, because "wait until the
+       transaction completes" is something the caller can act on
+       whereas a malformed document is not, so the actionable failure
+       is reported first when both apply.
 
     Uniqueness is NOT assessed here. It is enforced by the datastore at
     the moment of the create-only write, because an existence read
@@ -389,6 +601,13 @@ def _assess(
         transaction_id: Transaction the rating would be attached to.
         caller: Authenticated user, as resolved by the router.
         supplied_ratee_id: A counterparty the client claimed, if any.
+        transaction: The transaction document body, when the caller
+            already holds a copy read under a Firestore lock. Defaults
+            to the ``_UNREAD`` sentinel, which makes this function issue
+            its own get-by-ID. ``None`` means "read, and absent".
+        is_verified: The rater's verification flag, when the caller has
+            re-read it under a lock. Defaults to the ``_UNREAD``
+            sentinel, which falls back to the value on ``caller``.
             Checked against the derived value and otherwise discarded;
             never used as the ratee.
 
@@ -412,12 +631,15 @@ def _assess(
     # ``get_current_user`` re-reads the user document on every request,
     # so revoking verification takes effect on the caller's very next
     # call with no token rotation.
-    if not getattr(caller, 'is_verified', False):
+    if is_verified is _UNREAD:
+        is_verified = getattr(caller, 'is_verified', False)
+    if not is_verified:
         outcome['error'] = RaterNotVerified()
         return outcome
 
     # Guard 2 - the transaction must exist. A single get-by-ID.
-    transaction = _load_transaction(transaction_id)
+    if transaction is _UNREAD:
+        transaction = _load_transaction(transaction_id)
     if transaction is None:
         outcome['error'] = TransactionNotFound()
         return outcome
@@ -457,7 +679,6 @@ def _assess(
 
     outcome['ratee_id'] = ratee_id
     outcome['direction'] = direction
-    outcome['vehicle_listing_id'] = transaction.get('vehicle_listing_id')
 
     # Guard 5 - a rating attests to a completed exchange. Compared
     # case-insensitively so a differently-cased document still matches.
@@ -467,7 +688,174 @@ def _assess(
         outcome['error'] = TransactionNotCompleted()
         return outcome
 
+    # Guard 6 - the transaction must actually carry what a rating
+    # record needs. ``vehicle_listing_id`` is required on every
+    # Transaction and is denormalised onto the rating so it can be
+    # rendered with context; a document without one cannot supply it,
+    # and substituting an empty string would persist a rating that
+    # references nothing while satisfying the model. Refuse instead.
+    listing_id = transaction.get('vehicle_listing_id')
+    if not isinstance(listing_id, str) or not listing_id.strip():
+        outcome['error'] = TransactionNotRatable()
+        return outcome
+    outcome['vehicle_listing_id'] = listing_id.strip()
+
     return outcome
+
+
+def _page_size(limit: Any, default: int = DEFAULT_RATINGS_PAGE_SIZE) -> int:
+    """Clamp a caller-supplied page size into a serviceable range.
+
+    A lower bound alone is not a bound: ``limit=100000`` would be passed
+    straight to Firestore and turn a public read into a collection scan.
+    Both ends are therefore closed, and a value that is not a whole
+    number at all falls back to the default rather than raising - a
+    malformed page size is a request-shaping mistake, not a reason to
+    refuse to serve the read.
+
+    Args:
+        limit: Candidate page size, of any type.
+        default: Value to use when ``limit`` is not interpretable.
+
+    Returns:
+        An integer in ``[1, MAX_RATINGS_PAGE_SIZE]``.
+    """
+    try:
+        requested = int(limit)
+    except (TypeError, ValueError):
+        requested = default
+    if requested < 1:
+        requested = 1
+    return min(requested, MAX_RATINGS_PAGE_SIZE)
+
+
+def _is_valid_document_id(value: Any) -> bool:
+    """Report whether a value may be used as a Firestore document ID.
+
+    The service-layer half of the same rule ``app.schema.rating``'s
+    ``DocumentId`` type enforces on the request body. It is needed
+    separately because two entry points here receive an ID as a bare
+    argument rather than through a validated model: the eligibility
+    check and the per-transaction listing are both handed a raw path
+    parameter by the router.
+
+    Args:
+        value: Candidate identifier, of any type.
+
+    Returns:
+        ``True`` for a non-empty string within the length bound that
+        contains no forward slash and no ASCII control character, is
+        neither ``"."`` nor ``".."``, and does not fall inside the
+        ``__*__`` namespace Firestore reserves.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if len(value) > DOCUMENT_ID_MAX_LENGTH:
+        return False
+    return bool(_DOCUMENT_ID_RE.match(value))
+
+
+def _is_valid_score(value: Any) -> bool:
+    """Report whether a stored score is a usable vote.
+
+    A genuine integer inside the configured bound, and nothing else.
+    ``bool`` is excluded explicitly because it is a subclass of ``int``
+    in Python, so ``True`` would otherwise pass as the score 1.
+
+    Args:
+        value: Candidate score, as stored.
+
+    Returns:
+        ``True`` when the value can be counted.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return settings.RATING_MIN <= value <= settings.RATING_MAX
+
+
+def _coerce_aggregate(
+    raw_average: Any,
+    raw_count: Any,
+    subject: str,
+) -> Tuple[Optional[float], int]:
+    """Return a stored aggregate pair only if it can possibly be true.
+
+    The single gate every reader and every fold passes through, because
+    the two fields are only meaningful together. Validating them
+    independently lets impossible pairs through - a count of five beside
+    a null average, a fractional count, an average of NaN or one outside
+    the rating bound - and an impossible pair is not a cosmetic problem:
+    it is rendered to a user as their counterparty's reputation, and
+    folding a new score into it propagates the impossibility forever.
+
+    The invariant enforced here is exactly the one
+    :class:`app.schema.rating.RatingAggregate` declares: a non-negative
+    whole count, a finite average inside ``RATING_MIN..RATING_MAX``, and
+    ``count == 0`` if and only if ``average is None``.
+
+    A pair that fails is QUARANTINED rather than repaired in place:
+    it is logged at error level and reported as "no reputation yet",
+    which is the only honest reading of a value that cannot be trusted,
+    and which lets subsequent publications rebuild a correct aggregate
+    from real scores instead of compounding a broken one. Nothing is
+    written here; recomputing a stored pair from the ratings collection
+    is an operator repair, and a Firestore transaction cannot query.
+
+    Args:
+        raw_average: ``rating_average`` as stored - typically ``None``
+            or a float, but any value may be present.
+        raw_count: ``rating_count`` as stored. Absent on user documents
+            written before these fields existed, which is why a missing
+            value is a legitimate zero rather than a fault.
+        subject: Identifier used in the log line when a pair is
+            quarantined, so the affected document can be found.
+
+    Returns:
+        ``(average, count)``, guaranteed to satisfy the invariant.
+    """
+    count: Optional[int] = None
+    if raw_count is None:
+        count = 0
+    elif isinstance(raw_count, bool):
+        count = None
+    elif isinstance(raw_count, int):
+        count = raw_count
+    elif isinstance(raw_count, float) and raw_count.is_integer():
+        # Firestore has one number type, so a whole value may arrive as
+        # a float. A fractional one cannot be a count of anything.
+        count = int(raw_count)
+
+    average: Optional[float] = None
+    average_present = raw_average is not None
+    if average_present:
+        if isinstance(raw_average, bool):
+            average = None
+        elif isinstance(raw_average, (int, float)):
+            candidate = float(raw_average)
+            if candidate == candidate and abs(candidate) != float('inf'):
+                average = candidate
+
+    valid = (
+        count is not None
+        and count >= 0
+        and (average is None) == (count == 0)
+        and (
+            average is None
+            or settings.RATING_MIN <= average <= settings.RATING_MAX
+        )
+        and (average is not None or not average_present)
+    )
+    if not valid:
+        logger.error(
+            'Quarantining impossible rating aggregate for %s: '
+            'average=%r count=%r. Reporting no reputation until the '
+            'stored pair is recomputed.',
+            subject,
+            raw_average,
+            raw_count,
+        )
+        return None, 0
+    return average, int(count or 0)
 
 
 def _fold_scores(
@@ -482,46 +870,80 @@ def _fold_scores(
     through here, so they cannot diverge - and divergence would be
     invisible until a user's reputation was already wrong.
 
-    An incremental mean is not a preference, it is the only option: a
-    Firestore transaction can lock get-by-ID reads but not a query, so
-    the average cannot be recomputed from the user's ratings inside the
-    transaction that must apply it atomically.
+    An incremental mean is a deliberate choice, not a forced one: the
+    pinned client CAN read a query through a transaction, so recomputing
+    from the user's ratings is possible. It is rejected because it cannot
+    hold the SRS 200 ms budget as a rating count grows, and because
+    locking a whole result set rather than one document would make
+    contention and transaction reruns far more likely.
 
     Every published rating is counted, whatever its score. There is no
     threshold and no sentiment weighting here, and none may be added.
 
+    The base pair is validated by :func:`_coerce_aggregate` before it is
+    folded into, so an impossible stored pair cannot contaminate the
+    result. Every score folded in must itself be a valid vote; a stored
+    value that is not is refused rather than counted as something.
+
     Args:
         current_average: Stored average, or ``None`` when the user has
-            no published ratings yet.
-        current_count: Stored count. Absent, negative or non-numeric
-            values are treated as zero, because user documents written
-            before these fields existed simply lack them - which is
-            what makes this feature migration-free.
+            no published ratings yet. Already-validated values are
+            revalidated here, cheaply, because this function is the
+            single arithmetic entry point.
+        current_count: Stored count. Absent values are treated as zero,
+            because user documents written before these fields existed
+            simply lack them - which is what makes this feature
+            migration-free.
         scores: Scores becoming published in this operation. May be
             empty, in which case the aggregate is returned unchanged.
 
     Returns:
-        ``(average, count)`` after the fold. For the very first rating
-        this is ``(float(score), 1)``: the average moves from ``None``
-        to exactly the submitted score.
+        ``(average, count)`` after the fold, satisfying the same
+        invariant :func:`_coerce_aggregate` enforces. For the very first
+        rating this is ``(float(score), 1)``: the average moves from
+        ``None`` to exactly the submitted score.
+
+    Raises:
+        ValueError: A score being folded in is not a valid vote, or the
+            resulting average falls outside the rating bound. Either
+            means the caller's own validation failed, and a reputation
+            must not be written from data this function cannot vouch
+            for.
     """
-    base_count = 0
-    if isinstance(current_count, (int, float)) and current_count > 0:
-        base_count = int(current_count)
+    base_average, base_count = _coerce_aggregate(
+        current_average,
+        current_count,
+        'aggregate fold',
+    )
 
-    base_average = 0.0
-    if isinstance(current_average, (int, float)):
-        base_average = float(current_average)
+    added = list(scores)
+    invalid = [score for score in added if not _is_valid_score(score)]
+    if invalid:
+        raise ValueError(
+            'Refusing to fold invalid score(s) into an aggregate: '
+            '{0!r}'.format(invalid)
+        )
 
-    added = [int(score) for score in scores]
     total_count = base_count + len(added)
     if total_count <= 0:
         # No published ratings before and none now: "no ratings yet"
         # must stay distinguishable from a genuine average of zero.
         return None, 0
 
-    running_total = base_average * base_count + sum(added)
+    running_total = (base_average or 0.0) * base_count + sum(added)
     average = round(running_total / total_count, AGGREGATE_PRECISION)
+    if not settings.RATING_MIN <= average <= settings.RATING_MAX:
+        # Unreachable with a validated base and validated scores, so
+        # reaching it means an assumption above has broken. Refusing is
+        # the only safe response: an out-of-range average would be
+        # rejected by the schema on the way out anyway, after the write.
+        raise ValueError(
+            'Computed rating average {0} is outside {1}..{2}'.format(
+                average,
+                settings.RATING_MIN,
+                settings.RATING_MAX,
+            )
+        )
     return average, total_count
 
 
@@ -559,9 +981,19 @@ def _window_elapsed(created_at: Any) -> bool:
     """Report whether the rating window has closed for a timestamp.
 
     The single home of the window arithmetic. ``RATING_WINDOW_DAYS`` is
-    read here at call time rather than captured at import, so this
-    module adds no import-time failure mode and a reconfigured window
-    takes effect without a restart.
+    read off the ``settings`` singleton on every call rather than
+    copied into a module-level constant at import, which is what keeps
+    this module free of an import-time failure mode.
+
+    That per-call read is not live reconfiguration and must not be
+    mistaken for it. ``app/core/config.py`` evaluates ``Settings()``
+    exactly once, when it is first imported, so editing the process
+    environment or the ``.env`` file afterwards changes nothing until
+    the process is restarted - or until something explicitly rebuilds
+    or mutates that singleton. What the per-call read does buy is that
+    assigning to the already-built object, as in
+    ``settings.RATING_WINDOW_DAYS = 0``, is honoured by the very next
+    call; that is how a test drives the window without a restart.
 
     Args:
         created_at: When the rating was created, in any of the shapes
@@ -608,11 +1040,44 @@ def _rating_from_dict(data: Dict[str, Any]) -> Optional[Rating]:
         return None
 
 
+def _body_with_document_id(snapshot: Any) -> Dict[str, Any]:
+    """Read a snapshot's body with its document ID as the authority.
+
+    ``Rating.id`` is not decoration: it IS the deterministic natural key
+    ``{transaction_id}_{rater_id}``, and the uniqueness guarantee rests
+    on that key being the document's own name. So the document ID always
+    wins - it is assigned unconditionally rather than filled in only
+    when absent, because a body-level ``id`` that disagrees is either a
+    foreign write or corruption, and trusting it would hand callers an
+    identifier that addresses a different document (or none).
+
+    A disagreement is not silently normalised away either; it is logged
+    with both values so the record can be repaired.
+
+    Args:
+        snapshot: Firestore document snapshot.
+
+    Returns:
+        The document body with ``id`` set to the snapshot's own ID.
+    """
+    body = snapshot.to_dict() or {}
+    stored_id = body.get('id')
+    if stored_id is not None and stored_id != snapshot.id:
+        logger.warning(
+            'Rating document %s carries a conflicting stored id %r; '
+            'using the document id and leaving the record for repair',
+            snapshot.id,
+            stored_id,
+        )
+    body['id'] = snapshot.id
+    return body
+
+
 def _ratings_from_snapshots(snapshots: Iterable[Any]) -> List[Rating]:
     """Parse an iterable of Firestore snapshots into rating models.
 
-    The stored ``id`` field is reconciled with the document ID so a
-    document written without it still yields a usable model.
+    The document ID is the authority for ``Rating.id``; see
+    :func:`_body_with_document_id`.
 
     Args:
         snapshots: Firestore document snapshots.
@@ -622,9 +1087,7 @@ def _ratings_from_snapshots(snapshots: Iterable[Any]) -> List[Rating]:
     """
     parsed: List[Rating] = []
     for snapshot in snapshots:
-        body = snapshot.to_dict() or {}
-        body.setdefault('id', snapshot.id)
-        rating = _rating_from_dict(body)
+        rating = _rating_from_dict(_body_with_document_id(snapshot))
         if rating is not None:
             parsed.append(rating)
     return parsed
@@ -651,71 +1114,146 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
     """
     if not transaction_id or not rater_id:
         return False
-    document_id = rating_document_id(transaction_id, rater_id)
+    document_id = _rating_document_id(transaction_id, rater_id)
     snapshot = (
         db.collection(RATINGS_COLLECTION).document(document_id).get()
     )
     return bool(snapshot.exists)
 
 
-def _create_rating_document(
+def _submit_transaction_body(
+    transaction: firestore.Transaction,
+    transaction_id: str,
+    caller: User,
     document_id: str,
-    body: Dict[str, Any],
-) -> None:
-    """Write the rating create-only, translating a collision.
+    score: int,
+    review: Optional[str],
+    supplied_ratee_id: Optional[str],
+) -> Dict[str, Any]:
+    """Re-authorize under the lock, then create the rating. R1 + R2.
 
-    The uniqueness enforcement point. Nothing preceding this decides
-    whether a duplicate exists - Firestore does, by refusing to create a
-    document that is already there, which is the one guarantee that
-    holds however two concurrent submissions interleave.
+    The enforcement point for BOTH must-requirements, and the reason it
+    is here rather than before the transaction opens: every fact the
+    guards depend on is re-read THROUGH ``transaction``, so the
+    authorization that permits the write is the authorization that holds
+    at the instant it commits. Verification revoked, or a transaction
+    reopened or reassigned, between the request arriving and the write
+    landing cannot slip a rating through, because Firestore's optimistic
+    concurrency reruns this callable when any document it read has
+    changed and the guards are then evaluated against the new state.
+    Without this, both gates would be advisory rather than enforced.
 
-    A lock race is handled separately from a collision, because they
-    mean opposite things. ``AlreadyExists`` is a verdict: somebody else
-    already rated, and that is final. ``Aborted`` is not a verdict at
-    all - Firestore is saying it could not decide in time and the write
-    should be retried. Treating the second as the first would report a
-    duplicate that may never have existed; letting it escape untouched
-    would report a server fault for what is really a retryable
-    contention blip. So it is retried, and the retry then produces the
-    genuine verdict either way: the create succeeds, or it collides.
+    All three reads precede the single write, which Firestore requires.
 
-    Retrying is safe precisely because the write is create-only and the
-    key is deterministic. An aborted write did not commit, and a
-    successful retry cannot produce a second document.
+    A guard failure raises out of the callable, which rolls the
+    transaction back, so a refused rating leaves nothing behind.
+
+    Uniqueness is still enforced by the datastore, not by the existence
+    read: the read makes the duplicate case report the domain error
+    rather than an infrastructure one, and ``transaction.create``
+    remains the guarantee that holds however two concurrent submissions
+    interleave - hence ``AlreadyExists`` is still translated by the
+    caller. This also removes the need for an application-level retry
+    with a back-off sleep on the request path: contention is answered by
+    the transaction runner's own bounded retry rather than by blocking
+    the caller for hundreds of milliseconds against a 200 ms budget.
 
     Args:
+        transaction: Active Firestore transaction, supplied positionally
+            by :func:`app.db.firestore.run_in_transaction`.
+        transaction_id: Transaction that authorizes the rating.
+        caller: Authenticated user, used for identity only; the
+            authorization-bearing ``is_verified`` flag is re-read here.
         document_id: Deterministic natural key for the rating.
-        body: Document body to persist.
+        score: Validated score.
+        review: Validated, normalised review text, if any.
+        supplied_ratee_id: A counterparty the client claimed, if any.
+
+    Returns:
+        The document body that was created.
 
     Raises:
+        RatingError: Any guard failed against the locked state. The
+            transaction is rolled back, so nothing is written.
         DuplicateRating: A rating already exists at this key.
-        google.api_core.exceptions.Aborted: Contention persisted across
-            every attempt. Left to propagate deliberately - it is a
-            transient infrastructure condition rather than a domain
-            outcome, and the operation is safe to retry again.
     """
-    for attempt in range(CREATE_RETRY_ATTEMPTS):
-        try:
-            create_document_with_id(
-                RATINGS_COLLECTION,
-                document_id,
-                body,
-            )
-            return
-        except AlreadyExists:
-            raise DuplicateRating()
-        except Aborted:
-            if attempt == CREATE_RETRY_ATTEMPTS - 1:
-                logger.warning(
-                    'Rating %s abandoned after %d contended attempts',
-                    document_id,
-                    CREATE_RETRY_ATTEMPTS,
-                )
-                raise
-            # Exponential back-off. No jitter: the contenders here are a
-            # single transaction's two participants, so the herd is two
-            # writers at most and spreading them needs nothing more.
-            time.sleep(CREATE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+    rater_id = getattr(caller, 'id', None) or ''
+
+    # --- reads (all of them, before any write) ---
+    user_snapshot = (
+        db.collection(USERS_COLLECTION)
+        .document(rater_id)
+        .get(transaction=transaction)
+    )
+    if not user_snapshot.exists:
+        # The caller authenticated against a document that has since
+        # gone. Reported as unverified rather than as a missing user:
+        # from this module's side the only question is whether the
+        # account currently carries verification, and a deleted account
+        # does not.
+        raise RaterNotVerified()
+    user_body = user_snapshot.to_dict() or {}
+
+    transaction_snapshot = (
+        db.collection(TRANSACTIONS_COLLECTION)
+        .document(transaction_id)
+        .get(transaction=transaction)
+    )
+    transaction_body = (
+        (transaction_snapshot.to_dict() or {})
+        if transaction_snapshot.exists
+        else None
+    )
+
+    rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
+    existing = rating_ref.get(transaction=transaction)
+
+    # --- guards, against the locked reads ---
+    # _assess remains the SINGLE source of the guard logic for all three
+    # callers - the eligibility report, this write, and the locked
+    # re-check - so the reason a user is shown cannot drift from the
+    # reason a write is refused. Note that ``is_verified`` comes from the
+    # locked user document, not from the caller object the router built.
+    outcome = _assess(
+        transaction_id,
+        caller,
+        supplied_ratee_id=supplied_ratee_id,
+        transaction=transaction_body,
+        is_verified=bool(user_body.get('is_verified', False)),
+    )
+    if outcome['error'] is not None:
+        raise outcome['error']
+
+    if existing.exists:
+        raise DuplicateRating()
+
+    # --- the single write ---
+    # Field names here are load-bearing beyond this module: the declared
+    # composite indexes reference them by exact string, and a mismatch
+    # produces an index that silently serves nothing rather than an
+    # error. They mirror app/schema/rating.py one for one.
+    body: Dict[str, Any] = {
+        'id': document_id,
+        'transaction_id': transaction_id,
+        # Denormalised from the same locked transaction read, so a
+        # rating can be rendered with context without a second lookup.
+        # Guard 6 has already proved it is a non-empty string, which is
+        # why no placeholder is substituted here: a transaction that
+        # cannot supply it is refused rather than recorded incompletely.
+        'vehicle_listing_id': outcome['vehicle_listing_id'],
+        'rater_id': rater_id,
+        'ratee_id': outcome['ratee_id'],
+        'direction': outcome['direction'],
+        'score': score,
+        'review': review,
+        'is_published': False,
+        'moderation_status': ModerationStatus.PENDING.value,
+        'moderation_reason': None,
+        'created_at': firestore.SERVER_TIMESTAMP,
+        'updated_at': firestore.SERVER_TIMESTAMP,
+    }
+    transaction.create(rating_ref, body)
+    return body
 
 
 def evaluate_eligibility(
@@ -751,11 +1289,25 @@ def evaluate_eligibility(
     """
     caller_id = getattr(caller, 'id', None) or ''
 
-    # Probed unconditionally so ``already_rated`` is always truthful,
-    # including for a participant whose verification was revoked after
-    # they rated. Cheap: one get-by-ID on a read-only endpoint.
-    already_rated = _rating_exists(transaction_id, caller_id)
+    # A raw path parameter never passes through ``RatingCreate``, so the
+    # document-ID grammar is enforced here instead. A malformed value is
+    # REPORTED as an unknown transaction rather than raised: this is a
+    # read-only decision endpoint, and a value that cannot name a
+    # document cannot name that transaction either.
+    if not _is_valid_document_id(transaction_id):
+        return EligibilityDecision(
+            eligible=False,
+            reason=TransactionNotFound.message,
+            ratee_id=None,
+            direction=None,
+            already_rated=False,
+        )
 
+    # Guards first. The duplicate probe is REPORTING-ONLY, so issuing it
+    # before the guards spent a network round trip on requests that fail
+    # for a more fundamental reason - an unverified caller, or one who is
+    # not a party to the transaction - and whose ``already_rated`` value
+    # nobody can act on anyway.
     outcome = _assess(transaction_id, caller)
     error = outcome['error']
     if error is not None:
@@ -764,8 +1316,12 @@ def evaluate_eligibility(
             reason=error.message,
             ratee_id=outcome['ratee_id'],
             direction=outcome['direction'],
-            already_rated=already_rated,
+            already_rated=False,
         )
+
+    # Reached only once participation is established, which is the first
+    # point at which the answer is meaningful to the caller.
+    already_rated = _rating_exists(transaction_id, caller_id)
 
     if already_rated:
         # Reported, not enforced. The write path reaches the same
@@ -803,11 +1359,19 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
     contribution is what removes the incentive for review extortion -
     neither side can see what the other said in time to retaliate.
 
-    Because the contribution is deferred, this insert touches exactly
-    one document, and a single-document Firestore write is already
-    atomic. The multi-document transaction belongs at the publication
-    transition, where the invariant genuinely spans documents, and that
-    is where :func:`publish_if_window_elapsed` and
+    Both gates are enforced INSIDE the Firestore transaction that
+    writes, against documents re-read under its lock - see
+    :func:`_submit_transaction_body`. Checking before the write and
+    trusting the result would leave a window in which verification is
+    revoked, or the transaction is reopened or reassigned, between the
+    decision and the commit; the rating would then land on authority the
+    datastore no longer granted. A refused rating rolls back, so nothing
+    is written.
+
+    The aggregate contribution is deferred, so this call moves only the
+    rating document. The multi-document aggregate transaction belongs at
+    the publication transition, where the invariant genuinely spans
+    documents, and that is where :func:`publish_if_window_elapsed` and
     :func:`publish_if_reciprocal` apply it.
 
     Args:
@@ -838,65 +1402,78 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
         DuplicateRating: This rater has already rated this transaction.
     """
     transaction_id = getattr(payload, 'transaction_id', None) or ''
-    score = int(getattr(payload, 'score'))
-    review = getattr(payload, 'review', None)
+    score = getattr(payload, 'score')
+    if not _is_valid_score(score):
+        # Unreachable through the router, where Pydantic rejects it with
+        # a 422 before this runs. Checked anyway because this is the
+        # only path that writes a score, and a score that is not a
+        # bounded integer must never reach an aggregate.
+        raise ValueError(
+            'Score must be an integer between {0} and {1}'.format(
+                settings.RATING_MIN,
+                settings.RATING_MAX,
+            )
+        )
+    # Normalised again at the write boundary rather than trusted from
+    # the request model, so the plain-text contract holds for every
+    # caller of this function, not only for bodies Pydantic validated.
+    review = as_plain_text(getattr(payload, 'review', None))
     # RatingCreate deliberately has no ratee_id. If one arrives anyway,
     # it is a claim to be checked against the derived counterparty and
     # discarded either way - never a value to use.
     supplied_ratee_id = getattr(payload, 'ratee_id', None)
 
-    outcome = _assess(
-        transaction_id,
-        caller,
-        supplied_ratee_id=supplied_ratee_id,
-    )
-    if outcome['error'] is not None:
-        raise outcome['error']
+    rater_id = getattr(caller, 'id', None) or ''
+    document_id = _rating_document_id(transaction_id, rater_id)
 
-    rater_id = getattr(caller, 'id')
-    document_id = rating_document_id(transaction_id, rater_id)
+    # Every guard, and the create, inside ONE transaction. The body
+    # re-reads the rater, the transaction and the target rating document
+    # through the lock and re-runs the full guard sequence against those
+    # snapshots, so no unlocked pre-check decides whether this write is
+    # allowed. Create-only semantics still make the datastore the
+    # authority on duplicates: the collision IS the duplicate-vote
+    # signal, and it cannot race however two submissions interleave.
+    try:
+        body = run_in_transaction(
+            _submit_transaction_body,
+            transaction_id,
+            caller,
+            document_id,
+            score,
+            review,
+            supplied_ratee_id,
+        )
+    except AlreadyExists:
+        # Reached when the collision surfaces from the commit rather
+        # than from the locked existence read - the two concurrent
+        # submissions raced past the read. Same verdict either way.
+        raise DuplicateRating()
 
-    # Field names here are load-bearing beyond this module: the declared
-    # composite indexes reference them by exact string, and a mismatch
-    # produces an index that silently serves nothing rather than an
-    # error. They mirror app/schema/rating.py one for one.
-    body: Dict[str, Any] = {
-        'id': document_id,
-        'transaction_id': transaction_id,
-        # Denormalised from the same transaction read, so a rating can
-        # be rendered with context without a second lookup. Coerced to
-        # a string because the field is required by the contract even
-        # when the source document omits it.
-        'vehicle_listing_id': outcome['vehicle_listing_id'] or '',
-        'rater_id': rater_id,
-        'ratee_id': outcome['ratee_id'],
-        'direction': outcome['direction'],
-        'score': score,
-        'review': review,
-        'is_published': False,
-        'moderation_status': ModerationStatus.PENDING.value,
-        'moderation_reason': None,
-        'created_at': firestore.SERVER_TIMESTAMP,
-        'updated_at': firestore.SERVER_TIMESTAMP,
-    }
-
-    # Create-only. The collision IS the duplicate-vote signal, and it is
-    # the enforcement point precisely because it cannot race: whichever
-    # way two concurrent submissions interleave, the second is rejected.
-    _create_rating_document(document_id, body)
-
+    # The rating is committed by this point, so a failure to REVEAL it
+    # must not be reported as a failure to RECORD it: the caller would
+    # retry and receive a duplicate conflict for work that actually
+    # succeeded. The rating simply stays unpublished, contributing
+    # nothing, and the unpublished document IS the durable retry state -
+    # the reciprocal check on the next read, or the window sweep, picks
+    # it up. What differs per failure class is what the operator is
+    # told, because "retry later" and "this will never succeed" must not
+    # look alike in the log.
     published_ids: List[str] = []
     try:
         published_ids = publish_if_reciprocal(transaction_id)
+    except DEFERRABLE_PUBLICATION_ERRORS as error:
+        # A transient fault or an unprovable record, reported at the
+        # severity its cause deserves by the shared helper so this path
+        # and the sweeps cannot describe the same condition differently.
+        _log_publication_failure(document_id, error)
     except Exception:
-        # The rating is committed; a failure to reveal it must not
-        # present as a failure to record it, or a retry would return a
-        # duplicate conflict for work that actually succeeded. The
-        # rating stays unpublished and contributes nothing, and the
-        # reciprocal check on the next read, or the window sweep,
-        # publishes it. Logged rather than swallowed silently.
+        # Not transient and not a data invariant, so it is a defect in
+        # this module. Recorded at error level with a stack trace and an
+        # explicit marker so it cannot be mistaken for routine deferred
+        # work, but still not raised, for the reason above.
         logger.exception(
-            'Deferred publication check failed for rating %s',
+            'BUG: unexpected failure in the deferred publication check '
+            'for rating %s. The rating is recorded and unpublished.',
             document_id,
         )
 
@@ -944,18 +1521,32 @@ def _apply_publication(
     All reads have already been performed by the caller, because
     Firestore rejects a read issued after the transaction's first write.
 
+    Every entry handed here has already been PROVED under the same
+    transaction's lock by :func:`_validate_locked_rating`, so this
+    function does not decide anything: it writes what has been proved.
+    In particular there is no "publish it anyway without the aggregate"
+    branch - a rating that cannot be aggregated never reaches this
+    function, because publication without its aggregate movement is
+    exactly the state that cannot be repaired afterwards.
+
     Args:
         transaction: Active Firestore transaction.
         pending: One entry per rating to publish, each carrying
             ``rating_ref``, ``rating_id``, ``ratee_id``, ``score``,
-            ``user_ref``, ``user_exists``, ``current_average`` and
-            ``current_count``. Entries sharing a ``ratee_id`` are folded
-            into a single aggregate write, so no user document is ever
-            written twice in one transaction - which Firestore would
-            otherwise leave with only the last write's value.
+            ``user_ref``, ``current_average`` and ``current_count``,
+            all read under this transaction. Entries sharing a
+            ``ratee_id`` are folded into a single aggregate write, so no
+            user document is written twice in one transaction - which
+            Firestore would otherwise leave holding only the last
+            write's value.
 
     Returns:
         IDs of the ratings that were published.
+
+    Raises:
+        ValueError: An entry's score or stored aggregate fails
+            :func:`_fold_scores`. Propagated so the transaction rolls
+            back rather than committing half of a reveal.
     """
     if not pending:
         return []
@@ -970,23 +1561,13 @@ def _apply_publication(
         transaction.update(entry['rating_ref'], dict(stamp))
         published.append(entry['rating_id'])
 
-    # Group by ratee so a transaction that publishes both directions of
-    # a degenerate transaction - the same user on both sides - folds
-    # both scores into one write instead of losing one of them.
+    # Group by ratee so a transaction that publishes two ratings aimed
+    # at the same user folds both scores into one write instead of
+    # losing one of them.
     grouped: Dict[str, Dict[str, Any]] = {}
     for entry in pending:
-        ratee_id = entry.get('ratee_id')
-        score = entry.get('score')
-        if not ratee_id or not entry.get('user_exists'):
-            # No counterparty document to credit. The rating still
-            # publishes; there is simply no profile to aggregate onto,
-            # and inventing a user document to hold a counter would
-            # create a record that fails the user contract.
-            continue
-        if score is None:
-            continue
         bucket = grouped.setdefault(
-            ratee_id,
+            entry['ratee_id'],
             {
                 'user_ref': entry['user_ref'],
                 'current_average': entry.get('current_average'),
@@ -994,7 +1575,7 @@ def _apply_publication(
                 'scores': [],
             },
         )
-        bucket['scores'].append(score)
+        bucket['scores'].append(entry['score'])
 
     for bucket in grouped.values():
         average, count = _fold_scores(
@@ -1014,109 +1595,371 @@ def _apply_publication(
     return published
 
 
-def _collect_pending(
+def _locked_transaction(
     transaction: firestore.Transaction,
-    document_ids: List[str],
-    require_window: bool,
-) -> List[Dict[str, Any]]:
-    """Lock the candidate documents and decide which may publish.
+    transaction_id: str,
+) -> Dict[str, Any]:
+    """Read the authorizing transaction document under the lock.
 
-    Performs every read the publication needs, in the order Firestore
-    demands: all ratings, then all counterparty user documents, and only
-    then does the caller write. Re-reading under the lock is what makes
-    publication idempotent - a rating another request already published
-    is filtered out here, so its score can never be counted twice.
+    Publication is a SECOND trust boundary, not a continuation of the
+    first. The rating document was authorized when it was created, but by
+    the time it publishes it has been sitting in the datastore, and this
+    is the moment its score is folded into somebody's reputation. So the
+    authorization facts are re-read from their source rather than taken
+    from the rating's own copy of them.
 
     Args:
         transaction: Active Firestore transaction.
-        document_ids: Rating document IDs to consider.
-        require_window: When ``True``, a rating publishes only if its
-            window has closed; when ``False``, eligibility was
-            established by the caller (the counterparty has submitted).
+        transaction_id: Transaction the rating claims to belong to.
 
     Returns:
-        Entries in the shape :func:`_apply_publication` expects, one per
-        rating that may publish now.
+        The transaction document body.
+
+    Raises:
+        PublicationInvariantError: The transaction does not exist, or
+            does not name two distinct participants. Without it there is
+            nothing to re-derive the counterparty from, so no
+            publication can be justified.
     """
-    candidates: List[Dict[str, Any]] = []
-    for document_id in document_ids:
-        rating_ref = (
-            db.collection(RATINGS_COLLECTION).document(document_id)
+    if not transaction_id:
+        raise PublicationInvariantError(
+            'Rating carries no transaction reference'
         )
-        snapshot = rating_ref.get(transaction=transaction)
-        if not snapshot.exists:
-            continue
-        body = snapshot.to_dict() or {}
-        if body.get('is_published'):
-            continue
-        if require_window and not _window_elapsed(body.get('created_at')):
-            continue
-        candidates.append({
-            'rating_ref': rating_ref,
-            'rating_id': document_id,
-            'ratee_id': body.get('ratee_id'),
-            'score': body.get('score'),
-        })
-
-    if not candidates:
-        return []
-
-    # Second read phase: one get-by-ID per distinct counterparty. Still
-    # strictly before any write.
-    user_state: Dict[str, Dict[str, Any]] = {}
-    for candidate in candidates:
-        ratee_id = candidate.get('ratee_id')
-        if not ratee_id or ratee_id in user_state:
-            continue
-        user_ref = db.collection(USERS_COLLECTION).document(ratee_id)
-        user_snapshot = user_ref.get(transaction=transaction)
-        user_body = (
-            user_snapshot.to_dict() or {} if user_snapshot.exists else {}
+    snapshot = (
+        db.collection(TRANSACTIONS_COLLECTION)
+        .document(transaction_id)
+        .get(transaction=transaction)
+    )
+    if not snapshot.exists:
+        raise PublicationInvariantError(
+            'Transaction {0} no longer exists'.format(transaction_id)
         )
-        user_state[ratee_id] = {
-            'user_ref': user_ref,
-            'user_exists': bool(user_snapshot.exists),
-            # Absent on any user document written before these fields
-            # existed. Treated as "no reputation yet", which is the
-            # correct reading and why no backfill is required.
-            'current_average': user_body.get('rating_average'),
-            'current_count': user_body.get('rating_count', 0),
-        }
-
-    for candidate in candidates:
-        state = user_state.get(candidate.get('ratee_id') or '')
-        if state is None:
-            candidate['user_ref'] = None
-            candidate['user_exists'] = False
-            candidate['current_average'] = None
-            candidate['current_count'] = 0
-        else:
-            candidate.update(state)
-    return candidates
+    body = snapshot.to_dict() or {}
+    buyer_id = body.get('buyer_id')
+    seller_id = body.get('seller_id')
+    if not buyer_id or not seller_id or buyer_id == seller_id:
+        raise PublicationInvariantError(
+            'Transaction {0} does not name two distinct '
+            'participants'.format(transaction_id)
+        )
+    return body
 
 
-def _publish_transaction_body(
+def _validate_locked_rating(
+    document_id: str,
+    body: Dict[str, Any],
+    transaction_body: Dict[str, Any],
+    transaction_id: str,
+) -> str:
+    """Re-prove one rating against its transaction, and return the ratee.
+
+    The authorization check that makes publication safe, and the reason
+    the target user document is never chosen from the rating's own
+    ``ratee_id`` alone: a stored ``ratee_id`` is data, and data can be
+    wrong or tampered with. Trusting it would let a single altered field
+    redirect a score into any user's reputation. Every fact is therefore
+    re-derived here from the locked transaction and compared:
+
+    * the document ID is the deterministic natural key for this
+      transaction and this rater, so the record is where it claims to be;
+    * the rater is one of the transaction's two participants;
+    * the ratee is the OTHER participant, computed rather than read;
+    * the direction matches the one that derivation implies;
+    * the score is a bounded integer, so the aggregate cannot be moved
+      by a value that was never a valid vote.
+
+    Args:
+        document_id: Rating document ID, as locked.
+        body: Rating document body, as locked.
+        transaction_body: The authorizing transaction, as locked.
+        transaction_id: ID of that transaction.
+
+    Returns:
+        The re-derived ``ratee_id``, which is what the caller must credit.
+
+    Raises:
+        PublicationInvariantError: Any fact fails to re-prove.
+    """
+    rater_id = body.get('rater_id')
+    if not rater_id:
+        raise PublicationInvariantError(
+            'Rating {0} names no rater'.format(document_id)
+        )
+    if document_id != _rating_document_id(transaction_id, rater_id):
+        raise PublicationInvariantError(
+            'Rating {0} is not the deterministic key for transaction '
+            '{1} and rater {2}'.format(
+                document_id, transaction_id, rater_id
+            )
+        )
+
+    derived_ratee, derived_direction = _derive_counterparty(
+        transaction_body,
+        rater_id,
+    )
+    if not derived_ratee:
+        raise PublicationInvariantError(
+            'Rating {0} names a rater who is not a party to transaction '
+            '{1}'.format(document_id, transaction_id)
+        )
+    if body.get('ratee_id') != derived_ratee:
+        raise PublicationInvariantError(
+            'Rating {0} stores ratee {1!r} but transaction {2} makes the '
+            'counterparty {3!r}'.format(
+                document_id,
+                body.get('ratee_id'),
+                transaction_id,
+                derived_ratee,
+            )
+        )
+    if body.get('direction') != derived_direction:
+        raise PublicationInvariantError(
+            'Rating {0} stores direction {1!r} but its participants '
+            'imply {2!r}'.format(
+                document_id,
+                body.get('direction'),
+                derived_direction,
+            )
+        )
+    if not _is_valid_score(body.get('score')):
+        raise PublicationInvariantError(
+            'Rating {0} stores score {1!r}, which is not a vote between '
+            '{2} and {3}'.format(
+                document_id,
+                body.get('score'),
+                settings.RATING_MIN,
+                settings.RATING_MAX,
+            )
+        )
+    return derived_ratee
+
+
+def _locked_user_state(
     transaction: firestore.Transaction,
-    document_ids: List[str],
-    require_window: bool,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Read the ratee's aggregate under the lock, requiring the document.
+
+    A missing user document is an invariant failure rather than a case
+    to work around. Publishing without crediting anybody would leave the
+    score permanently visible and permanently uncounted, and the
+    idempotency check would then refuse to revisit it - so there would be
+    no way back. Refusing keeps the rating unpublished and repairable.
+
+    Args:
+        transaction: Active Firestore transaction.
+        user_id: The rated user.
+
+    Returns:
+        ``user_ref``, ``current_average`` and ``current_count``, the last
+        two already validated as a possible pair.
+
+    Raises:
+        PublicationInvariantError: No such user document.
+    """
+    user_ref = db.collection(USERS_COLLECTION).document(user_id)
+    snapshot = user_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        raise PublicationInvariantError(
+            'Ratee {0} has no user document to credit'.format(user_id)
+        )
+    user_body = snapshot.to_dict() or {}
+    # Absent on any user document written before these fields existed.
+    # Treated as "no reputation yet", which is the correct reading and
+    # why no backfill is required.
+    average, count = _coerce_aggregate(
+        user_body.get('rating_average'),
+        user_body.get('rating_count', 0),
+        'users/{0}'.format(user_id),
+    )
+    return {
+        'user_ref': user_ref,
+        'current_average': average,
+        'current_count': count,
+    }
+
+
+def _locked_rating(
+    transaction: firestore.Transaction,
+    document_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one rating under the lock, or report it as unpublishable.
+
+    Args:
+        transaction: Active Firestore transaction.
+        document_id: Rating document ID.
+
+    Returns:
+        ``(ref, body)`` as a dict, or ``None`` when the document does not
+        exist or is already published - both of which mean "nothing to do
+        here" rather than "something is wrong". Re-reading publication
+        state under the lock is what makes every publication path
+        idempotent, so no score can be counted twice.
+    """
+    rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
+    snapshot = rating_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return None
+    body = snapshot.to_dict() or {}
+    if body.get('is_published'):
+        return None
+    return {'rating_ref': rating_ref, 'body': body}
+
+
+def _reciprocal_publication_body(
+    transaction: firestore.Transaction,
+    transaction_id: str,
 ) -> List[str]:
-    """Read, then write, one publication inside a single transaction.
+    """Prove reciprocity under lock, then reveal both sides at once.
 
     Kept as a top-level function rather than a closure because
     Firestore's optimistic concurrency reruns the callable on contention,
     so it must be free of state that would not survive a second run.
 
+    The whole decision happens here, inside the transaction. Anything
+    established outside it - by the query that noticed two ratings
+    existed, say - is treated as a hint that may already be stale, never
+    as grounds to write: a rating could have been deleted or altered
+    between that query and this lock, and publishing one side alone is
+    precisely the state the double-blind model exists to prevent. So the
+    two expected documents are derived from the locked transaction's own
+    participants and re-read here, and both must be present and provable
+    before either is touched.
+
+    Reads strictly precede writes, as Firestore requires. Only
+    get-by-ID reads are used here - not because a query could not be
+    locked, but because naming the two expected documents exactly keeps
+    the conflict footprint at two documents.
+
     Args:
         transaction: Active Firestore transaction, supplied positionally
             by :func:`app.db.firestore.run_in_transaction`.
-        document_ids: Rating document IDs to consider.
-        require_window: Whether the rating window must have closed.
+        transaction_id: Transaction whose two sides are being revealed.
 
     Returns:
-        IDs of the ratings published by this transaction.
+        IDs of the ratings published by this transaction; empty when the
+        counterparty has not rated, or when both sides were already
+        published.
+
+    Raises:
+        PublicationInvariantError: A present rating cannot be re-proved
+            against the locked transaction, or a ratee has no user
+            document. The transaction rolls back, so nothing publishes.
     """
-    pending = _collect_pending(transaction, document_ids, require_window)
+    transaction_body = _locked_transaction(transaction, transaction_id)
+    expected = [
+        _rating_document_id(transaction_id, transaction_body['buyer_id']),
+        _rating_document_id(transaction_id, transaction_body['seller_id']),
+    ]
+
+    # Read phase 1 - both sides of the reveal must exist. A rating that
+    # is already published is not "missing": it still proves its side
+    # arrived, which is what the reveal is conditioned on.
+    locked: Dict[str, Optional[Dict[str, Any]]] = {}
+    for document_id in expected:
+        rating_ref = db.collection(RATINGS_COLLECTION).document(
+            document_id
+        )
+        snapshot = rating_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            # The counterparty has not rated yet - the ordinary case,
+            # and not an error.
+            return []
+        body = snapshot.to_dict() or {}
+        _validate_locked_rating(
+            document_id,
+            body,
+            transaction_body,
+            transaction_id,
+        )
+        locked[document_id] = (
+            None if body.get('is_published')
+            else {'rating_ref': rating_ref, 'body': body}
+        )
+
+    outstanding = [
+        (document_id, state)
+        for document_id, state in locked.items()
+        if state is not None
+    ]
+    if not outstanding:
+        return []
+
+    # Read phase 2 - one get-by-ID per distinct counterparty being
+    # credited, still strictly before any write.
+    user_state: Dict[str, Dict[str, Any]] = {}
+    pending: List[Dict[str, Any]] = []
+    for document_id, state in outstanding:
+        body = state['body']
+        ratee_id = body['ratee_id']
+        if ratee_id not in user_state:
+            user_state[ratee_id] = _locked_user_state(
+                transaction,
+                ratee_id,
+            )
+        entry = {
+            'rating_ref': state['rating_ref'],
+            'rating_id': document_id,
+            'ratee_id': ratee_id,
+            'score': body['score'],
+        }
+        entry.update(user_state[ratee_id])
+        pending.append(entry)
+
     return _apply_publication(transaction, pending)
+
+
+def _window_publication_body(
+    transaction: firestore.Transaction,
+    document_id: str,
+) -> List[str]:
+    """Publish one unreciprocated rating under lock, once it is due.
+
+    Kept as a top-level function for the same rerun-safety reason as
+    :func:`_reciprocal_publication_body`.
+
+    The window check outside this function is an optimisation; the
+    authoritative one is here, against the locked document, together
+    with the same re-derivation of every authorization fact from the
+    locked transaction. A rating publishing on window expiry gets no
+    weaker a proof than one publishing on reciprocity.
+
+    Args:
+        transaction: Active Firestore transaction, supplied positionally
+            by :func:`app.db.firestore.run_in_transaction`.
+        document_id: Rating to consider.
+
+    Returns:
+        ``[document_id]`` when it published, otherwise an empty list.
+
+    Raises:
+        PublicationInvariantError: The rating cannot be re-proved against
+            its transaction, or its ratee has no user document. The
+            transaction rolls back, so nothing publishes.
+    """
+    state = _locked_rating(transaction, document_id)
+    if state is None:
+        return []
+    body = state['body']
+    if not _window_elapsed(body.get('created_at')):
+        return []
+
+    transaction_id = body.get('transaction_id')
+    transaction_body = _locked_transaction(transaction, transaction_id)
+    ratee_id = _validate_locked_rating(
+        document_id,
+        body,
+        transaction_body,
+        transaction_id,
+    )
+    entry = {
+        'rating_ref': state['rating_ref'],
+        'rating_id': document_id,
+        'ratee_id': ratee_id,
+        'score': body['score'],
+    }
+    entry.update(_locked_user_state(transaction, ratee_id))
+    return _apply_publication(transaction, [entry])
 
 
 def _transaction_rating_snapshots(transaction_id: str) -> List[Any]:
@@ -1148,6 +1991,34 @@ def _transaction_rating_snapshots(transaction_id: str) -> List[Any]:
     return list(query.stream())
 
 
+def _reciprocal_possible(snapshots: Iterable[Any]) -> bool:
+    """Report the NECESSARY conditions for a reciprocal reveal.
+
+    Two distinct raters and at least one unrevealed side. Neither is
+    sufficient - sufficiency is proved under the transaction lock by
+    :func:`_reciprocal_publication_body`, which re-derives both expected
+    documents from the transaction itself. This exists only so a caller
+    that has already read the transaction's ratings can decide whether
+    opening a transaction is worth it WITHOUT reading them again.
+
+    Args:
+        snapshots: Rating snapshots for one transaction.
+
+    Returns:
+        ``True`` when a reciprocal publication could possibly apply.
+    """
+    raters = set()
+    unpublished = False
+    for snapshot in snapshots:
+        body = snapshot.to_dict() or {}
+        rater_id = body.get('rater_id')
+        if rater_id:
+            raters.add(rater_id)
+        if not body.get('is_published'):
+            unpublished = True
+    return len(raters) >= 2 and unpublished
+
+
 def publish_if_reciprocal(transaction_id: str) -> List[str]:
     """Publish both sides once both have rated. The blind reveal.
 
@@ -1164,6 +2035,13 @@ def publish_if_reciprocal(transaction_id: str) -> List[str]:
     show one side's verdict while withholding the other's, which is the
     precise state the model exists to prevent.
 
+    The decision is made ENTIRELY inside that transaction, by
+    :func:`_reciprocal_publication_body`. The query below is an
+    optimisation and nothing more - it avoids opening a transaction for a
+    transaction nobody has finished rating - and its answer may already
+    be stale by the time the lock is taken, which is exactly why nothing
+    is written on the strength of it.
+
     Safe to call repeatedly. Ratings already published are re-read under
     the transaction's lock and skipped, so no score is ever counted
     twice.
@@ -1175,34 +2053,26 @@ def publish_if_reciprocal(transaction_id: str) -> List[str]:
         IDs of the ratings published by this call, empty when the
         counterparty has not rated yet or when both sides were already
         published.
+
+    Raises:
+        PublicationInvariantError: A rating attached to this transaction
+            cannot be re-proved under lock. Nothing is published.
     """
-    snapshots = _transaction_rating_snapshots(transaction_id)
-    if len(snapshots) < 2:
+    if not transaction_id:
         return []
 
-    document_ids: List[str] = []
-    raters = set()
-    unpublished = False
-    for snapshot in snapshots:
-        body = snapshot.to_dict() or {}
-        document_ids.append(snapshot.id)
-        rater_id = body.get('rater_id')
-        if rater_id:
-            raters.add(rater_id)
-        if not body.get('is_published'):
-            unpublished = True
-
-    # Both directions must exist. Two documents from the same rater
-    # cannot happen through this service - the natural key forbids it -
-    # but the reveal is gated on distinct raters rather than on a
-    # document count so a corrupted collection cannot trigger it.
-    if len(raters) < 2 or not unpublished:
+    # Cheap pre-check. Two distinct raters and at least one unpublished
+    # side are necessary conditions for this call to do anything, so a
+    # transaction is only opened when they hold. Sufficiency is decided
+    # under the lock.
+    if not _reciprocal_possible(
+        _transaction_rating_snapshots(transaction_id)
+    ):
         return []
 
     published = run_in_transaction(
-        _publish_transaction_body,
-        document_ids,
-        False,
+        _reciprocal_publication_body,
+        transaction_id,
     )
     if published:
         logger.info(
@@ -1242,6 +2112,11 @@ def publish_if_window_elapsed(rating: Any) -> bool:
         open. An unusable ``created_at`` - absent, or the unwritten
         server-side sentinel - counts as "still open", which defers the
         reveal rather than risking an early one.
+
+    Raises:
+        PublicationInvariantError: The rating cannot be re-proved
+            against its transaction under lock, or its ratee has no user
+            document. Nothing is published.
     """
     document_id = _rating_field(rating, 'id')
     if not document_id:
@@ -1255,9 +2130,8 @@ def publish_if_window_elapsed(rating: Any) -> bool:
         return False
 
     published = run_in_transaction(
-        _publish_transaction_body,
-        [document_id],
-        True,
+        _window_publication_body,
+        document_id,
     )
     if published:
         logger.info(
@@ -1267,8 +2141,8 @@ def publish_if_window_elapsed(rating: Any) -> bool:
     return bool(published)
 
 
-def publish_expired_ratings(
-    limit: int = DEFAULT_SWEEP_PAGE_SIZE,
+def _publish_expired_ratings(
+    limit: int = DEFAULT_SWEEP_SCAN_LIMIT,
 ) -> int:
     """Publish every unreciprocated rating whose window has closed.
 
@@ -1282,10 +2156,24 @@ def publish_expired_ratings(
     that is due. This function is the scheduled equivalent of the same
     work, not a prerequisite for it.
 
+    The walk is a cursor over the unpublished ratings ordered by document
+    name, so a pass covers all of them up to ``limit`` rather than
+    re-reading one page. That matters because most unpublished ratings
+    are NOT yet due: with a fixed first page, a due rating sitting behind
+    a run of not-yet-due ones would never be reached, and the same
+    not-due records would be re-examined on every pass forever.
+
+    An operational note rather than a requirement: a composite index on
+    ``(is_published ASC, created_at ASC)`` would let this query ask only
+    for records already past their deadline, replacing the scan with a
+    targeted read. It is not used here because the index set this feature
+    declares does not include it, and a query that needs an undeclared
+    composite index fails outright at runtime rather than degrading.
+
     Args:
-        limit: Maximum number of unpublished ratings to examine in one
-            pass. Bounded so a large backlog is drained across several
-            runs rather than in one unbounded read.
+        limit: Ceiling on the number of unpublished ratings examined in
+            one pass, so no single call becomes an unbounded read. A
+            larger backlog drains across successive passes.
 
     Returns:
         How many ratings this pass published.
@@ -1295,117 +2183,177 @@ def publish_expired_ratings(
         .where(
             filter=firestore.FieldFilter('is_published', '==', False)
         )
-        .limit(max(1, int(limit)))
+        .order_by('__name__')
     )
 
     published = 0
-    for snapshot in query.stream():
-        body = snapshot.to_dict() or {}
-        body.setdefault('id', snapshot.id)
+    examined = 0
+    deferred = 0
+    for snapshot in _paginate(
+        query,
+        DEFAULT_SWEEP_PAGE_SIZE,
+        max(1, int(limit)),
+    ):
+        examined += 1
+        body = _body_with_document_id(snapshot)
         try:
             if publish_if_window_elapsed(body):
                 published += 1
-        except Exception:
-            # One unpublishable record must not abort the sweep; the
-            # next pass will retry it.
-            logger.exception(
-                'Could not publish expired rating %s',
-                snapshot.id,
-            )
+        except DEFERRABLE_PUBLICATION_ERRORS as error:
+            # One record that cannot publish must not abort the sweep,
+            # but it is not silently equivalent to one that simply is not
+            # due: it is counted and reported at a severity matching its
+            # cause. Anything outside these two classes is a defect in
+            # this module and is left to propagate.
+            deferred += 1
+            _log_publication_failure(snapshot.id, error)
+    logger.info(
+        'Rating window sweep examined %d unpublished rating(s), '
+        'published %d, deferred %d',
+        examined,
+        published,
+        deferred,
+    )
     return published
 
 
 def _publish_due_for_ratee(user_id: str) -> None:
-    """Bring one user's pending ratings up to date before reading them.
+    """Settle the ratings already DUE for one user, and nothing more.
 
-    Publication cannot be left to the background worker, because there
-    is none: no task in this codebase is ever dispatched and no broker is
+    Publication cannot be left to the background worker, because there is
+    none: no task in this codebase is ever dispatched and no broker is
     configured. A reputation that only became correct once a worker ran
     would simply never become correct. So a read that is about to report
-    a user's reputation first settles anything already due.
+    a user's reputation settles what is already due first.
 
-    Both publication paths are attempted - the window first, since that
-    is the one a read is obliged to apply, and then the reciprocal
-    check for whatever remains, which repairs a reveal that failed
-    earlier rather than leaving it stranded until the window closes.
+    What this deliberately does NOT do is drain a backlog. It runs on the
+    critical path of a public read against a 200 ms budget, so the work
+    it may do is bounded twice over:
 
-    Failures are logged and swallowed on purpose: a read must still
-    return the data it can, and every publication path is idempotent, so
-    the next read simply retries.
+    * the query asks the datastore for DUE records only, using a range
+      filter on ``created_at`` against the window deadline, so a user
+      with a hundred ratings still inside their window costs ONE query
+      returning nothing rather than a hundred candidate documents and a
+      transaction each;
+    * it takes at most ``SETTLE_BATCH_SIZE`` of them, OLDEST FIRST.
+
+    Oldest-first ordering is what makes the small bound safe rather than
+    merely cheap: each read settles the longest-overdue records, so a
+    backlog larger than one page drains across successive reads instead
+    of letting the same records be passed over forever.
+
+    The reciprocal reveal is NOT attempted here. It belongs to the
+    submission that completes the pair (:func:`submit_rating`) and to the
+    per-transaction read (:func:`_settle_transaction`), both of
+    which already know which transaction they concern. Doing it from a
+    per-user read cost one extra query per unresolved transaction, which
+    is the fan-out this budget cannot afford. Nothing is lost: a pair
+    whose reveal failed transiently is still revealed by either of those
+    two paths, and window expiry publishes it regardless.
+
+    The query shape - two equality filters, then a range and an order on
+    ``created_at`` - is served by the declared
+    ``(ratee_id ASC, is_published ASC, created_at DESC)`` composite
+    index: the two leading clauses are equalities, for which index
+    direction is immaterial, and Firestore scans the trailing field in
+    either direction. The order here is ASCENDING even though the index
+    declares DESCENDING, because oldest-first is what prevents
+    starvation. If a deployment ever disagrees it says so loudly rather
+    than silently returning nothing, because a missing index raises
+    ``FailedPrecondition`` and this module lets that propagate.
+
+    A rating whose ``created_at`` is absent or unusable never matches the
+    range filter and so is never settled here - the same "unusable
+    timestamp means not yet due" reading :func:`_window_elapsed` applies,
+    deferring a reveal rather than risking an early one. The global sweep
+    orders by ``__name__`` instead, so such a record is still reachable
+    there and cannot be stranded.
 
     Args:
-        user_id: The rated user whose pending ratings are settled.
+        user_id: The rated user whose due ratings are settled.
+
+    Raises:
+        Exception: A permanent failure propagates, so a read cannot
+            quietly report a stale reputation forever because an index is
+            missing. Transient faults are absorbed per record.
     """
-    if not user_id:
+    if not _is_valid_document_id(user_id):
         return
+    window_days = max(0, int(settings.RATING_WINDOW_DAYS))
+    deadline = datetime.now(timezone.utc) - timedelta(days=window_days)
     query = (
         db.collection(RATINGS_COLLECTION)
         .where(filter=firestore.FieldFilter('ratee_id', '==', user_id))
         .where(
             filter=firestore.FieldFilter('is_published', '==', False)
         )
-        .limit(DEFAULT_SWEEP_PAGE_SIZE)
+        .where(
+            filter=firestore.FieldFilter('created_at', '<=', deadline)
+        )
+        .order_by('created_at')
+        .limit(SETTLE_BATCH_SIZE)
     )
-
-    unresolved = set()
     for snapshot in query.stream():
-        body = snapshot.to_dict() or {}
-        body.setdefault('id', snapshot.id)
+        body = _body_with_document_id(snapshot)
         try:
-            if publish_if_window_elapsed(body):
-                continue
-        except Exception:
-            logger.exception(
-                'Window publication failed for rating %s',
-                snapshot.id,
-            )
-            continue
-        transaction_id = body.get('transaction_id')
-        if transaction_id:
-            unresolved.add(transaction_id)
-
-    for transaction_id in unresolved:
-        try:
-            publish_if_reciprocal(transaction_id)
-        except Exception:
-            logger.exception(
-                'Reciprocal publication failed for transaction %s',
-                transaction_id,
-            )
+            publish_if_window_elapsed(body)
+        except DEFERRABLE_PUBLICATION_ERRORS as error:
+            # One record that cannot publish must not stop the read from
+            # answering, but it is reported at the severity its cause
+            # deserves. Anything outside these classes propagates.
+            _log_publication_failure(snapshot.id, error)
 
 
-def _publish_due_for_transaction(transaction_id: str) -> None:
-    """Settle any pending publication for one transaction.
+def _settle_transaction(transaction_id: str) -> Tuple[List[Any], bool]:
+    """Settle one transaction's publications from a SINGLE read.
 
-    The transaction-scoped counterpart of :func:`_publish_due_for_ratee`,
-    used before listing a transaction's ratings so a participant is never
-    shown a stale unpublished state for a reveal that is already due.
+    The per-transaction view previously read the same bounded query three
+    times to serve one request: once for the reciprocal pre-check, once
+    for the window pass, and once more to serialise the result. This
+    reads it once and reports whether anything actually changed, so the
+    caller re-reads only when it must.
+
+    The reciprocal reveal is attempted only when the necessary conditions
+    hold on the snapshots already in hand, so the transaction - and the
+    extra read inside :func:`publish_if_reciprocal` - is opened only when
+    there is genuinely a pair to reveal. Sufficiency is still proved
+    under the lock, which is where it has to be proved.
 
     Args:
         transaction_id: Transaction whose ratings are settled.
-    """
-    if not transaction_id:
-        return
-    try:
-        publish_if_reciprocal(transaction_id)
-    except Exception:
-        logger.exception(
-            'Reciprocal publication failed for transaction %s',
-            transaction_id,
-        )
 
-    for snapshot in _transaction_rating_snapshots(transaction_id):
-        body = snapshot.to_dict() or {}
-        if body.get('is_published'):
-            continue
-        body.setdefault('id', snapshot.id)
+    Returns:
+        ``(snapshots, changed)`` - the snapshots as they were read, and
+        whether any publication was applied. When ``changed`` is false
+        the snapshots are still current and can be serialised directly.
+    """
+    snapshots = _transaction_rating_snapshots(transaction_id)
+    changed = False
+
+    if _reciprocal_possible(snapshots):
         try:
-            publish_if_window_elapsed(body)
-        except Exception:
-            logger.exception(
-                'Window publication failed for rating %s',
-                snapshot.id,
+            if publish_if_reciprocal(transaction_id):
+                changed = True
+        except DEFERRABLE_PUBLICATION_ERRORS as error:
+            _log_publication_failure(
+                'transaction {0}'.format(transaction_id),
+                error,
             )
+
+    if not changed:
+        # Window expiry only needs considering while a side is still
+        # unrevealed; a reciprocal reveal has already published both.
+        for snapshot in snapshots:
+            body = _body_with_document_id(snapshot)
+            if body.get('is_published'):
+                continue
+            try:
+                if publish_if_window_elapsed(body):
+                    changed = True
+            except DEFERRABLE_PUBLICATION_ERRORS as error:
+                _log_publication_failure(snapshot.id, error)
+
+    return snapshots, changed
 
 
 def _sort_key(rating: Rating) -> datetime:
@@ -1428,7 +2376,7 @@ def _sort_key(rating: Rating) -> datetime:
 def _is_withheld(rating: Rating) -> bool:
     """Report whether moderation has withheld a rating from display.
 
-    The ONLY display filter in this module, and it is driven purely by
+    One half of the visibility policy, and it is driven purely by
     moderation state. There is deliberately no score threshold, no
     score-correlated filter and no "hide low ratings" path anywhere
     here, and none may be added: the FTC Rule on the Use of Consumer
@@ -1447,7 +2395,101 @@ def _is_withheld(rating: Rating) -> bool:
     return rating.moderation_status == ModerationStatus.REJECTED.value
 
 
-def list_ratings_for_user(
+def _visible_projection(rating: Rating) -> Rating:
+    """Project a rating into what a reader other than its author may see.
+
+    The other half of the visibility policy, and the one that implements
+    "moderation before display". The two halves of a rating are treated
+    differently because they carry different risk:
+
+    * The SCORE is shown, and counted, for every published rating
+      whatever its value. A number cannot contain abuse, profanity or
+      somebody's phone number, and withholding it on the strength of
+      being low is precisely the review suppression the FTC rule
+      forbids. So moderation state never hides a score.
+    * The free-text REVIEW is user-authored content and is the only part
+      a policy violation can live in, so it is withheld until moderation
+      has approved it. Before that - while ``moderation_status`` is
+      ``pending`` - the reader gets the rating with no review text,
+      which is what stops unreviewed content, including PII, being
+      published by default.
+
+    ``moderation_reason`` is redacted too: it is an internal note
+    recording why a moderator acted, written for operators rather than
+    for the public, and the rating's author sees it through their own
+    view instead.
+
+    Args:
+        rating: Rating as stored.
+
+    Returns:
+        The same rating when its content is approved, otherwise a copy
+        with the unapproved content removed. The original is never
+        mutated - these models are also the values the aggregate and the
+        publication paths read.
+    """
+    if rating.moderation_status == ModerationStatus.APPROVED.value:
+        return rating.copy(update={'moderation_reason': None})
+    return rating.copy(update={'review': None, 'moderation_reason': None})
+
+
+def _paginate(
+    query: Any,
+    page_size: int,
+    scan_limit: int,
+) -> Iterable[Any]:
+    """Walk an ORDERED query page by page, advancing a cursor.
+
+    Firestore's ``limit`` is applied by the datastore, before this
+    process can filter anything, so a single limited page is not a way
+    to read "the first N that matter" - it is a way to read the first N
+    documents, some of which may be discarded here. Anything the
+    discarded ones would have revealed is then invisible, and because an
+    unordered limited query returns the same first page every time, a
+    record beyond it is never reached at all: it starves indefinitely
+    while its neighbours are re-examined on every pass.
+
+    Cursor pagination removes both problems. Each page starts after the
+    last document of the previous one, so every matching document is
+    seen exactly once and the walk terminates.
+
+    ``query`` MUST carry an ordering, because a cursor is defined
+    relative to one. Ordering by ``__name__`` is the cheapest choice
+    when no other order is needed: Firestore's automatic single-field
+    indexes are keyed by (value, document name), so an equality-filtered
+    query ordered by name is served without any composite index - and,
+    unlike ordering by a data field, it cannot silently exclude
+    documents that lack that field.
+
+    Args:
+        query: An ordered Firestore query, without a ``limit``.
+        page_size: Documents to fetch per round trip.
+        scan_limit: Hard ceiling on documents examined, so no single
+            call can degrade into an unbounded read of a large
+            collection.
+
+    Yields:
+        Document snapshots, in the query's order.
+    """
+    examined = 0
+    cursor = None
+    while examined < scan_limit:
+        window = min(page_size, scan_limit - examined)
+        page_query = query.limit(window)
+        if cursor is not None:
+            page_query = page_query.start_after(cursor)
+        page = list(page_query.stream())
+        if not page:
+            return
+        for snapshot in page:
+            yield snapshot
+        examined += len(page)
+        cursor = page[-1]
+        if len(page) < window:
+            return
+
+
+def _list_ratings_for_user(
     user_id: str,
     limit: int = DEFAULT_RATINGS_PAGE_SIZE,
 ) -> List[Rating]:
@@ -1459,23 +2501,31 @@ def list_ratings_for_user(
     holds on the way out as well as on the way in - an unreciprocated
     rating is invisible here until it is revealed.
 
+    Review CONTENT is returned only once moderation has approved it, so
+    unreviewed text is never displayed; the score of every published
+    rating is returned regardless, because suppressing a score by
+    sentiment is prohibited. See :func:`_visible_projection`.
+
     Any rating already due for publication is settled first, so this
     read never reports a reputation that is merely waiting for a worker
     that will not run.
 
     Args:
         user_id: The rated user.
-        limit: Maximum number of ratings to return.
+        limit: Maximum number of VISIBLE ratings to return - not a
+            budget the datastore may spend on records this function goes
+            on to hide.
 
     Returns:
-        Published, non-withheld ratings ordered by creation time
-        descending. Empty when the user has none.
+        Visible ratings ordered by creation time descending, each
+        projected for public display. Empty when the user has none.
     """
     if not user_id:
         return []
 
     _publish_due_for_ratee(user_id)
 
+    wanted = _page_size(limit)
     # Exactly the declared (ratee_id, is_published, created_at DESC)
     # composite index. The equality-only helper in app/db/firestore.py
     # cannot express the ordering, which is why the client is used
@@ -1485,18 +2535,33 @@ def list_ratings_for_user(
         .where(filter=firestore.FieldFilter('ratee_id', '==', user_id))
         .where(filter=firestore.FieldFilter('is_published', '==', True))
         .order_by('created_at', direction=firestore.Query.DESCENDING)
-        .limit(max(1, int(limit)))
     )
 
-    ratings = _ratings_from_snapshots(query.stream())
-    # Withheld ratings are filtered in Python rather than with a third
-    # equality clause, because a third filtered field would require a
+    # Withheld ratings are filtered here rather than with a third
+    # equality clause, because a third filtered field would need a
     # composite index that is not declared - and an undeclared index
-    # does not fail loudly, it just returns nothing.
-    return [rating for rating in ratings if not _is_withheld(rating)]
+    # does not fail loudly, it just returns nothing. Filtering after the
+    # read is only safe if the read can continue: hence the cursor walk,
+    # which keeps going until `wanted` VISIBLE ratings are collected.
+    # Without it, a page filled with withheld records would answer "this
+    # user has no reviews" while approved ones sat just beyond it.
+    visible: List[Rating] = []
+    pages = _paginate(
+        query,
+        DEFAULT_RATINGS_PAGE_SIZE,
+        wanted * MAX_VISIBILITY_SCAN_FACTOR,
+    )
+    for snapshot in pages:
+        rating = _rating_from_dict(_body_with_document_id(snapshot))
+        if rating is None or _is_withheld(rating):
+            continue
+        visible.append(_visible_projection(rating))
+        if len(visible) >= wanted:
+            break
+    return visible
 
 
-def get_user_aggregate(user_id: str) -> RatingAggregate:
+def _get_user_aggregate(user_id: str) -> RatingAggregate:
     """Read a user's denormalised reputation summary.
 
     One get-by-ID, never a scan. That is why the aggregate is maintained
@@ -1516,7 +2581,11 @@ def get_user_aggregate(user_id: str) -> RatingAggregate:
         ``count`` stays ``0`` for a user with no published ratings, for a
         user document predating these fields, and for a user that does
         not exist - so "no ratings yet" remains distinguishable from a
-        genuine average of zero.
+        genuine average of zero. A stored pair that cannot possibly be
+        true - a positive count with no average, a fractional count, a
+        non-finite or out-of-range average - is quarantined by
+        :func:`_coerce_aggregate` and reported the same way, rather than
+        presented to a user as their counterparty's reputation.
     """
     if not user_id:
         return RatingAggregate()
@@ -1528,20 +2597,15 @@ def get_user_aggregate(user_id: str) -> RatingAggregate:
         return RatingAggregate()
 
     body = snapshot.to_dict() or {}
-    raw_average = body.get('rating_average')
-    raw_count = body.get('rating_count', 0)
-
-    average: Optional[float] = None
-    if isinstance(raw_average, (int, float)):
-        average = float(raw_average)
-    count = 0
-    if isinstance(raw_count, (int, float)) and raw_count > 0:
-        count = int(raw_count)
-
+    average, count = _coerce_aggregate(
+        body.get('rating_average'),
+        body.get('rating_count', 0),
+        'users/{0}'.format(user_id),
+    )
     return RatingAggregate(average=average, count=count)
 
 
-def list_ratings_for_transaction(
+def _list_ratings_for_transaction(
     transaction_id: str,
     caller_id: Optional[str] = None,
 ) -> List[Rating]:
@@ -1554,43 +2618,60 @@ def list_ratings_for_transaction(
     hidden until it publishes. Returning both unconditionally here would
     hand a participant exactly the early look the model exists to deny.
 
+    Two distinct rules therefore apply, and which one a rating gets
+    depends only on authorship:
+
+    * The caller's OWN rating is returned in full - unrevealed, and even
+      when moderation withheld it, together with the recorded reason.
+      Anything else makes a withheld review vanish without explanation,
+      leaving its author unable to tell whether it was ever received.
+    * Anyone else's is subject to the same policy as the public read:
+      visible only once published and not withheld, with unapproved
+      review content and the internal moderation note removed. See
+      :func:`_visible_projection`.
+
     Args:
         transaction_id: Transaction whose ratings are wanted.
         caller_id: The authenticated caller, when there is one. Their own
-            rating is always included. Omit it for an unprivileged view,
-            which then contains published, non-withheld ratings only.
+            rating is always included in full. Omit it for an
+            unprivileged view, which then contains published,
+            non-withheld ratings with approved content only.
 
     Returns:
         Visible ratings ordered by creation time descending.
     """
-    if not transaction_id:
+    # Raw-path-parameter guard FIRST, exactly as on the eligibility
+    # endpoint: a value that is not a usable document ID cannot identify
+    # a transaction, and must not reach a query - or a publication
+    # attempt - built from it.
+    if not _is_valid_document_id(transaction_id):
         return []
 
-    _publish_due_for_transaction(transaction_id)
+    # One read serves both the settlement and the answer; a second read
+    # is issued only when settlement actually published something and the
+    # snapshots in hand are therefore stale.
+    snapshots, changed = _settle_transaction(transaction_id)
+    if changed:
+        snapshots = _transaction_rating_snapshots(transaction_id)
 
-    ratings = _ratings_from_snapshots(
-        _transaction_rating_snapshots(transaction_id)
-    )
+    ratings = _ratings_from_snapshots(snapshots)
 
     visible: List[Rating] = []
     for rating in ratings:
         if caller_id and rating.rater_id == caller_id:
-            # A rater always sees what they wrote, including while it is
-            # unrevealed and including when it was withheld - otherwise
-            # a withheld review would vanish without explanation.
             visible.append(rating)
             continue
         if not rating.is_published:
             continue
         if _is_withheld(rating):
             continue
-        visible.append(rating)
+        visible.append(_visible_projection(rating))
 
     visible.sort(key=_sort_key, reverse=True)
     return visible
 
 
-def get_rating(rating_id: str) -> Optional[Rating]:
+def _get_rating(rating_id: str) -> Optional[Rating]:
     """Read one rating by its document ID.
 
     Args:
@@ -1606,12 +2687,10 @@ def get_rating(rating_id: str) -> Optional[Rating]:
     snapshot = db.collection(RATINGS_COLLECTION).document(rating_id).get()
     if not snapshot.exists:
         return None
-    body = snapshot.to_dict() or {}
-    body.setdefault('id', snapshot.id)
-    return _rating_from_dict(body)
+    return _rating_from_dict(_body_with_document_id(snapshot))
 
 
-def moderate_rating(
+def _moderate_rating(
     rating_id: str,
     status: Any,
     reason: Optional[str] = None,
@@ -1642,16 +2721,24 @@ def moderate_rating(
             value string. Validated here, because an unrecognised value
             would otherwise be written straight onto the document and
             silently disable every state check that reads it.
-        reason: The policy basis for the transition. Recorded as given
-            and cleared when omitted, so approving a rating does not
-            leave a stale rejection reason behind.
+        reason: The policy basis for the transition. MANDATORY when
+            withholding a rating, because a rejection with no recorded
+            basis is a moderation decision nobody can audit - and an
+            unauditable one is indistinguishable from suppressing an
+            unflattering review, which is exactly what the FTC rule
+            prohibits. Recorded as given, and cleared when omitted, so
+            approving a rating does not leave a stale rejection reason
+            behind.
 
     Returns:
         The rating in its new state, or ``None`` when no rating exists at
         that ID - which the router reports as not found.
 
     Raises:
-        ValueError: ``status`` is not a recognised moderation state.
+        ValueError: ``status`` is not a recognised moderation state, or a
+            rejection was requested without a policy reason. Raised
+            before anything is written, so a rating is never withheld
+            first and justified afterwards.
     """
     if isinstance(status, ModerationStatus):
         status_value = status.value
@@ -1664,6 +2751,20 @@ def moderate_rating(
             'Unknown moderation status: {0!r}'.format(status)
         )
 
+    # Validated BEFORE the document is even read, so there is no path on
+    # which a rating is withheld and the justification is left for
+    # later. A rejection is the one transition that removes somebody's
+    # words from view; it carries its policy basis or it does not happen.
+    recorded_reason = (reason or '').strip() or None
+    if (
+        status_value == ModerationStatus.REJECTED.value
+        and recorded_reason is None
+    ):
+        raise ValueError(
+            'Rejecting a rating requires a policy reason describing the '
+            'violation. A low score is never itself a violation.'
+        )
+
     if not rating_id:
         return None
 
@@ -1672,29 +2773,15 @@ def moderate_rating(
     if not snapshot.exists:
         return None
 
-    if (
-        status_value == ModerationStatus.REJECTED.value
-        and not (reason or '').strip()
-    ):
-        # Not fatal - an administrator may withhold first and document
-        # afterwards - but a rejection with no recorded policy basis is
-        # exactly what makes a moderation decision unauditable, so it is
-        # surfaced rather than accepted quietly.
-        logger.warning(
-            'Rating %s rejected with no recorded policy reason',
-            rating_id,
-        )
-
     rating_ref.update({
         'moderation_status': status_value,
-        'moderation_reason': reason,
+        'moderation_reason': recorded_reason,
         'updated_at': firestore.SERVER_TIMESTAMP,
     })
 
-    body = snapshot.to_dict() or {}
-    body.setdefault('id', snapshot.id)
+    body = _body_with_document_id(snapshot)
     body['moderation_status'] = status_value
-    body['moderation_reason'] = reason
+    body['moderation_reason'] = recorded_reason
     # As on the create path, the returned model carries a real UTC
     # timestamp because the value actually written is a server-side
     # sentinel rather than a serialisable one.

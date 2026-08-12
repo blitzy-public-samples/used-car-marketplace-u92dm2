@@ -16,12 +16,7 @@ jobs:
     - name: Use Node.js
       uses: actions/setup-node@v2
       with:
-        # Node 22.x (>= 22.12.0). The previous '14.x' pin is not a supported
-        # runtime: Node 14 is end-of-life, and the declared toolchain (Vite 4,
-        # TypeScript 5, Vitest) plus frontend/package-lock.json are resolved
-        # and verified on the 22.x line. frontend/package.json "engines"
-        # records the same floor.
-        node-version: '22.x'
+        node-version: '14.x'
 
     - name: Install dependencies
       run: npm ci

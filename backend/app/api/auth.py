@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
@@ -9,8 +10,27 @@ from app.core.config import settings
 from app.db.firestore import db
 from app.schema.user import User
 
+logger = logging.getLogger(__name__)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token')
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+
+# The credential field on a user document, canonical name first. The
+# authoritative USER data model is the ER diagram in
+# ``documentation/Software Requirements Specifications (SRS).md``, which
+# names it ``password_hash``, so that is the one field this application
+# reads and the one any registration handler must write. A document
+# conforming to the specification would otherwise appear to have no
+# password at all and could never authenticate.
+#
+# ``hashed_password`` is accepted only as a legacy alias, and only for
+# reading: it is the name this module used before the mismatch was
+# found, so any account already stored under it keeps working while the
+# data is migrated to the canonical field. It is deliberately listed
+# second, so a document carrying both is authenticated against the
+# canonical value. Delete the alias once no document uses it - do not
+# add a third name.
+CREDENTIAL_FIELDS = ('password_hash', 'hashed_password')
 
 # Router that ``app/main.py`` mounts at ``/api/auth``. It declares no
 # routes on purpose: registration and login are F-001 work and are out
@@ -37,19 +57,38 @@ def authenticate_user(email: str, password: str) -> User:
     snapshot = user_doc[0]
     user_data = snapshot.to_dict() or {}
     user_data['id'] = snapshot.id
-    # The stored hash is read from the RAW document and removed from the
-    # dict before the model is built: ``User`` is the response shape
-    # every router annotates, so a credential must never become one of
-    # its attributes.
-    hashed_password = user_data.pop('hashed_password', None)
-    if not hashed_password:
+    # The stored hash is read from the RAW document, under the canonical
+    # field name with the legacy alias as a fallback, and EVERY
+    # credential key is removed from the dict before the model is built:
+    # ``User`` is the response shape every router annotates, so a
+    # credential must never become one of its attributes - not even the
+    # alias the account happens not to be using.
+    stored_hash = None
+    for field in CREDENTIAL_FIELDS:
+        candidate = user_data.pop(field, None)
+        if stored_hash is None and candidate:
+            stored_hash = candidate
+    if not stored_hash:
         # An account with no stored hash cannot authenticate. Returning
         # here also keeps ``None`` out of passlib, which raises rather
         # than reporting a failed verification when handed one.
         return False
-    if not verify_password(password, hashed_password):
+    if not verify_password(password, stored_hash):
         return False
-    return User(**user_data)
+    try:
+        return User(**user_data)
+    except ValidationError:
+        # A stored document that cannot satisfy the model is an
+        # authentication failure, not a server fault: the credential
+        # matched but no identity can be established from the record.
+        # Answering with the established falsy result keeps this a 401
+        # at the caller instead of a 500, and the log carries only the
+        # document id - never the body, and never the hash.
+        logger.warning(
+            'Rejecting authentication for malformed user document %s',
+            snapshot.id,
+        )
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()

@@ -108,11 +108,20 @@ def run_in_transaction(fn, *args, **kwargs):
 
     1. All reads must precede all writes. A read issued after the first
        write of the same transaction is rejected.
-    2. Only get-by-ID reads are permitted. A query cannot be locked, so
-       an aggregate cannot be recomputed by querying a collection from
-       inside a transaction; it must be read from a known document ID.
-       That is why aggregates here are denormalized onto the document
-       they describe.
+    2. Every read must go through the transaction to be locked, using
+       either ``ref.get(transaction=transaction)`` or
+       ``transaction.get(ref_or_query)``. On the pinned client
+       (``google-cloud-firestore==2.13.1``) ``Transaction.get`` accepts a
+       ``Query`` as well as a ``DocumentReference``, so a transactional
+       read is NOT restricted to get-by-ID.
+       Aggregates in this codebase are nonetheless denormalized onto the
+       document they describe and read by ID, and that is a deliberate
+       choice rather than a limitation: recomputing a mean by reading
+       every rating a popular seller has received grows without bound,
+       and the SRS requires API responses within 200 ms for 95% of
+       requests. A locked query would also widen the transaction's
+       conflict footprint from one document to a whole result set,
+       making contention - and therefore reruns - far more likely.
     3. Concurrency is optimistic. Before committing, Firestore checks
        whether anything the transaction touched has changed and reruns
        ``fn`` if it has, so ``fn`` must be safe to run more than once

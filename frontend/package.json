@@ -3,10 +3,6 @@
   "version": "1.0.0",
   "description": "Frontend for Task Management Application",
   "private": true,
-  "engines": {
-    "node": ">=22.12.0",
-    "npm": ">=10.0.0"
-  },
   "dependencies": {
     "@reduxjs/toolkit": "^1.9.5",
     "axios": "^1.4.0",
