@@ -1,4 +1,6 @@
-from google.cloud.firestore import Client, transactional
+from typing import Optional
+from google.api_core.exceptions import Aborted
+from google.cloud.firestore import Client, Transaction, transactional
 from google.cloud.exceptions import NotFound
 from app.core.config import settings
 
@@ -42,8 +44,12 @@ def query_documents(collection: str, filters: dict) -> list:
     return [doc.to_dict() for doc in docs]
 
 
-def create_document_with_id(collection: str, document_id: str,
-                            data: dict) -> str:
+def create_document_with_id(
+    collection: str,
+    document_id: str,
+    data: dict,
+    transaction: Optional[Transaction] = None,
+) -> str:
     """Create a document at a caller-supplied ID, failing on collision.
 
     ``create_document`` above cannot serve this purpose: it calls
@@ -69,20 +75,41 @@ def create_document_with_id(collection: str, document_id: str,
     ``document_id`` is opaque here; composing or validating a natural
     key belongs to the caller that owns what the key means.
 
+    Pass ``transaction`` to enrol the create in a transaction that is
+    already open, so a uniqueness constraint and whatever else must hold
+    with it commit together or not at all. Without that argument the
+    create is its own standalone write. Both routes go through
+    create-only semantics and both surface a collision identically, so
+    this remains the ONE primitive that owns create-only writes: a
+    caller inside a transaction has no reason to reach past it to
+    ``transaction.create`` and reimplement the same rule, which is how
+    two subtly different versions of a uniqueness guarantee start to
+    exist side by side.
+
     Args:
         collection: Target Firestore collection name.
         document_id: Exact document ID to create; never generated or
             rewritten by this helper.
         data: Document body to persist.
+        transaction: Open ``Transaction`` to enrol the create in, or
+            ``None`` for a standalone write.
 
     Returns:
-        The ``document_id`` that was created.
+        The ``document_id`` that was created. Note that when
+        ``transaction`` is supplied the write is only STAGED at this
+        point and becomes durable when that transaction commits.
 
     Raises:
         google.api_core.exceptions.AlreadyExists: If a document already
-            exists at ``collection/document_id``.
+            exists at ``collection/document_id``. Raised on both routes;
+            inside a transaction it also aborts that transaction, so no
+            other write staged alongside it is committed either.
     """
-    db.collection(collection).document(document_id).create(data)
+    doc_ref = db.collection(collection).document(document_id)
+    if transaction is None:
+        doc_ref.create(data)
+    else:
+        transaction.create(doc_ref, data)
     return document_id
 
 
@@ -122,10 +149,41 @@ def run_in_transaction(fn, *args, **kwargs):
        requests. A locked query would also widen the transaction's
        conflict footprint from one document to a whole result set,
        making contention - and therefore reruns - far more likely.
-    3. Concurrency is optimistic. Before committing, Firestore checks
-       whether anything the transaction touched has changed and reruns
-       ``fn`` if it has, so ``fn`` must be safe to run more than once
-       and must not act outside the transaction.
+    3. A transactional read takes a LOCK on what it read, and that lock
+       is held until the transaction commits, fails or times out; while
+       held it blocks other transactions, batched writes and
+       non-transactional writes from changing that document. This is a
+       server-client transaction against Firestore in Native mode,
+       whose Standard edition applies pessimistic concurrency controls
+       by default, and the concurrency mode is a database-level setting
+       rather than something this code selects. So do not reason about
+       the body of ``fn`` as though its reads were merely version-checked
+       at commit time: keep the set of documents it reads as small as
+       the invariant allows, and keep it short, because everything it
+       reads is unavailable to other writers for the duration.
+    4. ``fn`` MUST be safe to run more than once. Under contention a
+       commit is rejected with ``ABORTED`` and the client reruns ``fn``
+       from the top, so it must be free of side effects that a rollback
+       cannot undo - no email, no payment call, no mutation of module
+       state - and it must not depend on values computed on a previous
+       attempt.
+    5. Retries are finite, and their exhaustion is reported oddly. Once
+       the client's attempts are used up it gives up, and on the pinned
+       release (``google-cloud-firestore==2.13.1``) it reports that by
+       raising ``ValueError`` CHAINED FROM the final ``Aborted`` rather
+       than raising ``Aborted`` itself - see
+       ``firestore_v1/transaction.py``, ``raise ValueError(msg) from
+       last_exc``. A caller that catches the retryable Google API
+       exceptions would therefore miss contention exhaustion entirely
+       and see an opaque ``ValueError``. This function normalises that
+       case back into the underlying ``Aborted`` so contention
+       exhaustion is catchable as the transient transport fault it is.
+
+    The normalisation is scoped as narrowly as it can be: only a
+    ``ValueError`` whose ``__cause__`` IS an ``Aborted`` is translated.
+    A ``ValueError`` that ``fn`` itself raised - a domain validation
+    failure, say - has no such cause and propagates untouched, which
+    matters because those carry meaning the caller has to see.
 
     Args:
         fn: Callable taking the ``Transaction`` as its first positional
@@ -135,8 +193,20 @@ def run_in_transaction(fn, *args, **kwargs):
 
     Returns:
         Whatever ``fn`` returns on the attempt that commits.
+
+    Raises:
+        google.api_core.exceptions.Aborted: Contention persisted through
+            every retry the client allows.
+        Exception: Anything ``fn`` raises propagates unchanged, after
+            the transaction has been rolled back.
     """
-    return transactional(fn)(db.transaction(), *args, **kwargs)
+    try:
+        return transactional(fn)(db.transaction(), *args, **kwargs)
+    except ValueError as error:
+        cause = error.__cause__
+        if isinstance(cause, Aborted):
+            raise cause from error
+        raise
 
 
 async def initialize_db() -> None:

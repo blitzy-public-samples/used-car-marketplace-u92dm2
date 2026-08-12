@@ -36,6 +36,10 @@
     "vitest": "0.34.6",
     "@vitejs/plugin-react": "^4.0.3"
   },
+  "overrides": {
+    "node-releases": "2.0.44",
+    "postcss-load-config": "4.0.2"
+  },
   "scripts": {
     "start": "vite",
     "build": "tsc && vite build",

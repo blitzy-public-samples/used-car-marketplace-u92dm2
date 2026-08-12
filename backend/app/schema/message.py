@@ -6,12 +6,19 @@ This module removes that one blocker and gives the messaging domain its
 first server-side request validation.
 
 It does NOT make ``app.main`` importable on its own, and should not be
-read as claiming to. Importing the application still fails earlier, at
-``app/api/listings.py:L14``, because every existing router annotates
-``current_user: User`` without importing ``User`` - a pre-existing
-``NameError`` in three reference-only modules that is outside this
-change. This module removes one obstacle on that path; the annotation
-imports are the remaining one.
+read as claiming to. Two pre-existing obstacles in reference-only
+modules remain on that path, both outside this change:
+
+* ``app/api/listings.py:L14`` - and the same line in the transactions
+  and messages routers - annotates ``current_user: User`` without
+  importing ``User``, which raises ``NameError`` at import. This is the
+  one the application fails on first.
+* ``app/services/payment.py:L1`` does ``from stripe import Stripe``, a
+  name ``stripe==7.9.0`` does not export, so the transactions router
+  that imports ``process_payment`` cannot import either.
+
+This module removes one obstacle on that path; those two are the rest of
+it.
 
 REQUEST STATE AND SERVER STATE ARE SEPARATE
 -------------------------------------------------------------------
@@ -21,35 +28,46 @@ server, never by the caller. Two models express that split:
 client may legitimately state; :class:`Message` is the persisted and
 response contract and carries the whole record.
 
-The router is not able to bind :class:`MessageCreate` yet - it is
-reference-only at this stage and cannot be edited here - so
-:class:`Message` additionally guarantees the same property on its own,
-by excluding the two server-owned fields that would otherwise do harm
-from everything ``.dict()`` exports. That matters because the handler
-builds its write payload as ``message.dict()``:
+That split is enforced by WHICH MODEL a boundary binds, not by hiding
+fields on the response model. Every field of :class:`Message` is
+therefore fully serialisable. Suppressing a field from ``.dict()`` to
+keep a client from asserting it looks like defence but is not: ``read``
+is the read-state of a message, so a ``read`` that never reaches
+``.dict()`` can never be PERSISTED either, which makes the state
+permanently unrecordable rather than merely unassertable by a caller -
+and a response that omits it cannot tell a client whether a message has
+been read. The request contract is the place to refuse a client-supplied
+``read``, and :class:`MessageCreate` is that contract: it has no ``read``
+field to supply.
 
-* ``id`` excluded - otherwise the payload carries an ``id`` key (``None``
-  when the client omits it, the client's own value when it does not).
-  Persisting it both stores a bogus identifier and breaks every
-  subsequent read, because the handler then reconstructs each message as
-  ``Message(**msg.to_dict(), id=msg.id)`` and Python rejects the
-  duplicate keyword with ``TypeError`` before validation is even
-  reached. With ``id`` absent from the stored body, the snapshot ID is
-  injected exactly once.
-* ``read`` excluded - otherwise a sender can mark their own message as
-  already read by including ``read: true`` in the request body.
+KNOWN CONSEQUENCE, recorded rather than designed around
+-------------------------------------------------------------------
+``backend/app/api/messages.py`` is reference-only and cannot be edited
+here, so it still builds its write payload from ``Message(...).dict()``
+at :L17 instead of binding :class:`MessageCreate`. Because ``id`` is
+serialisable, that payload carries an ``id`` key, and the read path at
+:L35/:L37 rebuilds each message as ``Message(**msg.to_dict(),
+id=msg.id)`` - which Python rejects with ``TypeError`` for the duplicate
+keyword.
 
-``sender_id`` and ``timestamp`` stay exported because the handler
-assigns both unconditionally after calling ``.dict()``, so a client
-value cannot survive into the datastore; excluding them as well would
-strip them from responses for no security gain.
+That is a pre-existing defect in the handler and the fix belongs there:
+bind :class:`MessageCreate` on the write path, and stop passing ``id``
+twice on the read path. It is deliberately NOT worked around here by
+excluding ``id`` from serialisation. Doing so would trade one visible,
+fixable handler bug for two invisible contract defects - an unrecordable
+read-state and a response model that silently drops fields - and would
+leave this schema permanently shaped around a bug in a module it does
+not own. No messaging endpoint executes today in any case: ``messages.py``
+raises ``NameError`` at import, because it annotates
+``current_user: User`` without importing ``User``.
 
 Pydantic v1 semantics apply: ``pydantic==1.10.13`` is pinned in
-``backend/requirements.txt``, field-level ``exclude`` is a v1 feature,
-and the handler uses the v1 ``.dict()`` serialisation API.
+``backend/requirements.txt`` and the handler uses the v1 ``.dict()``
+serialisation API.
 """
-from pydantic import BaseModel, Field
 from typing import Any, Optional
+
+from pydantic import BaseModel
 
 
 class MessageCreate(BaseModel):
@@ -81,12 +99,15 @@ class Message(BaseModel):
     default, keeping the model constructible from a bare request body
     and from a stored document alike.
 
-    ``id`` and ``read`` are declared ``exclude=True``: they remain
-    readable and assignable attributes, and they are still populated
-    when a stored document supplies them, but they never appear in
-    ``.dict()``. See the module docstring - that is what keeps a
-    client-supplied identifier or read state out of the datastore and
-    what stops the read path passing ``id`` twice.
+    Every field is serialisable, including ``id`` and ``read``. This is
+    the persisted and response contract, so a field it withholds from
+    ``.dict()`` is a field that can be neither stored nor reported;
+    ``read`` in particular is the message's read-state, which would be
+    permanently unrecordable if it never reached a write. Keeping a
+    caller from ASSERTING server state is the job of
+    :class:`MessageCreate`, which simply has no such field. See the
+    module docstring for the handler defect this deliberately does not
+    paper over.
 
     Pre-existing inconsistency: the client mirror
     ``frontend/src/schema/message.ts`` names two of these fields
@@ -94,12 +115,12 @@ class Message(BaseModel):
     ``timestamp``. Recorded, not bridged with aliases.
     """
 
-    id: Optional[str] = Field(None, exclude=True)
+    id: Optional[str] = None
     sender_id: Optional[str] = None
     recipient_id: str
     vehicle_listing_id: Optional[str] = None
     content: str
-    read: bool = Field(False, exclude=True)
+    read: bool = False
     # Permissive by necessity: the handler assigns
     # ``firestore.SERVER_TIMESTAMP``, a sentinel object rather than a
     # ``datetime``, which a strict ``datetime`` annotation rejects.

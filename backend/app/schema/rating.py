@@ -59,7 +59,15 @@ from enum import Enum
 from typing import Any, Optional
 
 from google.cloud import firestore
-from pydantic import BaseModel, Field, conint, constr, validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    conint,
+    constr,
+    root_validator,
+    validator,
+)
 
 from app.core.config import settings
 
@@ -171,6 +179,29 @@ class ModerationStatus(str, Enum):
     REJECTED = 'rejected'
 
 
+# Bound on ``moderation_reason``, the free text a moderator records when
+# withholding a review. It is deliberately much smaller than the review
+# bound: a policy citation is a short phrase ("contains a phone number"),
+# not prose, and the field is written by staff rather than by the public.
+#
+# It needs a bound at all for the same reason the review does. The value
+# is persisted on the rating document and is read back by the author of
+# that rating, so an unbounded moderator note is an unbounded write into
+# a document whose size Firestore caps at 1 MiB, and an unbounded string
+# on a response. 500 characters is ample for a policy reference and
+# leaves the document nowhere near that cap.
+MODERATION_REASON_MAX_LENGTH = 500
+
+# The single unrecognised key ``RatingCreate`` tolerates in a request
+# body. Named once here so the request contract and the service guard
+# that refuses a mismatched claim refer to the same symbol rather than
+# repeating a string literal that could drift apart.
+#
+# It is tolerated so that the claim can be REFUSED rather than ignored;
+# see ``RatingCreate`` for why those are different outcomes.
+RATEE_ID_CLAIM = 'ratee_id'
+
+
 def enum_value(value: Any, enumeration: Any, label: str) -> str:
     """Return the wire value of ``value`` within ``enumeration``.
 
@@ -204,12 +235,16 @@ def enum_value(value: Any, enumeration: Any, label: str) -> str:
     )
 
 
-def as_plain_text(value: Optional[str]) -> Optional[str]:
-    """Normalise user-authored text to the plain-text contract.
+def as_plain_text(
+    value: Optional[str],
+    max_length: Optional[int] = None,
+    label: str = 'Review',
+) -> Optional[str]:
+    """Normalise author-supplied text to the plain-text contract.
 
-    The server-side half of the review content policy, applied at the
-    request boundary and again on anything read back, so no consumer
-    can receive review text this function has not passed. It does not
+    The server-side half of the content policy, applied at the request
+    boundary and again on anything read back, so no consumer can
+    receive text this function has not passed. It does not
     escape or rewrite the author's words - the stored value is plain
     text that every render path must output-encode - it removes what
     prose cannot legitimately contain:
@@ -228,15 +263,23 @@ def as_plain_text(value: Optional[str]) -> Optional[str]:
     The length bound is re-applied afterwards rather than trusted from
     before, because normalisation is not guaranteed to shorten a string.
 
+    The same normalisation serves every field of author-supplied prose
+    on a rating - the public review and the moderator's reason - because
+    both are persisted, both are read back, and neither can legitimately
+    contain a control character. Only the bound and the name in the error
+    message differ, so both are parameters rather than duplicated logic.
+
     Args:
         value: Raw text, or ``None``.
+        max_length: Maximum length permitted after normalisation.
+            Defaults to ``settings.RATING_REVIEW_MAX_LENGTH``.
+        label: Human-readable field name for the error message.
 
     Returns:
         The normalised text, or ``None`` when there is nothing left.
 
     Raises:
-        ValueError: The normalised text exceeds
-            ``settings.RATING_REVIEW_MAX_LENGTH``.
+        ValueError: The normalised text exceeds the applicable bound.
     """
     if value is None:
         return None
@@ -252,10 +295,13 @@ def as_plain_text(value: Optional[str]) -> Optional[str]:
     text = text.strip()
     if not text:
         return None
-    limit = int(settings.RATING_REVIEW_MAX_LENGTH)
+    limit = int(
+        settings.RATING_REVIEW_MAX_LENGTH if max_length is None
+        else max_length
+    )
     if len(text) > limit:
         raise ValueError(
-            'Review must be at most {0} characters'.format(limit)
+            '{0} must be at most {1} characters'.format(label, limit)
         )
     return text
 
@@ -297,7 +343,20 @@ class Rating(BaseModel):
     # becomes visible only once the counterparty submits theirs or the
     # rating window elapses. The aggregate reflects published ratings
     # only, which is what removes the incentive for review extortion.
-    is_published: bool = False
+    #
+    # ``StrictBool`` rather than ``bool``, for the same reason
+    # ``RatingScore`` is a strict int. Plain ``bool`` in Pydantic v1
+    # COERCES: it accepts the strings 'false', 'no' and '0' and the ints
+    # 0 and 1, and - the case that matters - it maps the string 'true'
+    # AND the string 'false' onto real booleans while rejecting neither.
+    # This field decides whether a rating is visible to the public and
+    # whether it counts toward a reputation, and the service branches on
+    # the raw stored value. A document whose ``is_published`` is the
+    # STRING 'false' must therefore be reported as malformed, never
+    # silently interpreted - in either direction. Strict typing makes
+    # that a validation failure at the boundary instead of a visibility
+    # decision taken on a truthiness accident.
+    is_published: StrictBool = False
     moderation_status: str = ModerationStatus.PENDING.value
     moderation_reason: Optional[str] = None
     # Permissive ANNOTATION by necessity, constrained by the validator
@@ -327,6 +386,25 @@ class Rating(BaseModel):
     def _validate_review(cls, value: Optional[str]) -> Optional[str]:
         """Hold stored review text to the plain-text contract."""
         return as_plain_text(value)
+
+    @validator('moderation_reason')
+    def _validate_moderation_reason(
+        cls,
+        value: Optional[str],
+    ) -> Optional[str]:
+        """Hold the moderator's reason to a bounded plain-text contract.
+
+        The reason is staff-authored rather than public, but it is still
+        persisted on this document and still read back by the rating's
+        author, so it gets the same normalisation as the review and a
+        bound of its own. Whitespace-only text normalises to ``None``,
+        which keeps "no reason recorded" a single state rather than two.
+        """
+        return as_plain_text(
+            value,
+            max_length=MODERATION_REASON_MAX_LENGTH,
+            label='Moderation reason',
+        )
 
     @validator('created_at', 'updated_at', always=True)
     def _validate_timestamp(cls, value: Any) -> Any:
@@ -370,6 +448,18 @@ class RatingCreate(BaseModel):
     persists explicitly and never serialises this model, so an extra
     key cannot reach the datastore.
 
+    That tolerance is deliberately NARROW. ``extra = 'allow'`` on its own
+    would accept any key a caller invented, so a body could carry
+    ``is_published``, ``moderation_status``, ``rater_id`` or a hundred
+    kilobytes of arbitrary keys and still be answered 201. None of those
+    could ever be persisted - the write path names its fields - but
+    accepting them makes the request contract undiscoverable and invites
+    a caller to believe a field had an effect it never had.
+    ``_reject_unsupported_keys`` below therefore refuses every
+    unrecognised key EXCEPT ``ratee_id``, so the model both keeps the one
+    claim it must be able to refuse and rejects everything else at the
+    boundary with a 422 that names the offending keys.
+
     These bounds are the authoritative ones - the client-side Zod
     mirror is a convenience, not a substitute. Because Pydantic
     validates the request body before the handler body runs, an
@@ -394,8 +484,11 @@ class RatingCreate(BaseModel):
       Every one of those records a score the caller never chose - the
       last silently rounding a rating down.
 
-    Unknown keys are RETAINED rather than dropped; ``Config`` below
-    explains why that is the safe choice for this particular model.
+    Exactly ONE unrecognised key is tolerated - ``ratee_id``, the
+    counterparty claim - and every other unrecognised key is REFUSED.
+    ``Config`` and ``_reject_unsupported_keys`` below explain why that
+    asymmetry, rather than blanket acceptance or blanket refusal, is the
+    correct contract for this model.
     """
 
     transaction_id: DocumentId
@@ -425,7 +518,57 @@ class RatingCreate(BaseModel):
         # {transaction_id, score, review}: the write path names every
         # persisted field explicitly and never serialises this model,
         # so a retained extra key cannot reach the datastore.
+        #
+        # ``allow`` is the widest of the three settings, and it is
+        # NARROWED back down by ``_reject_unsupported_keys`` below,
+        # which permits only ``ratee_id`` through. The pair is what
+        # expresses "retain one specific claim, refuse everything
+        # else"; Pydantic v1 has no per-key extra policy, so the
+        # permissive setting plus an explicit allow-list is the only
+        # way to say it.
         extra = 'allow'
+
+    @root_validator(pre=True)
+    def _reject_unsupported_keys(cls, values: Any) -> Any:
+        """Refuse every unrecognised key except the counterparty claim.
+
+        Runs ``pre`` so it sees the body as submitted, before coercion
+        and before ``extra = 'allow'`` has retained anything.
+
+        The allow-list is deliberately one entry long. ``ratee_id`` is
+        tolerated because the service must be able to compare it against
+        the derived counterparty and answer 403 on a mismatch - a guard
+        that is unreachable if the key is dropped, and equally
+        unreachable if the whole body is refused with a 422. Every other
+        unrecognised key is a caller mistake or a probe, and naming the
+        offending keys in the error is what makes the contract
+        discoverable rather than mysteriously permissive.
+
+        Args:
+            values: The raw submitted body, ordinarily a mapping.
+
+        Returns:
+            ``values`` unchanged when every key is supported.
+
+        Raises:
+            ValueError: One or more unsupported keys were supplied.
+        """
+        if not isinstance(values, dict):
+            return values
+        declared = set(cls.__fields__)
+        permitted = declared | {RATEE_ID_CLAIM}
+        unsupported = sorted(
+            str(key) for key in values if str(key) not in permitted
+        )
+        if unsupported:
+            raise ValueError(
+                'Unsupported field(s): {0}. Permitted fields are '
+                '{1}'.format(
+                    ', '.join(unsupported),
+                    sorted(declared),
+                )
+            )
+        return values
 
     @validator('review')
     def _validate_review(cls, value: Optional[str]) -> Optional[str]:

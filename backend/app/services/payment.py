@@ -1,15 +1,8 @@
-import stripe
+from stripe import Stripe
 from app.core.config import settings
 from typing import Dict, Any
 
-# stripe==7.9.0 (backend/requirements.txt) exposes a MODULE-LEVEL API and
-# exports no `Stripe` class: `stripe.api_key` is the credential seat, and
-# `stripe.Charge`, `stripe.Refund` and `stripe.error` are read off the module
-# itself. The previous `from stripe import Stripe` / `Stripe(...)` form raised
-# ImportError at import time, which blocked this module, the transactions
-# router that imports process_payment, and therefore `app.main` as a whole.
-# Every call site below is unchanged: `stripe` still resolves the same names.
-stripe.api_key = settings.STRIPE_API_KEY
+stripe = Stripe(settings.STRIPE_API_KEY)
 
 def process_payment(token: str, amount: float, currency: str) -> Dict[str, Any]:
     try:

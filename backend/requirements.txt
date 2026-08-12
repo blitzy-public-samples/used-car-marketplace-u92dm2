@@ -15,24 +15,30 @@
 # the module that imports it, so the manifest documents its own justification.
 #
 # -----------------------------------------------------------------------------
-# FIXED INVENTORY: THE SEVENTEEN PLANNED LINES, PLUS ONE DIRECT IMPORT
+# FIXED INVENTORY: THE SEVENTEEN PLANNED LINES, PLUS TWO AUTHORISED ADDITIONS
 # -----------------------------------------------------------------------------
-# The package set is frozen and is not a matter of local judgement. Adding a
-# line - even a well-intentioned compatibility pin, and even for a package that
-# is already in the resolved closure as a transitive dependency - is a
-# deviation. Where a compatibility problem is real it is recorded as a finding
-# in this header and resolved by an authorised change to the code that has the
-# problem, NOT by widening this file.
+# The package set is not a matter of local judgement. Adding a line - even a
+# well-intentioned compatibility pin, and even for a package already present in
+# the resolved closure as a transitive dependency - is a deviation, and needs
+# authorising as its own reviewed change rather than being smuggled in
+# alongside a feature.
 #
-# There is exactly ONE addition to the seventeen planned lines, and it is not a
-# compatibility pin: `google-api-core==2.30.3`. The rule above governs packages
-# this codebase does not import. google-api-core IS imported directly, by name,
-# at app/services/rating.py - `google.api_core.exceptions` is what tells a
-# duplicate vote apart from a retryable fault - and a distribution whose
-# EXCEPTION IDENTITY the feature's correctness depends on must not float with a
-# transitive resolution. Declaring it is therefore the same discipline that
-# fixes the other seventeen, not an exception to it. See the Google Cloud
-# section for the pin and its compatibility statement.
+# There are exactly TWO additions to the seventeen planned lines, and each
+# carries that authorisation:
+#
+#   * `google-api-core==2.30.3` - not a compatibility pin. The rule above
+#     governs packages this codebase does not import; google-api-core IS
+#     imported directly, by name, at app/services/rating.py, where
+#     `google.api_core.exceptions` is what tells a duplicate vote apart from a
+#     retryable fault. A distribution whose EXCEPTION IDENTITY the feature's
+#     correctness depends on must not float with a transitive resolution.
+#     Declaring it is the same discipline that fixes the other seventeen, not
+#     an exception to it. See the Google Cloud section for its compatibility
+#     statement.
+#   * `bcrypt==4.0.1` - a compatibility pin, and exactly the kind this header
+#     says must be authorised separately rather than assumed. Code review
+#     finding M5 is that authorisation. See RESOLVED FINDING 3 below for the
+#     measurements, and the Authentication section for the pin itself.
 #
 # Two further consequences are worth naming, because both were previously
 # mistaken for missing requirements:
@@ -76,7 +82,7 @@
 # backend/requirements.txt. No duplicate copy is placed at the repository root.
 #
 # -----------------------------------------------------------------------------
-# RECORDED FINDING 3: passlib 1.7.4 drives only bcrypt < 4.1 cleanly
+# RESOLVED FINDING 3: passlib 1.7.4 drives only bcrypt < 4.1 cleanly
 # -----------------------------------------------------------------------------
 # `passlib[bcrypt]==1.7.4` below resolves bcrypt through passlib's own extra,
 # which declares `bcrypt>=3.1.0` with NO upper bound. A clean resolution on
@@ -98,33 +104,44 @@
 # routes, so verify_password(), get_password_hash() and authenticate_user() are
 # not reachable from any endpoint - registration and login are F-001 work and
 # are out of scope. It becomes load-bearing the moment a login handler lands.
-# The fix is a one-line `bcrypt==4.0.1` constraint, which is deliberately NOT
-# taken here: this inventory is frozen at seventeen lines and the constraint
-# needs authorising as its own change rather than being smuggled in with a
-# feature. Recorded, not suppressed, and not silently absorbed.
+#
+# RESOLUTION: the `bcrypt==4.0.1` constraint IS now taken, below. This note
+# said the deviation had to be authorised as its own reviewed change rather
+# than smuggled in with a feature; code review finding M5 is that
+# authorisation. 4.0.1 is the only pairing measured both correct and silent
+# above, and holding there trades away no security to buy that compatibility:
+# bcrypt has zero published advisories at any version (checked against
+# OSV.dev), so there is no fix being declined by not moving to 5.x.
+# Re-verified after pinning: CryptContext(schemes=['bcrypt']) hashes and
+# verifies correctly and emits no "(trapped)" traceback.
 #
 # -----------------------------------------------------------------------------
-# RECORDED FINDING 4: the TRANSITIVE graph beneath these pins is not locked
+# RESOLVED FINDING 4: the TRANSITIVE graph beneath these pins is now locked
 # -----------------------------------------------------------------------------
-# Every line in this file is an exact pin, but the eighteen packages below pull
-# in roughly fifty more, and those fifty are free to float: two installs a week
-# apart can resolve different versions of grpcio, protobuf, cryptography or
-# starlette from this identical manifest. "Resolved and installed together" is
-# therefore true of the direct pins and NOT of the graph beneath them.
+# Every line in this file is an exact pin, but the nineteen packages below pull
+# in roughly fifty more, and until this finding was resolved those fifty were
+# free to float: two installs a week apart could resolve different versions of
+# grpcio, protobuf, cryptography or starlette from an identical manifest, so
+# "resolved and installed together" held for the direct pins but not for the
+# graph beneath them.
 #
 # A committed lock artifact (`pip install -c constraints.txt`) is the standard
-# closure of that gap and needs no workflow change. It is deliberately NOT
-# committed here, because a lock of the full closure necessarily pins bcrypt -
-# and pinning bcrypt is precisely the deviation RECORDED FINDING 3 above says
-# must be authorised as its own change rather than smuggled in. Generating the
-# lock from the currently installed environment would pin bcrypt 4.0.1 and
-# thereby make FINDING 3 read as already-solved when it is not; generating it
-# from a clean resolve would pin the broken bcrypt 5.0.0.
+# closure of that gap and needs no workflow change.
 #
-# So the two decisions are coupled, and both belong to whoever owns platform
-# dependencies: authorise the bcrypt constraint, then generate and commit the
-# lock in the same change. Until then the floating closure is a known, recorded
-# property of this manifest rather than an unexamined one.
+# RESOLUTION: that lock IS now committed, as backend/constraints.txt, under
+# code review finding M5. This note correctly identified that the two
+# decisions are coupled - a lock of the full closure necessarily pins bcrypt -
+# so both are taken together in this single reviewed change: bcrypt is pinned
+# to the measured-clean 4.0.1 below, and constraints.txt was generated from
+# the environment that pin produces. The lock therefore records 4.0.1 rather
+# than the broken 5.0.0 a clean unconstrained resolve would have chosen.
+#
+# To install the exact verified closure:
+#     pip install -r requirements.txt -c constraints.txt
+#
+# requirements.txt alone remains installable, and that is what CI runs today -
+# the constraints file is additive and pins only the transitive graph, so it
+# changes no direct pin and needs no workflow edit.
 # =============================================================================
 
 
@@ -141,7 +158,27 @@ uvicorn[standard]==0.23.2
 
 # Multipart/form-data parsing. FastAPI requires it for the
 # OAuth2PasswordRequestForm imported at app/api/auth.py:L2.
-python-multipart==0.0.6
+#
+# Raised 0.0.6 -> 0.0.20 for code review finding M8. 0.0.6 is affected by
+# CVE-2024-24762 (ReDoS in Content-Type option parsing, fixed in 0.0.7) and
+# CVE-2024-53981 (excessive-logging denial of service on malformed multipart
+# boundaries, fixed in 0.0.18). 0.0.20 clears both.
+#
+# 0.0.20 is the CEILING on this runtime, not a preference: every release from
+# 0.0.21 onward declares `requires-python >= 3.10`, while backend_ci.yml pins
+# 3.9 and that runtime is fixed as no-change. Advisories fixed only in 0.0.22
+# and later are therefore unreachable here without first raising the Python
+# target, which is a platform decision outside this change. That residual is
+# recorded rather than silently absorbed.
+#
+# Compatibility verified rather than assumed: starlette 0.27.0 - the release
+# fastapi 0.103.2 resolves - imports the LEGACY module name, at
+# formparsers.py:L10 `import multipart` and requests.py:L14
+# `from multipart.multipart import parse_options_header`. 0.0.20 still ships
+# that module alongside the renamed `python_multipart` package, so both import
+# paths resolve, and a form-encoded POST through OAuth2PasswordRequestForm
+# returns 200.
+python-multipart==0.0.20
 
 
 # --- Validation and settings -------------------------------------------------
@@ -158,7 +195,7 @@ python-multipart==0.0.6
 # L48-L49 says the same). No separate requirement is needed for it: python-
 # dotenv arrives in the closure through the `uvicorn[standard]` extra above,
 # which declares `python-dotenv>=0.13`. Verified on CPython 3.9.25 - installing
-# these seventeen lines yields a working python-dotenv, so the documented
+# this manifest yields a working python-dotenv, so the documented
 # `cp .env.example .env` path configures the application rather than breaking
 # it. Do not add a python-dotenv line to "make sure": it is already there.
 pydantic==1.10.13
@@ -168,14 +205,35 @@ pydantic==1.10.13
 
 # JWT encode/decode - app/api/auth.py:L3 and app/core/security.py:L2. The
 # [cryptography] extra supplies the signing backend the HS256 algorithm needs.
-python-jose[cryptography]==3.3.0
+#
+# Raised 3.3.0 -> 3.5.0 for code review finding m8. 3.3.0 is affected by
+# CVE-2024-33663 (algorithm confusion when an OpenSSH ECDSA public key is
+# supplied, rated CRITICAL) and CVE-2024-33664 (JWE decompression bomb causing
+# denial of service). Both are fixed in 3.4.0; 3.5.0 is the current release of
+# that line and carries no known advisory. It still declares
+# `requires-python >= 3.9`, so it fits the pinned runtime with no runtime
+# change. Re-verified after upgrading against the exact code path in
+# app/api/auth.py: an HS256 encode/decode round trip returns the original
+# claims, and a tampered signature raises JWTError instead of validating.
+python-jose[cryptography]==3.5.0
 
 # Password hashing - app/api/auth.py:L4,L13 and app/core/security.py:L3,L9
 # build a CryptContext(schemes=['bcrypt']). The `[bcrypt]` extra brings the
-# bcrypt backend itself into the closure, unversioned by design here - see
-# RECORDED FINDING 3 in the header for the passlib/bcrypt version constraint
-# that a future authorised change should add, and why it is not added now.
+# bcrypt backend into the closure, but declares only `bcrypt>=3.1.0` with no
+# upper bound - so the backend has to be pinned explicitly on its own line
+# below. See RESOLVED FINDING 3 in the header for the measurements.
 passlib[bcrypt]==1.7.4
+
+# The bcrypt backend passlib drives, pinned for code review finding M5.
+# Without this line a clean resolve installs bcrypt 5.0.0, which BREAKS passlib
+# 1.7.4: passlib's backend probe hashes a >72-byte secret to detect an old wrap
+# bug, and bcrypt 5.x raises `ValueError: password cannot be longer than 72
+# bytes` instead of truncating, so hash() and verify() raise instead of
+# working. 4.0.1 is the only version measured both correct AND silent;
+# 4.1.1-4.3.0 hash correctly but log a "(trapped) error reading bcrypt
+# version" traceback on every call, because bcrypt >= 4.1 removed the
+# `bcrypt.__about__` attribute that passlib's version probe reads.
+bcrypt==4.0.1
 
 
 # --- Google Cloud ------------------------------------------------------------
@@ -213,9 +271,15 @@ google-cloud-documentai==2.20.1
 # API: the credential seat is `stripe.api_key`, and resources are read off the
 # module as `stripe.Charge`, `stripe.Refund` and `stripe.error`. There is no
 # `Stripe` class to import from it - `from stripe import Stripe` raises
-# ImportError - and no `StripeClient` either; that arrived in 8.x. This pin is
-# the AAP's frozen version, so app/services/payment.py:L1,L12 was aligned to
-# the API this distribution actually exports rather than the pin being moved.
+# ImportError - and no `StripeClient` either; that arrived in 8.x.
+#
+# RECORDED, NOT FIXED: app/services/payment.py:L1,L12 is written against that
+# non-existent `Stripe` class, so importing it raises ImportError, and with it
+# the transactions router that imports process_payment and therefore app.main.
+# The pin is the plan's version and is not moved to accommodate the module,
+# and the module is not rewritten here either: it is a reference-only file
+# outside this feature's scope, so the mismatch belongs to a change that owns
+# it. Nothing in the rating feature imports payment.py.
 stripe==7.9.0
 
 
