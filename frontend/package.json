@@ -3,10 +3,6 @@
   "version": "1.0.0",
   "description": "Frontend for the Used Car Marketplace platform (React + TypeScript + Vite)",
   "private": true,
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
-  },
   "dependencies": {
     "@reduxjs/toolkit": "^1.9.5",
     "@stripe/react-stripe-js": "^2.3.0",
@@ -34,7 +30,6 @@
     "@types/react-dom": "^18.2.6",
     "@typescript-eslint/eslint-plugin": "^6.7.3",
     "@typescript-eslint/parser": "^6.7.3",
-    "@vitejs/plugin-react": "^4.0.3",
     "autoprefixer": "^10.4.14",
     "eslint": "^8.50.0",
     "eslint-plugin-react-hooks": "^4.6.0",
@@ -43,14 +38,15 @@
     "tailwindcss": "^3.3.2",
     "typescript": "^5.1.6",
     "vite": "^4.4.2",
-    "vitest": "^0.34.6"
+    "vitest": "^0.34.6",
+    "@vitejs/plugin-react": "^4.0.3"
   },
   "scripts": {
     "start": "vite",
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest run --passWithNoTests",
-    "test:watch": "vitest",
+    "test": "vitest run --passWithNoTests --environment jsdom --globals",
+    "test:watch": "vitest --environment jsdom --globals",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
@@ -94,5 +90,9 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   }
 }

@@ -1,25 +1,19 @@
-# Ignore rules for the Used Car Marketplace repository, added with the root npm
-# workspace manifest: the repository had no ignore rules at all, and a root
-# `npm install` (formerly an ENOENT failure) now hoists a large node_modules/ here.
-# NOTE: package-lock.json is deliberately NOT ignored - the single root lockfile is
-# committed so that `npm ci` stays reproducible both locally and in CI.
+# Added with the root npm workspace manifest: this repository had no ignore rules at
+# all, and a root `npm install` (formerly an ENOENT failure) now hoists a large
+# node_modules/ tree here. package-lock.json is NOT ignored - the single committed
+# root lockfile is what keeps `npm ci` reproducible, locally and in CI.
 
-# npm / Node dependencies (hoisted into one root tree by npm workspaces)
+# npm / Node dependencies (hoisted into one root tree) and frontend build output
 node_modules/
-
-# Frontend build output (Vite writes dist/; build/ is legacy CRA output)
 frontend/dist/
 frontend/build/
-
-# Local environment files and overrides - never commit real credentials
+# Local environment files - never commit real credentials
 .env
 .env.*.local
-
 # Python backend artifacts (scripts/setup_environment.sh creates ./venv)
 venv/
 __pycache__/
 *.pyc
-
 # Package manager debug logs
 npm-debug.log*
 yarn-debug.log*
