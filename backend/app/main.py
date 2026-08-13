@@ -12,13 +12,15 @@ from app.core.config import settings
 
 # Every attribute a LogRecord carries by construction, read from the running
 # interpreter so that a version which adds one -- 3.12 added taskName -- needs
-# no edit here. Anything on a record outside this set arrived through `extra`
-# and is request context worth printing.
+# no edit here. A field outside this set is one the record gained after
+# construction -- through `extra` at the call site, or through a record
+# factory or adapter -- and is the context worth printing.
 _LOG_RECORD_FIELDS = frozenset(
     vars(logging.LogRecord('', 0, '', 0, '', None, None))
 ) | {'asctime', 'message'}
-# Every module of this application names its logger with
-# logging.getLogger(__name__), so they all sit under this one namespace.
+# Every logger this application currently creates is named with
+# logging.getLogger(__name__), so they all sit under this one namespace. A
+# module that creates none simply logs nothing of its own.
 _APP_LOGGER_NAME = 'app'
 
 
@@ -26,8 +28,9 @@ def _escape_log_context(value):
     """Flatten one context value onto a single line.
 
     A context field can carry text a request influenced, and a newline inside
-    a log line is a forged log line, so control characters are escaped rather
-    than emitted.
+    a log line is a forged log line, so backslash, newline, carriage return
+    and tab are escaped. Those four and no others: this is line-forgery
+    defence, not general control-character sanitisation.
     """
     text = str(value)
     for character, replacement in (
@@ -38,15 +41,17 @@ def _escape_log_context(value):
 
 
 class ContextFormatter(logging.Formatter):
-    """Formatter that also renders whatever was passed through ``extra``.
+    """Formatter that also renders a record's non-standard fields.
 
-    A format string can only render a field it names, and raises KeyError on a
-    record that lacks it -- so correlation_id, attached by the listing handler
-    and absent from every other record, cannot be rendered that way.
-    Appending the fields a record carries beyond the standard set renders
-    `extra` without coupling the format string to any one key, which is what
-    makes logger.exception('photo analysis failed', extra={...}) traceable
-    back to the request that produced it.
+    A format string can only render a field it names, and raises
+    ValueError: Formatting field not found in record on one that lacks it --
+    so correlation_id, attached by the listing handler and absent from every
+    other record, cannot be rendered that way. Appending whatever a record
+    carries beyond the standard set renders those fields, anything a caller
+    passed through `extra` among them, without coupling the format string to
+    any one key, which is what makes
+    logger.warning('photo analysis failed', extra={'correlation_id': ...,
+    'error_type': ...}) traceable back to the request that produced it.
     """
 
     def formatMessage(self, record):
@@ -74,7 +79,19 @@ def _configure_application_logging():
     without even a level name. Configuring the namespace once, here in the
     composition root, is what makes both observable.
 
-    A namespace an operator has already configured is left exactly as it is.
+    An operator who attaches a handler to this namespace before `app.main` is
+    imported keeps their configuration: the guard below returns on the first
+    handler it finds. Configuration that attaches no handler -- a level or a
+    propagation flag on its own -- is overwritten, so attach the handler too.
+
+    INFO is also where the level split matters. Handlers log the message and
+    the escaped `extra` context at INFO or WARNING and put the traceback and
+    the third-party error text behind DEBUG, so what a production process
+    prints by default names the class of a failure and the request it belongs
+    to without publishing absolute paths, parser internals or provider text
+    that can quote the request itself. Raising this namespace to DEBUG, or
+    configuring it yourself before importing this module, is what turns that
+    detail on -- so point it at a sink whose readers are allowed to see it.
     """
     app_logger = logging.getLogger(_APP_LOGGER_NAME)
     if app_logger.handlers:
@@ -117,6 +134,21 @@ async def shutdown_event():
     # Release AI model resources
     pass
 
+# allow_credentials=True is what makes the origin list load-bearing: in this
+# configuration starlette echoes back the requesting origin instead of a
+# literal '*', so a wildcard would admit every site on the internet rather than
+# failing safe. app/core/config.py therefore refuses an ALLOWED_ORIGINS entry
+# containing '*' outright, which is the guard that belongs to this middleware.
+# The two wildcards that remain here are method and header lists, and narrowing
+# them is a policy change this repair set is not authorized to make -- tracked
+# as NT-11 in documentation/ONBOARDING.md.
+#
+# No security-header middleware is registered either, and that is a decision
+# rather than an omission: HSTS, CSP, frame and content-type options, referrer
+# policy and host validation belong to whatever terminates TLS in front of this
+# application, which is also the only component that knows the deployed origin.
+# The one header this application does own is Cache-Control: no-store on the
+# token and profile responses, set by the handlers in app/api/auth.py.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
