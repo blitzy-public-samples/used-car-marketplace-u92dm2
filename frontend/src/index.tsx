@@ -6,6 +6,7 @@ import { loadStripe } from '@stripe/stripe-js';
 import App from './App';
 import { store } from './store';
 import { setupInterceptors } from './services/api';
+import './styles/index.css';
 
 const STRIPE_PUBLIC_KEY = process.env.REACT_APP_STRIPE_PUBLIC_KEY;
 
