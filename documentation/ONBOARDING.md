@@ -27,7 +27,7 @@ This guide takes you from a clean machine to a **running** local application —
 >
 > **Read 13 as routes *registered*, never as endpoints *working*** — two of them do not work, and no port is served until you either take the local profile in [section 1.7.1](#171-the-local-development-profile) or repair **HCF-3** properly.
 >
-> Every one of those claims is reproducible, and no way of reproducing them needs a running server: [section 1.9](#19-verify-your-checkout) is the gate set you run before every commit, [section 1.10](#110-before-you-call-a-change-done) is the full protocol — ten categories and forty-four numbered assertions, each naming the artefact that owns it — and [section 6](#6-verifying-behaviour-in-process) is a self-contained script that asserts a hundred and thirty-nine of the same properties in a few seconds with no network, no credential and no server. Each says plainly what it cannot prove, and each points at the two properties that need a Firestore emulator instead, because an in-memory double cannot model a race.
+> Every one of those claims is reproducible, and no way of reproducing them needs a running server: [section 1.9](#19-verify-your-checkout) is the gate set you run before every commit, [section 1.10](#110-before-you-call-a-change-done) is the full protocol — ten categories and forty numbered assertions, each naming the artefact that owns it — and [section 6](#6-verifying-behaviour-in-process) is a self-contained script that asserts ninety-nine of the same properties in a few seconds with no network, no credential and no server. Each says plainly what it cannot prove, and each points at the concurrency properties that need a Firestore emulator instead, because an in-memory double cannot model a race.
 >
 > Every gap named here is recorded with its reasons in [section 5](#5-suggested-next-tasks). None of them is something you have misconfigured, and [section 3](#3-common-pitfalls) tells you what each failure looks like so you can recognise it in a second rather than debug it for an hour.
 
@@ -190,7 +190,8 @@ export STRIPE_WEBHOOK_SECRET="whsec_xxx"
 # Optional, and shown because it is the one setting whose absence is invisible:
 # this is exactly the value the field already defaults to, so exporting it changes
 # nothing today but puts the origin your browser will use in front of you. Accepts
-# a comma-separated list or a JSON array -- see section 3.4.
+# a comma-separated list or a JSON array, and nothing rejects a wildcard, so name
+# every origin in full -- see section 3.4.
 export ALLOWED_ORIGINS="http://localhost:3000"
 ```
 
@@ -216,17 +217,17 @@ Two of the required variables are not yet consumed by any code. They are still m
 | --- | --- | --- | --- |
 | `PROJECT_NAME` | Yes | — | **No consumer yet.** `app/main.py` constructs `FastAPI()` with no title, so this value is required but unused (task **NT-8**). |
 | `API_V1_STR` | Yes | — | Builds the OAuth2 `tokenUrl` published in the OpenAPI schema. **Keep it as `/api`**: the router prefixes in `app/main.py` are literals, so a different value desynchronises the advertised token URL from the real one. |
-| `SECRET_KEY` | Yes | — | HS256 signing and verification key for every access token. **At least 32 characters, or the import fails** — `openssl rand -hex 32` gives 64. Never reuse one across environments. |
-| `ALGORITHM` | No | `HS256` | JWT algorithm, used for both signing and verification. **`HS256`, `HS384` or `HS512` only**; case is normalised. Anything else is refused at import — an asymmetric algorithm would need a key pair no setting supplies, and `none` would switch verification off entirely. |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | Yes | — | Access-token lifetime in minutes. Honoured on every issued token. **Must be between 1 and 1440.** `0` is refused rather than accepted, because a falsey delta is what `create_access_token` reads as "unset" before substituting 15 minutes — so a zero would silently mean something else. The ceiling is a day because nothing here can revoke a token before it expires ([section 2.5.1](#251-logout-is-stateless)). |
+| `SECRET_KEY` | Yes | — | HS256 signing and verification key for every access token. Nothing checks its length, so a short key is accepted and then signs every token with whatever entropy it has — use `openssl rand -hex 32`, which gives 64 characters, and never reuse one across environments (**NT-39**). |
+| `ALGORITHM` | No | `HS256` | JWT algorithm, passed as given to both signing and verification. Leave it at `HS256`: it is the symmetric family this project holds a shared secret for, and nothing validates the value, so an asymmetric name fails at the first token issued and `none` would be handed to the signer as written (**NT-39**). |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Yes | — | Access-token lifetime in minutes. Honoured on every issued token. **Avoid `0`**: `timedelta(minutes=0)` is falsey, and `create_access_token` reads a falsey delta as "unset" and substitutes 15 minutes, so a zero silently means something else. Nothing refuses a value at either extreme, and nothing here can revoke a token before it expires ([section 2.5.1](#251-logout-is-stateless)), so a long lifetime is a long exposure (**NT-39**). |
 | `GOOGLE_CLOUD_PROJECT` | Yes | — | Project for the Firestore client, which every import of the application builds, and for the Cloud Storage client, which is built only if `app/db/cloud_storage.py` is imported — and nothing imports it ([section 3.11](#311-clients-are-built-at-import-not-at-startup)). |
 | `GOOGLE_CLOUD_STORAGE_BUCKET` | Yes | — | Bucket handle acquired at import by `app/db/cloud_storage.py`. |
 | `STRIPE_API_KEY` | Yes | — | Handed to the Stripe client that `app/services/payment.py` constructs at its line 5 — a line no clean import currently reaches (**HCF-3**). Still required regardless. |
 | `STRIPE_WEBHOOK_SECRET` | Yes | — | **No consumer yet.** No webhook route exists; the variable is required regardless (task **NT-9**). |
 | `SENTRY_DSN` | No | unset | Optional error-reporting endpoint. No consumer yet. |
-| `ALLOWED_ORIGINS` | No | `["http://localhost:3000"]` | Origins accepted by the CORS middleware. Accepts a comma-separated list **or** a JSON array, and blank entries are dropped. **No entry may contain `*`** — see [section 3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash) for why a wildcard is refused rather than merely discouraged. |
+| `ALLOWED_ORIGINS` | No | `["http://localhost:3000"]` | Origins accepted by the CORS middleware. Accepts a comma-separated list **or** a JSON array, and blank entries are dropped. **Name every origin in full and never use `*`** — see [section 3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here) for what a wildcard actually does here, which is not what it looks like. |
 
-**Four of these settings are validated, not merely typed, and a value outside the policy stops the process at import with a message naming the fix.** That is deliberate: every one of them is read by code that cannot defend itself — the signer takes `ALGORITHM` as given, the token helper reads a falsey lifetime as "unset", and the CORS middleware runs with credentials enabled. A refusal at import is the one failure mode an operator cannot miss; a weak value that works is the one nobody notices.
+**None of these settings is validated beyond its type.** Pydantic checks that `ACCESS_TOKEN_EXPIRE_MINUTES` is an integer and that the required ones are present, and that is the whole of it: a five-character `SECRET_KEY`, a three-day token lifetime, an unsupported `ALGORITHM` and a wildcard origin all import without complaint and then govern. That is worth knowing rather than assuming, because each of them is read by code that cannot defend itself — the signer takes `ALGORITHM` as given, the token helper reads a falsey lifetime as "unset", and the CORS middleware runs with credentials enabled. Adding those bounds is **NT-39**; until then the values in the export block above are the reviewed ones.
 
 `CELERY_BROKER_URL` is **not** in this table on purpose. The background-task module reads it, but the settings object does not declare it, so that module cannot import at all (task **NT-6**).
 
@@ -383,9 +384,11 @@ uvicorn app.main:app --reload --port 8000
 A successful start prints the application's own startup line, and the interactive documentation is then live:
 
 ```text
-2026-01-01 12:00:00,000 INFO app.main: startup complete: firestore and vision clients initialised at import
+INFO:app.main:startup complete: firestore and vision clients initialised at import
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
+
+Two lines, two different formats, and the difference is worth recognising rather than puzzling over. The first is the application's, printed by the handler `logging.basicConfig` installs on the **root** logger — Uvicorn's own logging configuration does not touch root, so `basicConfig` is what governs anything the application logs, in its default `LEVEL:logger:message` form. The second is Uvicorn's, through the loggers it configures for itself. Neither renders the `extra` keys the application attaches to a record ([section 1.11](#111-where-the-logs-go)).
 
 - Swagger UI — <http://localhost:8000/docs>
 - OpenAPI schema — <http://localhost:8000/openapi.json>
@@ -422,7 +425,7 @@ curl -sS -w "$STATUS" -X POST "$BASE/auth/login" -H 'Content-Type: application/j
 | Behaviour under the profile | Why |
 | --- | --- |
 | All four authentication routes, both listing reads, listing creation, both transaction routes: **as documented** | Real handler code, real Pydantic validation, real bcrypt, real JWTs, real Firestore queries against the emulator |
-| Listing creation with photos answers **200**, stores `photo_analysis: []` on the document, and logs `photo analysis failed` once per photo with a shared `correlation_id` | The Vision stand-in raises, and the per-photo call is guarded — the same degraded path a real **HCF-4** failure takes ([section 4.4](#44-call-services-synchronously-and-guard-them)). The response body carries the listing's own fields only, so the analysis is visible in Firestore and in the log, not in the answer |
+| Listing creation with photos answers **200**, stores `photo_analysis: []` on the document, and prints `ERROR:app.api.listings:photo analysis failed` **and a traceback** once per photo | Not the stand-in — Pillow. `analyze_vehicle_photo` opens the payload with `Image.open` **before** it touches the Vision client, and the payload is a URL string encoded to bytes, so it raises `PIL.UnidentifiedImageError` and the Vision stand-in is never reached. That is **HCF-5** arriving first, and **HCF-4** waiting behind it; the per-photo call is guarded, so the result degrades instead of failing the request ([section 4.4](#44-call-services-synchronously-and-guard-them)). The response body carries the listing's own fields only, so the analysis is visible in Firestore and in the log, not in the answer |
 | A purchase answers **400 `Payment processing failed`**, writes no transaction and leaves the vehicle `available` | The Stripe stand-in declines every charge. This is the profile failing closed, not a defect |
 | Set `LOCAL_PROFILE_FAKE_CHARGE=1` and the same purchase answers **200**, writes the transaction as `completed` and marks the vehicle `sold` | The stand-in reports a fake settlement. **Nothing was charged.** Use it to walk the success branch, and never treat a green run as evidence that Stripe integration works |
 | A purchase needs a vehicle document you wrote yourself | Nothing in this codebase creates one (**HCF-7**, [section 2.9](#29-the-purchase-path)). Write `vehicles/{id}` with `{"status": "available"}` against the emulator first |
@@ -580,15 +583,17 @@ There is no Flake8 configuration file anywhere, so a bare `python -m flake8 back
 
 ### 1.9.5 Gate 5 — behaviour
 
-`pytest` cannot serve as this gate: it collects nothing here ([section 3.7](#37-pytest-is-not-a-gate)), and an unstubbed server does not start ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)). What is available is the in-process harness in [section 6](#6-verifying-behaviour-in-process): one script, no credentials, no network, 139 assertions covering the routes, the authentication flow and its policy, the attempt ceilings, both write paths and every input bound, CORS, the settings policy and the logging subsystem. Run it before you claim any behaviour works. When what you changed is the *shape* of a request or a response, follow it with the smoke test in [section 1.7.1](#171-the-local-development-profile) — that is the only check here that puts a real socket, a real HTTP parser and a real JSON body in the path.
+`pytest` cannot serve as this gate: it collects nothing here ([section 3.7](#37-pytest-is-not-a-gate)), and an unstubbed server does not start ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)). What is available is the in-process harness in [section 6](#6-verifying-behaviour-in-process): one script, no credentials, no network, 99 assertions covering the routes, the authentication flow, both write paths, the guards each of them does and does not apply, CORS, the settings contract and the startup and failure log records. Run it before you claim any behaviour works. When what you changed is the *shape* of a request or a response, follow it with the smoke test in [section 1.7.1](#171-the-local-development-profile) — that is the only check here that puts a real socket, a real HTTP parser and a real JSON body in the path.
 
 ## 1.10 BEFORE YOU CALL A CHANGE DONE
 
-[Section 1.9](#19-verify-your-checkout) is what you run before every commit. This section is what you run before you call a change **done**. It is **ten categories and forty-four numbered assertions**, and it is written out in full so that nobody has to re-derive it from prose — the whole point is that two people checking the same change check the same things.
+[Section 1.9](#19-verify-your-checkout) is what you run before every commit. This section is what you run before you call a change **done**. It is **ten categories and forty numbered assertions**, and it is written out in full so that nobody has to re-derive it from prose — the whole point is that two people checking the same change check the same things.
 
 Every assertion here is reproducible on a laptop with no cloud credentials and **no running server**. Nothing in it is aspirational: each one was executed against this checkout and each one passed.
 
-Two sections cover verification, and they are not the same thing. This one is the **checklist** — what has to be true, written out so a reviewer and an author check the same things. [Section 6](#6-verifying-behaviour-in-process) is the **executable** form: one self-contained script that installs the same two stubs, drives the same flows against an in-memory datastore and asserts a hundred and thirty-nine properties in a few seconds. Run section 6 to get an answer; use this section to know what the answer has to cover, including the categories the script deliberately leaves to you.
+Some assertions pin a **gap** rather than a guarantee — a request this API accepts that a policy would refuse. They are here because an unwritten gap is one that gets rediscovered as a surprise, and because the day someone closes one, the assertion should fail and be updated deliberately. Each names the task that would close it.
+
+Two sections cover verification, and they are not the same thing. This one is the **checklist** — what has to be true, written out so a reviewer and an author check the same things. [Section 6](#6-verifying-behaviour-in-process) is the **executable** form: one self-contained script that installs the same two stubs, drives the same flows against an in-memory datastore and asserts ninety-nine properties in a few seconds. Run section 6 to get an answer; use this section to know what the answer has to cover, including the categories the script deliberately leaves to you.
 
 | # | Category | Assertions | Needs |
 | --- | --- | ---: | --- |
@@ -596,18 +601,18 @@ Two sections cover verification, and they are not the same thing. This one is th
 | 2 | F-code lint | A2–A3 | nothing |
 | 3 | Import probes | A4–A6 | the stubs in [1.10.1](#1101-the-two-sanctioned-stubs) for A6 |
 | 4 | Route and OpenAPI inventory | A7–A9 | stubs |
-| 5 | Authentication, and its policy | A10–A22 | stubs + a datastore |
-| 6 | Listing write path, and its bounds | A23–A29 | stubs + a datastore |
-| 7 | Transaction write path, and its guards | A30–A37 | stubs + a datastore |
-| 8 | CORS and settings policy | A38–A41 | stubs for A38–A39 |
-| 9 | Log assertions | A42–A43 | stubs + a datastore |
-| 10 | Change-set containment | A44 | git |
+| 5 | Authentication, and what it does not check | A10–A20 | stubs + a datastore |
+| 6 | Listing write path, and its bounds | A21–A26 | stubs + a datastore |
+| 7 | Transaction write path, and its guards | A27–A33 | stubs + a datastore |
+| 8 | CORS and configuration | A34–A37 | stubs for A34–A35 |
+| 9 | Log assertions | A38–A39 | stubs + a datastore |
+| 10 | Change-set containment | A40 | git |
 
 **Two things are deliberately *not* gates here.** `pytest` collects nothing ([section 3.7](#37-pytest-is-not-a-gate)), and an unstubbed `uvicorn app.main:app` cannot start ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)). Neither can be used, and neither is a substitute for what follows.
 
 **One further property is outside every category above**, because no in-process assertion can reach it: that the routes actually answer over HTTP, through a real socket, a real HTTP parser and a real JSON body. The smoke test in [section 1.7.1](#171-the-local-development-profile) is what establishes it, and it is worth running whenever you change the shape of a request or a response.
 
-**Two of these properties cannot be established in-process at all**, and saying so is part of the protocol rather than a footnote to it: that a registration race resolves to exactly one account, and that a replayed payment intent is refused by a real query. Both depend on datastore behaviour an in-memory double does not model. Verify them against a Firestore emulator, under the fail-closed conditions in [1.10.1](#1101-the-two-sanctioned-stubs), and say which gate you used when you report the result.
+**Concurrency is outside it too**, and saying so is part of the protocol rather than a footnote to it: two simultaneous registrations for one address, and two simultaneous buyers for one vehicle, are both unguarded (**NT-40**, **NT-28**) and neither is observable against an in-memory double, which serialises everything. Take them to a Firestore emulator, under the fail-closed conditions in [1.10.1](#1101-the-two-sanctioned-stubs), and say which gate you used when you report the result.
 
 ### 1.10.1 The two sanctioned stubs
 
@@ -656,7 +661,7 @@ export GOOGLE_CLOUD_PROJECT="probe-$(date +%s)"   # a throwaway, per run
 - **Delete what you wrote, in a `finally`.** Stream each collection you touched and delete the documents. An emulator that outlives the run keeps its data.
 - **Never point one of these runs at a shared emulator or a real project**, and say which gate you used when you report the result: "verified in-process against doubles" and "verified against an emulator" are different claims.
 
-Drive the app with Starlette's `TestClient` (`from fastapi.testclient import TestClient`). Keep `httpx` below 0.28 — 0.28 removed the `Client(app=…)` shortcut `starlette 0.27` relies on. Use it as a **context manager**, or the startup event never fires and A35 cannot pass.
+Drive the app with Starlette's `TestClient` (`from fastapi.testclient import TestClient`). Keep `httpx` below 0.28 — 0.28 removed the `Client(app=…)` shortcut `starlette 0.27` relies on. Use it as a **context manager**, or the startup event never fires and A38 cannot pass.
 
 ### 1.10.2 Categories 1–4 — the static and structural gates
 
@@ -665,7 +670,7 @@ Drive the app with Starlette's `TestClient` (`from fastapi.testclient import Tes
 | **A1** | All seven changed modules compile | `python -m py_compile` over them exits 0 ([section 1.9](#19-verify-your-checkout)) |
 | **A2** | Those modules report **zero** `F401`/`F811`/`F821`/`F841` | the changed-file `flake8` command in [section 1.9](#19-verify-your-checkout) prints nothing |
 | **A3** | The tree-wide F-code baseline is still **ten** findings, none in a file you changed | the package-wide `flake8` command in [section 1.9](#19-verify-your-checkout); compare against the table there |
-| **A4** | `Message.__fields__` is exactly `['content', 'id', 'read', 'recipient_id', 'sender_id', 'timestamp', 'vehicle_listing_id']` | `python -c "from app.schema.message import Message; print(sorted(Message.__fields__))"` — no stubs needed |
+| **A4** | `Message.__fields__` is exactly `['content', 'id', 'read', 'recipient_id', 'sender_id', 'timestamp', 'vehicle_listing_id']`, and the model carries no validators | `python -c "from app.schema.message import Message; print(sorted(Message.__fields__))"` — no stubs needed |
 | **A5** | `app.api.messages` and `app.api.transactions` each import with no `ModuleNotFoundError` and no `NameError` | `python -c "import app.api.messages, app.api.transactions"` with the stubs in place |
 | **A6** | `import app.main` succeeds | prints your own marker; this is the assertion that the boot chain is whole |
 | **A7** | **13 routes across 9 unique `/api` paths**, and the four auth paths are exactly `/api/auth/register`, `/login`, `/logout`, `/me` | the route-table snippet in [section 2.7](#27-the-routes-as-actually-served) |
@@ -676,69 +681,65 @@ A8 is the one people skip, and it is the one that catches an accidental "tidy" o
 
 ### 1.10.3 Categories 5–7 — the behavioural gates
 
-**Category 5 — authentication and its policy (A10–A22).** The first ten are the flow; the last three are the policy that keeps the flow from being abused.
+**Category 5 — authentication, and what it does not check (A10–A20).** The first ten are the flow. A20 is the other half of the truth: what the two public routes accept.
 
 | # | Request | Expect |
 | --- | --- | --- |
-| **A10** | `POST /api/auth/register`, fresh email | **201**; body keys exactly `access_token`, `token_type`, `token`, `user`; header `Cache-Control: no-store`; the string `hashed_password` appears **nowhere** in the serialized payload |
+| **A10** | `POST /api/auth/register`, fresh email | **201**; body keys exactly `access_token`, `token_type`, `token`, `user`; the string `hashed_password` appears **nowhere** in the serialized payload; exactly **one** document written, in `users` and no other collection |
 | **A11** | the same body again | **409** `Email is already registered`, and the `users` query for that email still returns **one** document |
-| **A12** | `POST /api/auth/login`, correct credentials | **200**; `access_token == token`; `user` is an object; header `Cache-Control: no-store` |
+| **A12** | `POST /api/auth/login`, correct credentials | **200**; `access_token == token`; `user` is an object |
 | **A13** | login, wrong password | **401** with header `WWW-Authenticate: Bearer` |
 | **A14** | login, unknown email | **401** with a detail **byte-identical** to A13 — this is the no-enumeration property |
-| **A15** | `GET /api/auth/me` with the token | **200**; `user` holds exactly `id, email, first_name, last_name, role, created_at, updated_at`; header `Cache-Control: no-store` |
+| **A15** | `GET /api/auth/me` with the token | **200**; `user` holds exactly `id, email, first_name, last_name, role, created_at, updated_at` |
 | **A16** | `/me` with no `Authorization` header | **401** + `WWW-Authenticate: Bearer` (detail `Not authenticated` — see [section 2.5](#25-authentication-and-tokens)) |
 | **A17** | `/me` with `Bearer not-a-real-token` | **401** + `WWW-Authenticate: Bearer` (detail `Could not validate credentials`) |
 | **A18** | `POST /api/auth/logout` with the token | **200**, body exactly `{"detail": "Logged out"}` |
 | **A19** | decode the issued token with `SECRET_KEY` | claims are exactly `['exp', 'sub']`, `sub` is the user's document id, and the measured lifetime matches `ACCESS_TOKEN_EXPIRE_MINUTES` — **not** the 15-minute fallback |
-| **A20** | register with `role: "admin"`, then `"root"`, then `"  "` | **422** every time, and **no** document written. Then register with `role: "Seller"` and read the stored role back: it is `seller`, lower-cased, because every authorization check compares the string exactly |
-| **A21** | register with a malformed address, an address over 254 characters, a password of 7 characters, a password over 72 **bytes** once UTF-8 encoded, a blank name, and a name over 100 characters | **422** for each, all of them **before** the duplicate lookup, bcrypt and Firestore, so the write counter never moves. Then register `" Seller@Harness.TEST "` and confirm the stored address is `seller@harness.test`, that `SELLER@harness.test` answers **409**, and that logging in with either spelling answers **200** |
-| **A22** | drive `POST /api/auth/login` past ten attempts in one minute, then `POST /api/auth/register` past five | **429** with a `Retry-After` header and a detail that mentions neither the address nor whether it exists; nothing written for the refused registration. A correct sign-in clears its own counters. Registration also writes a `user_emails/{sha256(email)}` marker — pre-create one for an unused address and registration answers **409** with no account written, which is the atomic half of uniqueness |
+| **A20** | register with `role: "admin"`; with a malformed address; with a one-character password; with a blank name. Then register `"Seller@Harness.TEST"` and sign in as `"seller@harness.test"` | **201** for every one of the first four, each stored exactly as sent — including the self-granted `admin` role, which `delete_listing` trusts. The sign-in answers **401**, because the address is matched exactly and nothing normalises it. These are gaps, not features (**NT-24**); assert them so that adding the policy is a deliberate change to this table |
 
-**Category 6 — listing write path and its bounds (A23–A29).** Patch the module-level name, not the service module: `app.api.listings.analyze_vehicle_photo = my_fake`. That is the call site under test.
+**Category 6 — listing write path and its bounds (A21–A26).** Patch the module-level name, not the service module: `app.api.listings.analyze_vehicle_photo = my_fake`. That is the call site under test.
 
 | # | Request | Expect |
 | --- | --- | --- |
-| **A23** | `POST` a listing (as a `seller`) with two photo URLs | **200**; the helper is called **exactly twice**, and **each argument is `bytes`** |
-| **A24** | the same with `photos: []` | **200**; the helper is **not** called; the stored `photo_analysis` is `[]` |
-| **A25** | the same where the helper raises on **every** photo | **200** — a degraded analysis, never a 500; stored `photo_analysis` is `[]` |
-| **A26** | the same where it raises on one of two | **200**, and the one successful result is retained |
-| **A27** | `POST` a listing as a `buyer` | **403** `Only sellers can create listings`, and **no** helper call |
-| **A28** | `POST` with thirteen photos; with one entry over 256 KiB; with four 250 KB entries; with a blank entry | **422** every time, **zero** helper calls and **zero** writes — the bounds run before the first outbound call, not after it. The record-count, aggregate-maintenance-content and serialized-size guards still answer 422 as well, and the serialized-size case is worth asserting through its log line so it cannot pass by tripping a photo bound instead |
-| **A29** | under A25, read the captured log | one `photo analysis failed` record per failed photo, all sharing one `correlation_id`, each carrying `error_type` — and **no traceback and no provider text at `INFO`**. Set the `app` namespace to `DEBUG`, repeat, and both appear |
+| **A21** | `POST` a listing (as a `seller`) with two photo URLs | **200**; the helper is called **exactly twice**, and **each argument is `bytes`** |
+| **A22** | the same with `photos: []` | **200**; the helper is **not** called; the stored `photo_analysis` is `[]` |
+| **A23** | the same where the helper raises on **every** photo | **200** — a degraded analysis, never a 500; stored `photo_analysis` is `[]` |
+| **A24** | the same where it raises on one of two | **200**, and the one successful result is retained |
+| **A25** | `POST` a listing as a `buyer` | **403** `Only sellers can create listings`, and **no** helper call |
+| **A26** | `POST` with more than 20 maintenance records; with over 900 KiB of maintenance content; with a listing that serializes past 1 MB. Then `POST` with thirteen photos and with a blank photo entry | **422** for each of the first three, the serialized-size case asserted through its log record so it cannot pass by tripping one of the other two. The last two answer **200**, with thirteen outbound provider calls for thirteen photos: nothing bounds the photo list, which is the gap **NT-25** records |
 
-A23 through A26 also prove there is no `await` in front of the call: awaiting a `dict` would turn every one of them into a 500.
+A21 through A24 also prove there is no `await` in front of the call: awaiting a `dict` would turn every one of them into a 500.
 
-**Category 7 — transaction write path and its guards (A30–A37).** Patch `app.api.transactions.process_payment`. Create the vehicle document yourself — nothing in this codebase creates one (**HCF-7**) — and give each attempt its own `stripe_payment_intent_id` unless the case is deliberately replaying one.
+**Category 7 — transaction write path and its guards (A27–A33).** Patch `app.api.transactions.process_payment`. Create the vehicle document yourself — nothing in this codebase creates one (**HCF-7**).
 
 | # | Request | Expect |
 | --- | --- | --- |
-| **A30** | `POST` a transaction as the buyer, vehicle `status: 'available'` | **200**; the helper receives **exactly three** arguments — the transaction's `stripe_payment_intent_id`, its `amount`, and `'usd'` — and the vehicle document becomes `{'status': 'sold'}` |
-| **A31** | the same | the vehicle was looked up by **`vehicle_listing_id`**; no `AttributeError` for a field the schema does not declare |
-| **A32** | the helper returns `success: False` | **400**; **no** transaction document written; the vehicle **not** marked sold |
-| **A33** | the helper returns a dict with **no** `success` key | **400** — `.get('success')` fails safe where `['success']` would raise `KeyError` |
-| **A34** | `POST` a transaction whose `buyer_id` is not the caller | **403**, and **no** payment attempted |
-| **A35** | `POST` against a `sold` vehicle, and against a vehicle id that does not exist | **400** both times, and **no** payment attempted |
-| **A36** | give the vehicle document a `price` and a `seller_id`, then `POST` terms that match, terms with a different amount, and terms naming a different seller | **200** for the match; **400** for each disagreement, raised **before** the charge, with no payment attempted and the vehicle left `available` |
-| **A37** | `POST` again with a `stripe_payment_intent_id` a transaction already records | **409**, **zero** helper calls, and still exactly one transaction document — a retry must not charge a second time |
+| **A27** | `POST` a transaction as the buyer, vehicle `status: 'available'` | **200**; the helper receives **exactly three** arguments — the transaction's `stripe_payment_intent_id`, its `amount`, and `'usd'` — and the vehicle document becomes `{'status': 'sold'}` |
+| **A28** | the same | the vehicle was looked up by **`vehicle_listing_id`**; no `AttributeError` for a field the schema does not declare |
+| **A29** | the helper returns `success: False` | **400**; **no** transaction document written; the vehicle **not** marked sold |
+| **A30** | the helper returns a dict with **no** `success` key | **400** — `.get('success')` fails safe where `['success']` would raise `KeyError` |
+| **A31** | `POST` a transaction whose `buyer_id` is not the caller | **403**, and **no** payment attempted |
+| **A32** | `POST` against a `sold` vehicle, and against a vehicle id that does not exist | **400** both times, and **no** payment attempted |
+| **A33** | `POST` again with a `stripe_payment_intent_id` a transaction already records. Then give the vehicle document a `price` and a `seller_id` that both contradict the request and `POST` that | **200** both times: the charge is sent a second time for the replay, and the caller's own price and seller are accepted. Two gaps, deliberately pinned — **NT-27**/**NT-28** for the first, **NT-41** for the second |
 
 ### 1.10.4 Categories 8–9 — configuration, CORS and logs
 
 | # | Assertion | How |
 | --- | --- | --- |
-| **A38** | A preflight from an allowed origin returns **200** with `access-control-allow-origin` echoing that origin and `access-control-allow-credentials: true` | `client.options('/api/auth/login', headers={'Origin': 'http://localhost:3000', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type'})` |
-| **A39** | A preflight from an origin outside the list returns **400** with **no** allow-origin header | the same with `Origin: http://evil.test` |
-| **A40** | `ALLOWED_ORIGINS` resolves correctly for all six accepted forms and **never** raises `SettingsError` — unset → `['http://localhost:3000']`, one origin, comma-separated → both origins, JSON array → both origins, empty or whitespace → `[]` — while **any** entry containing `*` is refused at import, `'*'` and `'https://*.example.com'` included | set the variable and construct `Settings()` in a fresh subprocess, once per form; see [section 3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash) |
-| **A41** | Unsetting **any one** of the eight required variables still fails validation, and so does a `SECRET_KEY` under 32 characters, an `ACCESS_TOKEN_EXPIRE_MINUTES` of `0` or above 1440, and an `ALGORITHM` outside `HS256`/`HS384`/`HS512` | loop over them, one change at a time, constructing `Settings()` in a subprocess; each iteration must raise |
-| **A42** | The startup hook logs exactly `startup complete: firestore and vision clients initialised at import`, and no initializer traceback | attach a `logging.Handler` to the `app` namespace, then enter the `TestClient` context |
-| **A43** | Under A25, `photo analysis failed` is logged **once per failed photo**, every record carries a `correlation_id` and an `error_type`, **all records from one request share the same id**, and no traceback appears at `INFO` | inspect the captured records; the request must still be a 200 |
+| **A34** | A preflight from an allowed origin returns **200** with `access-control-allow-origin` echoing that origin and `access-control-allow-credentials: true` | `client.options('/api/auth/login', headers={'Origin': 'http://localhost:3000', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type'})` |
+| **A35** | A preflight from an origin outside the list returns **400** with **no** allow-origin header | the same with `Origin: http://evil.test` |
+| **A36** | `ALLOWED_ORIGINS` resolves for all nine accepted forms and **never** raises `SettingsError` — unset → `['http://localhost:3000']`, one origin, comma-separated → both, spaced entries → both stripped, JSON array → both, empty or whitespace → `[]`, and `'*'` or `'https://*.example.com'` → kept **verbatim**, because nothing rejects a wildcard | set the variable and construct `Settings()` in a fresh subprocess, once per form; see [section 3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here) |
+| **A37** | Unsetting **any one** of the eight required variables fails validation — while a five-character `SECRET_KEY`, an `ACCESS_TOKEN_EXPIRE_MINUTES` of `0` or `4321`, and a lower-case `ALGORITHM` all import **without complaint** | loop over them, one change at a time, constructing `Settings()` in a subprocess. The first half is the contract; the second half is the gap **NT-39** records |
+| **A38** | The startup hook logs exactly `startup complete: firestore and vision clients initialised at import`, and no initializer traceback | attach a `logging.Handler` to the `app` namespace, then enter the `TestClient` context |
+| **A39** | Under A23, `photo analysis failed` is logged **once per failed photo**, at `ERROR` with its traceback attached, and every record from one request carries the **same** `correlation_id` | keep the `LogRecord` objects rather than their printed text and read `record.correlation_id`: the application logs through `logging.basicConfig`, whose formatter renders no `extra` keys ([section 1.11](#111-where-the-logs-go)) |
 
-A40 and A41 need **no** stubs and no server — they construct `Settings` in isolation. Run them even when you are only changing configuration.
+A36 and A37 need **no** stubs and no server — they construct `Settings` in isolation. Run them even when you are only changing configuration.
 
 ### 1.10.5 Category 10 — change-set containment
 
 | # | Assertion | How |
 | --- | --- | --- |
-| **A44** | The change set is exactly the paths the current work authorises, and the working tree holds nothing else at all | `git diff --name-status <base-commit> HEAD` **and** `git status --porcelain`; the second must be empty ([section 1.9.3](#193-gate-3--change-containment)) |
+| **A40** | The change set is exactly the paths the current work authorises, and the working tree holds nothing else at all | `git diff --name-status <base-commit> HEAD` **and** `git status --porcelain`; the second must be empty ([section 1.9.3](#193-gate-3--change-containment)) |
 
 This is a scope gate, not a quality gate, and it is the cheapest one on the list. An extra path in the first output means a frozen file was touched — see [section 5](#5-suggested-next-tasks) for why several of them are frozen and what it takes to unfreeze one. Anything in the second output that you did not put there deliberately is a stray file, and if it looks like a credential, delete it rather than ignore it.
 
@@ -747,61 +748,51 @@ This is a scope gate, not a quality gate, and it is the cheapest one on the list
 Say this plainly rather than letting a green run imply more than it earned:
 
 - **No real Cloud Vision or Stripe traffic is exercised.** Categories 6 and 7 verify the **call sites** — arity, types, synchronicity, result handling. The services themselves are stubbed, and both have known defects behind the stub (**HCF-3**, **HCF-4**).
-- **Nothing here proves a concurrency property.** A22's marker assertion shows the *mechanism* — a pre-claimed address is refused — but the double serialises everything, so only an emulator run can show that four simultaneous registrations for one address yield one account. Same for a replayed payment intent under real query semantics. Run those separately, as [1.10.1](#1101-the-two-sanctioned-stubs) describes.
-- **Rate limiting is proven per process only.** The counters live in module state, so the protocol proves the ceiling and the 429; it cannot prove anything about a deployment running several workers, where each one carries its own counters (**NT-26**).
+- **Nothing here proves a concurrency property.** The double serialises everything, so A11's sequential 409 says nothing about two registrations arriving together — and the honest answer for that case is that both can succeed, because the check is a query rather than a conditional write ([section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced)). Same for two simultaneous buyers. Run those against an emulator, as [1.10.1](#1101-the-two-sanctioned-stubs) describes.
+- **A gap that is asserted is still a gap.** A20, A26, A33 and half of A37 pin what this API accepts, not what it should accept. A green protocol therefore means "no regression", not "no exposure" — [section 5.3](#53-where-to-start) is the list ordered by exposure.
 - **A clean install still serves nothing.** Every category from 3 onwards runs under the stubs. On an unstubbed checkout the import fails ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)), so a fully green protocol and a working deployment are not the same claim.
 - **The two messaging endpoints are out of scope for categories 5–7 on purpose.** They are reachable and non-functional (**HCF-8**); asserting their behaviour would only assert a known defect.
 - **The frontend is untested here.** The SPA does not render ([section 1.8](#18-run-the-spa-optional)), so the contract in [section 2.6](#26-the-spa-contract--treat-it-as-frozen) is verified by reading the client, not by driving it. Anything that needs a browser — rendering, real preflight behaviour in a browser, the login round trip through the SPA — belongs to whoever can run one, and is not covered by any assertion above.
 
 ## 1.11 WHERE THE LOGS GO
 
-`backend/app/main.py` configures logging for this application's own loggers, and it has to. **Uvicorn configures only its `uvicorn*` loggers**, so without that the whole `app.*` namespace inherits root's `WARNING` with no handler attached: an `INFO` record is created and then dropped, and a `WARNING` escapes through `logging.lastResort`, which prints the bare message with no timestamp, no level, no logger name and none of its context. Every audit and diagnostic line this backend emits was invisible for exactly that reason.
+`backend/app/main.py` calls `logging.basicConfig(level=logging.INFO)` at import, and that one line is the whole of this application's logging configuration. It has to be there: **Uvicorn configures only its `uvicorn*` loggers**, so without it the whole `app.*` namespace inherits root's `WARNING` with no handler attached — the startup record below is created and then dropped, and a guarded failure escapes through `logging.lastResort`, which prints the bare message with no timestamp, no level and no logger name. Every diagnostic line this backend emits was invisible for exactly that reason.
 
-What the composition root sets up, once, at import:
+What that gives you, and what it does not:
 
 | Property | Value |
 | --- | --- |
-| Namespace | `app` — every logger this application currently creates is named with `logging.getLogger(__name__)`, so all of them inherit it |
+| Scope | the **root** logger, so `app.*` records and third-party ones (`httpx`, `google.*`) share it. That is the trade for one line; quieting a chatty library means `logging.getLogger('httpx').setLevel(logging.WARNING)` in your own entry point |
 | Level | `INFO` |
-| Destination | one `StreamHandler`, on standard error, alongside Uvicorn's own output |
-| Format | `%(asctime)s %(levelname)s %(name)s: %(message)s`, then the context |
-| Context | every field the record carries beyond the standard `LogRecord` attributes — `extra` at the call site is how you add one — appended as `[key=value ...]` in alphabetical order, with backslash, newline, carriage return and tab escaped so a value cannot forge a line. Those four characters only; it is not general control-character sanitisation |
-| Propagation | off, so a handler on the root logger cannot print the same record a second time |
+| Destination | one `StreamHandler` on standard error, alongside Uvicorn's own output |
+| Format | `logging`'s default — `%(levelname)s:%(name)s:%(message)s` |
+| Context | **not rendered.** The default formatter prints only the fields its format string names, so a value attached through `extra` is carried on the record and never appears in the printed line. This is the one thing about logging here that surprises people |
+| Precedence | `basicConfig` returns without doing anything if the root logger already has a handler, so an operator who configures logging **before** importing `app.main` keeps their own configuration entirely, and the `app` namespace itself is never touched |
 
-A successful start therefore prints exactly one line from the startup hook:
+A successful start prints exactly one line from the startup hook:
 
 ```text
-2026-01-01 12:00:00,000 INFO app.main: startup complete: firestore and vision clients initialised at import
+INFO:app.main:startup complete: firestore and vision clients initialised at import
 ```
 
-and a guarded failure prints its context and the class of the failure. Listing creation generates one `correlation_id` per request and attaches it to every line it emits, which is what ties the photo loop and the maintenance loop of a single request together:
+and a guarded failure inside listing creation prints its message with the exception beneath it, because the handler logs through `logger.exception`:
 
 ```text
-2026-01-01 12:00:05,123 WARNING app.api.listings: photo analysis failed [correlation_id=3f2b9c14-... error_type=RuntimeError]
-```
-
-**What is not in that line is deliberate.** No traceback, and no text from the provider or the parser. A traceback publishes absolute paths and library internals, and a third-party error message can quote the request that produced it — a document's contents, a URL, an address — so at `INFO` and `WARNING` this application logs *what class of thing went wrong and which request it belonged to*, and nothing more.
-
-The detail still exists. It goes to `DEBUG`:
-
-```text
-2026-01-01 12:00:05,124 DEBUG app.api.listings: photo analysis failure detail [correlation_id=3f2b9c14-...]
+ERROR:app.api.listings:photo analysis failed
 Traceback (most recent call last):
   ...
 RuntimeError: vision provider unavailable
 ```
 
-so `logging.getLogger('app').setLevel(logging.DEBUG)` is how you get it while you are debugging. **If you turn that on anywhere shared, send it to a sink whose readers are allowed to see request content**, because that is what it contains. Treat `DEBUG` on this namespace as a restricted diagnostic channel rather than a verbosity setting.
+**The `correlation_id` is on the record even though it is not in that output.** Listing creation generates one per request and attaches it to every line it emits — `logger.exception("photo analysis failed", extra={"correlation_id": correlation_id})` — which is what ties the photo loop and the maintenance loop of one request together. To *see* it, give the root logger a formatter that renders it, or use a formatter that appends whatever a record carries beyond the standard `LogRecord` attributes. Neither is configured here, and doing it properly — structured output, a request id attached at middleware level rather than per handler — is task **NT-29**.
 
-**Response headers are a related ownership question, and this application answers only part of it.** The token and profile routes set `Cache-Control: no-store` themselves, because a bearer token must not be written to a shared or on-disk cache. Everything else a browser needs — HSTS, a content-security policy, frame and content-type options, referrer policy, host validation — is **not** set here and belongs to whatever terminates TLS in front of this application, which is also the only component that knows the deployed origin. There is no ingress configuration in this repository to inherit them from, so if you deploy this, that configuration is yours to write.
-
-**Adding context needs no change to the formatter.** `logger.warning("...", extra={"listing_id": listing_id})` renders as `[listing_id=...]`: the formatter prints whatever a record carries beyond the standard `LogRecord` attributes, so there is no key registry to keep in step. Keep using `correlation_id` for the per-request identifier — [section 4.4](#44-call-services-synchronously-and-guard-them) shows the shape — and never put a password, a token, an email address or a payload into a log line or an `extra` value. The attempt-limit records in `app/api/auth.py` are the pattern to copy: they log the *bucket* that filled, never the address or the peer that filled it.
+**Two consequences worth knowing before you rely on the output.** The traceback and the provider's own error text *are* printed, because `logger.exception` includes them: a third-party message can quote the request that produced it — a document's contents, a URL, an address — so treat this output as containing request content and point it at a sink whose readers may see it. And nothing here redacts anything: never put a password, a token, an email address or a payload into a message or an `extra` value. `app/api/auth.py` is the pattern to copy — its records name what happened and never the subject it happened to.
 
 **That last rule binds a client just as hard, and the frozen SPA breaks it** — it logs whole rejected axios errors, which carry the sign-in body and a live bearer token. Nothing in the backend does this; the client-side fix is task **NT-32**, and [section 2.6.2](#262-why-none-of-it-executes-yet) has the line numbers.
 
-**To take the configuration over**, configure the `app` logger yourself *before* `app.main` is imported — and **attach a handler while you do it**, whatever else you change. The guard is `if app_logger.handlers: return`, so an attached handler is what makes the application leave your configuration alone; a level or a propagation flag set on its own attaches nothing and is overwritten. Attach your own handler, point it at a JSON formatter, set whatever level you want on top of that, and none of it is touched.
+**Response headers are a related ownership question, and this application answers none of it.** It sets no response header of its own: no `Cache-Control` on the token and profile routes, and no HSTS, content-security policy, frame or content-type options, referrer policy or host validation. All of it belongs to whatever terminates TLS in front of this application — which is also the only component that knows the deployed origin — and there is no ingress configuration in this repository to inherit it from. If you deploy this, that configuration is yours to write, and `no-store` on the two token-bearing responses is the first line of it (**NT-38**).
 
-Every row of the table above, that last guarantee included, is asserted by gate H of the harness in [section 6](#6-verifying-behaviour-in-process) — the escaping, the alphabetical context, the exclusion of standard `LogRecord` fields, the traceback landing beneath the message rather than inside it when a record carries one, the single handler, the `INFO` level, the suppressed propagation, and the fact that configuring twice changes nothing. Gate C asserts the other half, at the call site: that a handler's failure line carries its `correlation_id` and `error_type` and **not** a traceback at `INFO`, and that the same failure at `DEBUG` carries both. If you touch this code, run that gate: none of it is covered by any committed test, because this project has none that collect ([section 3.7](#37-pytest-is-not-a-gate)).
+**To take the configuration over**, configure logging yourself *before* `app.main` is imported: attach your own handler to the root logger, point it at a JSON formatter, set whatever levels you want. `basicConfig` will then do nothing, so none of it is overwritten. That is asserted by gate A of the harness in [section 6](#6-verifying-behaviour-in-process) — the startup record reaches a handler attached to the `app` namespace — and by gate C at the call site: two failure records per two failed photos, at `ERROR`, with the traceback attached and one shared `correlation_id` read off the record rather than off its printed text. If you touch this code, run that gate: none of it is covered by any committed test, because this project has none that collect ([section 3.7](#37-pytest-is-not-a-gate)).
 
 # 2. DOMAIN CONTEXT
 
@@ -832,9 +823,9 @@ Four API modules, each exporting an `APIRouter` named `router`, are mounted by `
 
 Every user document carries a `role` string. The three values the system recognises are **`buyer`**, **`seller`** and **`admin`**, as specified in [`Technical Specifications.md`](Technical%20Specifications.md) §5.2.
 
-**Registration accepts only the two roles a caller may give itself: `buyer` and `seller`.** The value is trimmed and lower-cased, then checked against that allow-list; anything else — `admin`, `root`, a blank string — is a **422** and the attempt is logged. That check exists because the role is persisted, read back on every request by `get_current_user`, and trusted by the listing-delete branch below, so a role accepted verbatim would have let any anonymous caller make itself an administrator and delete any seller's listing. Case is normalised for a second reason worth knowing: every authorization check compares the stored string exactly, so `role: 'Seller'` stored as written would fail the seller gate on listing creation while looking correctly configured.
+**Registration stores whatever `role` it is sent, `admin` included.** There is no allow-list and no normalisation. That matters more than it looks: the role is persisted, read back on every request by `get_current_user`, and trusted by the listing-delete branch below, so **one anonymous request can make itself an administrator and delete any seller's listing**. Restricting the accepted values is task **NT-24**, and it is the first thing to fix before this API meets an untrusted caller. A second consequence of the same gap: every authorization check compares the stored string exactly, so `role: 'Seller'` is stored as written and then fails the seller gate on listing creation while looking correctly configured.
 
-**What that leaves open is the other half: there is no way to grant `admin` through this API at all.** No endpoint hands the role out, and nothing audits a grant, so an administrator today means writing the user document directly — which the application neither authenticates nor records. That is task **NT-14** (an authenticated, administrator-only elevation *and revocation* path that writes its own audit record). Until it lands, the direct write is the intended procedure, and it needs controls the code cannot give you:
+**Granting `admin` deliberately is a separate gap.** No endpoint hands the role out and nothing audits a grant, so the intended procedure for a real administrator is writing the user document directly — which the application neither authenticates nor records. That is task **NT-14** (an authenticated, administrator-only elevation *and revocation* path that writes its own audit record). Until it lands, the direct write needs controls the code cannot give you:
 
 - Provision administrators only through an **authorized operator channel**: a named service account or human principal with an IAM grant scoped to the `users` collection, never a shared or long-lived key, and never the same credential the running service uses.
 - Require the same **change approval** you would require of a deployment — who asked, who approved, which user id, why — and keep that record where your team already keeps change history.
@@ -846,37 +837,39 @@ Authorization is enforced inline in each handler — there is no shared dependen
 
 | Action | Rule | On violation |
 | --- | --- | --- |
-| Register | `role` must be `buyer` or `seller` after trimming and lower-casing | 422, and the attempt is logged |
+| Register | **none.** Any `role` string is accepted and stored (**NT-24**) | — |
 | Create a listing | `role` must be exactly `seller` | 403 `Only sellers can create listings` |
 | Update a listing | Caller must be the listing's `seller_id` | 403 |
 | Delete a listing | Caller must be the listing's `seller_id` **or** have `role == 'admin'` | 403 |
-| Create a transaction | Caller's id must equal the request's `buyer_id`, and the amount and seller must agree with the vehicle record wherever it carries them | 403, or 400 for terms that disagree |
+| Create a transaction | Caller's id must equal the request's `buyer_id`. The amount and the seller are taken from the request and checked against nothing (**NT-41**) | 403 |
 | Read a transaction | Caller must be the transaction's `buyer_id` or `seller_id` | 403 |
 | Send or list messages | Authenticated only; no role restriction | 401 if unauthenticated |
 
-`admin` grants exactly one privilege — deleting another seller's listing. There is no admin-only endpoint, and no endpoint that hands the role out at all (**NT-14**).
+`admin` grants exactly one privilege — deleting another seller's listing. There is no admin-only endpoint, no endpoint that hands the role out (**NT-14**), and nothing stopping a caller from taking it (**NT-24**).
 
 ### 2.2.1 What Registration Accepts
 
-`POST /api/auth/register` is the only unauthenticated write in this API, so `RegisterRequest` in `app/api/auth.py` validates every field it takes. All of it runs as Pydantic v1 validators, which means a bad body is a **422 before** the duplicate lookup, before bcrypt and before Firestore — no work is done for a request that is going to be refused.
+`POST /api/auth/register` is the only unauthenticated write in this API, and `RegisterRequest` in `app/api/auth.py` checks **nothing beyond field presence and type**. Pydantic v1 requires all five fields and coerces each to `str`; that is the whole of it.
 
 | Field | What is checked | Stored as |
 | --- | --- | --- |
-| `email` | Trimmed and lower-cased, then shape-checked — a local part, an `@`, and a dotted domain with no empty label — and capped at 254 characters, the longest address SMTP carries. `not-an-email` and `a@b..test` are 422s | The canonical form, so ` A@B.com ` and `a@b.com` are the same account rather than two |
-| `password` | At least 8 characters, and **at most 72 bytes once UTF-8 encoded**. The byte ceiling is not arbitrary: bcrypt hashes only the first 72 bytes and `passlib` discards the rest in silence, so a longer password would promise strength it does not have and any two sharing a 72-byte prefix would be interchangeable. Refusing is the honest answer | Never stored; only its bcrypt hash is |
-| `first_name`, `last_name` | Trimmed, required to be non-blank, and capped at 100 characters | The trimmed value |
-| `role` | Trimmed, lower-cased, and required to be `buyer` or `seller` — see [section 2.2](#22-roles-and-who-may-do-what) | The normalised value |
+| `email` | Presence and type only. `not-an-email` is accepted; so is a 4000-character string. Nothing trims or lower-cases it | Exactly as sent — so ` A@B.com ` and `a@b.com` become **two accounts**, and sign-in resolves to whichever Firestore returns first |
+| `password` | Presence and type only. A one-character password is accepted; so is one over bcrypt's 72-byte limit, of which only the first 72 bytes are hashed and the rest silently discarded | Never stored; only its bcrypt hash is |
+| `first_name`, `last_name` | Presence and type only. A blank string is accepted | Exactly as sent |
+| `role` | Presence and type only — see [section 2.2](#22-roles-and-who-may-do-what) for why this one is the dangerous member of the set | Exactly as sent, `admin` included |
 
-Shape validation is where this stops, and the distinction matters: **nothing proves the address belongs to the person registering it.** There is no verification email and no confirmation step, so an attacker can register an address it does not control and hold the account that a real owner would later expect. Adding that flow is a feature this codebase does not have (**NT-36**), not a validator someone forgot.
+**Every row of that table is a gap, and they are collected as task NT-24.** They are recorded here rather than left to be discovered, and the harness in [section 6](#6-verifying-behaviour-in-process) asserts them, so that adding the policy is a deliberate change to a documented expectation rather than a surprise.
+
+A related absence, and a different kind: **nothing proves the address belongs to the person registering it.** There is no verification email and no confirmation step, so an attacker can register an address it does not control and hold the account that a real owner would later expect. Adding that flow is a feature this codebase does not have (**NT-36**), not a validator someone forgot.
 
 Two more properties of this route are worth knowing before you build on it:
 
-- **Uniqueness is atomic, not merely checked.** Registration claims `user_emails/{sha256(canonical_email)}` with a conditional `create()` before it writes the account, so two simultaneous registrations for one address cannot both succeed — the loser gets the same **409 `Email is already registered`** as a sequential duplicate. The pre-write query is still there as the fast path, and it also covers any account created before that marker collection existed. If the account write fails after the claim, the claim is released, so an address is never left unusable with nothing behind it.
-- **Both public routes are throttled.** Ten sign-ins and five registrations per fixed one-minute window, counted per client address and per account, answering **429** with a `Retry-After` header and a message that says nothing about whether the account exists. A correct sign-in clears its own counters. The counters live in the worker process, so several workers multiply the ceiling — a cluster-wide limit needs a shared store or a gateway policy (**NT-26**).
+- **Uniqueness is checked, not enforced.** Registration queries `users` for the address and answers **409 `Email is already registered`** if it finds one. That is a read followed by a write, so two simultaneous registrations for one address can both find nothing and both succeed — and because addresses are not normalised, two spellings of one address are not even a duplicate. [Section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced) has what a real constraint would take.
+- **Nothing rate-limits either public route.** A caller may attempt as many sign-ins or registrations as it likes, each costing one bcrypt verification or one hash plus a write. That makes both routes a credential-stuffing surface and a CPU amplifier; adding a ceiling is task **NT-26**.
 
-`LoginRequest` validates the address only enough to canonicalise it — trimmed and lower-cased, so the same account signs in whatever the spelling — and **deliberately does not shape-check it or bound the password.** Nothing about the *credential* is judged before `authenticate_user` runs, which is what keeps every credential rejection uniform: an unknown email and a wrong password are both **401 `Incorrect email or password`** with a `WWW-Authenticate: Bearer` header, so the response cannot be used to enumerate accounts. A 422 on a sign-in attempt would leak exactly what the 401 is careful not to.
+`LoginRequest` takes an `email` and a `password` and checks nothing about either, which is the right shape for a sign-in: nothing about the *credential* is judged before `authenticate_user` runs, so every credential rejection stays uniform — an unknown email and a wrong password are both **401 `Incorrect email or password`** with a `WWW-Authenticate: Bearer` header, and the response cannot be used to enumerate accounts. A 422 on a sign-in attempt would leak exactly what the 401 is careful not to.
 
-That uniformity now extends to timing, which is where a matching response can still give an answer away. `authenticate_user` returns as soon as its query comes back empty, so an unknown address used to answer measurably faster than a known one with the wrong password. The failure path therefore spends one deliberate bcrypt verification against a throwaway hash when no account holds the address, and discards the result. Both branches cost the same work.
+One place where that uniformity does not hold is **timing**: `authenticate_user` returns as soon as its query comes back empty, so an unknown address answers measurably faster than a known one with the wrong password. Nothing here equalises that today, and closing it means spending a deliberate bcrypt verification on the unknown-address path — worth doing alongside **NT-26**, since both concern what the sign-in route gives away under repetition.
 
 **Two different rejections live at this route, and they are easy to confuse.** FastAPI validates the request body before `login()` is entered, so a body that is not *shaped* like a login attempt never reaches the credential check at all:
 
@@ -884,9 +877,8 @@ That uniformity now extends to timing, which is where a matching response can st
 | --- | --- | --- |
 | No body; `{}`; only `email`; only `password`; `null` for either; a value no coercion can turn into a string; malformed JSON; a form-encoded body | **422**, listing the offending `body/…` locations, with **no** `WWW-Authenticate` header | FastAPI request validation, before the handler |
 | Both fields present and coercible to strings — including `""`, whitespace, an unknown email, a wrong password, or a number Pydantic v1 coerces to `str` | **401 `Incorrect email or password`** with `WWW-Authenticate: Bearer` | `authenticate_user`, inside the handler |
-| More than ten attempts from one client, or against one address, inside a minute | **429** with `Retry-After`, and a detail that mentions neither the address nor its existence | the attempt limiter, before the credential check |
 
-Adding validators to force those 422s into 401s was considered and rejected: it would hide malformed-request bugs from clients that are simply posting the wrong shape, and the enumeration argument does not apply — a 422 names a *field of the request*, never whether an account exists. What must stay uniform is the credential answer, and it is.
+Turning those 422s into 401s would hide malformed-request bugs from clients that are simply posting the wrong shape, and the enumeration argument does not apply — a 422 names a *field of the request*, never whether an account exists. What must stay uniform is the credential answer, and it is.
 
 ## 2.3 FIRESTORE COLLECTIONS
 
@@ -894,12 +886,11 @@ Firestore is schemaless: collections exist because code writes to them, and noth
 
 | Collection | Written by | Read by | Notes |
 | --- | --- | --- | --- |
-| `users` | `app/api/auth.py` (register) | `app/api/auth.py` (authenticate, resolve token subject), `app/api/messages.py` (recipient exists) | Document id is also stored in the document’s own `id` field. The email is stored in canonical form — trimmed and lower-cased — so one address is one account. Firestore still has **no unique index on `email`**; uniqueness comes from the `user_emails` marker below plus the pre-write duplicate query. |
-| `user_emails` | `app/api/auth.py` (register claims a marker; releases it if the account write fails) | nothing reads it except registration itself, and the sign-in path to decide whether an address is claimed | One document per registered address, its id the SHA-256 digest of the canonical address — a fixed-length legal Firestore id that carries no readable address. It exists because a query cannot make uniqueness atomic and a conditional `create()` can: two simultaneous registrations for one address cannot both succeed. Nothing here is user data beyond the account id it points at. |
+| `users` | `app/api/auth.py` (register) | `app/api/auth.py` (authenticate, resolve token subject), `app/api/messages.py` (recipient exists) | Document id is also stored in the document’s own `id` field. The email is stored **exactly as sent**, so two spellings of one address are two accounts. Firestore has **no unique index on `email`** and nothing here adds one: uniqueness is a pre-write query, which two simultaneous requests can both pass ([section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced)). |
 | `listings` | `app/api/listings.py` | `app/api/listings.py` | Stores the listing plus derived `photo_analysis` and `maintenance_data`. |
-| `transactions` | `app/api/transactions.py` | `app/api/transactions.py` | Written only after payment succeeds, with `status: 'completed'` and its own document id in `id`. It **is** read before charging, by `stripe_payment_intent_id`, so a replayed intent answers 409 instead of paying twice; what remains unguarded is two genuinely simultaneous requests, which need a reservation and a provider-level idempotency key — **HCF-14**. |
-| `messages` | `app/api/messages.py` | `app/api/messages.py` | The handler writes `message.dict()` straight in, so the bound lives on the model: `Message.content` is trimmed, required to be non-blank, and capped at 4000 characters and 16 KiB encoded, which is what keeps an unbounded body out of Firestore. A client-supplied `id` or `read` flag is still stored as sent, because the same model is rebuilt from stored documents on the read path and a coercing validator would discard server values too — that one waits for the route logic (**HCF-8**). Reachable but not yet functional. |
-| `vehicles` | `app/api/transactions.py` (updates `status` only) | `app/api/transactions.py` | Read to check `status == 'available'` **and to settle the purchase's terms** — where the document carries a `price` or a `seller_id`, the request must agree with it — then updated to `'sold'` on a successful purchase. What is missing is a **creator**: **no module ever creates or populates a vehicle document**, so a purchase can only be tested against a document you write yourself, and a document without a price is why the terms check can only warn rather than refuse. See **HCF-7** and **HCF-16**. |
+| `transactions` | `app/api/transactions.py` | `app/api/transactions.py` (read by id only) | Written only after payment succeeds, with `status: 'completed'` and its own document id in `id`. Nothing reads it **before** charging, so a replayed `stripe_payment_intent_id` is charged again; a reservation and a provider-level idempotency key are what that needs — **NT-27**, **NT-28**. |
+| `messages` | `app/api/messages.py` | `app/api/messages.py` | The handler writes `message.dict()` straight in and nothing bounds it, so a blank or arbitrarily long body is stored as sent — as is a client-supplied `id` or `read` flag. Bounding the body means a validator on the model, and that model is also rebuilt from stored documents on the read path, so the bound has to tolerate what is already stored (**NT-25**). Reachable but not yet functional (**HCF-8**). |
+| `vehicles` | `app/api/transactions.py` (updates `status` only) | `app/api/transactions.py` | Read to check `status == 'available'`, then updated to `'sold'` on a successful purchase. Nothing else about the document is read — a `price` or a `seller_id` on it is **not** compared against the request, so the caller's own terms govern (**NT-41**). And nothing is missing more sharply than a **creator**: **no module ever creates or populates a vehicle document**, so a purchase can only be tested against a document you write yourself (**HCF-7**). |
 
 Note that a listing lives in `listings` while the availability check reads `vehicles`. That gap is the substance of **HCF-7**, not an accident of naming, and resolving it is a data-model decision rather than a bug fix.
 
@@ -907,14 +898,14 @@ Note that a listing lives in `listings` while the availability check reads `vehi
 
 | Integration | Entry point | Called from | Shape |
 | --- | --- | --- | --- |
-| Cloud Vision | `analyze_vehicle_photo(image_data: bytes)` | `app/api/listings.py`, once per photo, inline, **capped at 12 photos and 900 KiB per request** ([section 2.8](#28-what-the-write-endpoints-bound)) | Synchronous; returns a `dict` of extracted vehicle details. This is the only module that imports **Pillow**, which it uses to open the image bytes before the Vision call |
+| Cloud Vision | `analyze_vehicle_photo(image_data: bytes)` | `app/api/listings.py`, once per photo, inline, with **no cap on the number of photos** ([section 2.8](#28-what-the-write-endpoints-bound)) | Synchronous; returns a `dict` of extracted vehicle details. This is the only module that imports **Pillow**, which it uses to open the image bytes before the Vision call |
 | PyPDF2 | `process_maintenance_document(document_data: bytes, document_type: str)` | `app/api/listings.py`, once per record, at most `_MAX_MAINTENANCE_RECORDS` (20) per request | Synchronous; returns a `dict`. PDFs are parsed with `PyPDF2.PdfReader`; the module imports no imaging library |
 | Stripe | `process_payment(token: str, amount: float, currency: str)` | `app/api/transactions.py`, once per request, after the availability check | Synchronous; returns a `dict` with a `success` key. Validates `currency` against `usd`, `eur`, `gbp` |
 | Cloud Storage | `upload_file`, `delete_file`, `get_file_url` | **nothing** | The module is complete but has no importer; photo upload is not wired to it |
 
 **Every one of these is a plain `def`.** None may be awaited. That rule has its own pitfall entry — [section 3.5](#35-never-await-a-service-function-and-never-read-a-dict-by-attribute) — because violating it was one of the defects this codebase was just repaired for.
 
-**Because they are blocking, the handler that calls them has to be a plain `def` — and six of the thirteen now are.** Starlette runs a synchronous endpoint in its threadpool, so a slow Vision or Stripe call occupies one worker thread instead of the event loop every other request shares; inside an `async def` a single 1-second payment call delays every concurrent request by the full second. The six that get it right are the four authentication handlers plus **`create_listing` and `create_transaction`** — which were the two that mattered most, because between them they make every Cloud Vision, PyPDF2 and Stripe call in the request path. The remaining seven are still `async def` bodies doing synchronous I/O directly on the event loop: `get_listings`, `get_listing`, `update_listing`, `delete_listing`, `get_transaction` and both message routes. Converting those is task **NT-22**; it changes handler signatures that are frozen for the current work, so it needs authorization rather than initiative. One consequence of the conversions already done is recorded in [section 4.1](#41-add-a-router) and worth reading before you do another: a `SIGALRM`-based timeout does not fire off the main thread, so `document_processing.py`'s wall-clock guard on PDF extraction no longer applies to `create_listing` — the byte and record ceilings in [section 2.8](#28-what-the-write-endpoints-bound) are what bound that work now.
+**Because they are blocking, the handler that calls them ought to be a plain `def` — and only four of the thirteen are.** Starlette runs a synchronous endpoint in its threadpool, so a slow Vision or Stripe call occupies one worker thread instead of the event loop every other request shares; inside an `async def` a single 1-second payment call delays every concurrent request by the full second. The four plain `def` handlers are the authentication routes, which were written that way. The other nine are `async def` bodies doing synchronous I/O directly on the event loop — including **`create_listing` and `create_transaction`, the two that matter most**, because between them they make every Cloud Vision, PyPDF2 and Stripe call in the request path. Converting them is task **NT-22**; it changes handler signatures that are frozen for the current work, so it needs authorization rather than initiative. Read the note in [section 4.1](#41-add-a-router) before you do it: a `SIGALRM`-based timeout does not fire off the main thread, so moving `create_listing` off the loop would silently disarm `document_processing.py`'s wall-clock guard on PDF extraction, and a replacement deadline has to land in the same change.
 
 ## 2.5 AUTHENTICATION AND TOKENS
 
@@ -929,9 +920,9 @@ There is no `iat`, no `jti`, no role claim and no refresh token. Authorization i
 
 `ACCESS_TOKEN_EXPIRE_MINUTES` is honoured on every token issued. This is worth stating because the setting had no reader at all until the login path added one, and `create_access_token`'s hard-coded 15-minute fallback governs any caller that omits `expires_delta` — so the first token-issuing path written without that argument would have handed a deployment configured for 60 minutes a 15-minute token. Nothing was ever observed doing it, because no route minted a token at all; the gap was latent, not live. The login path passes the configured lifetime explicitly. The fallback still exists in `create_access_token` for callers that supply no lifetime — **if you add a token-issuing path, pass the lifetime explicitly**, exactly as `_issue_token` in `app/api/auth.py` does.
 
-There is one more way that fallback could bite, and configuration closes it: `create_access_token` tests `if expires_delta:`, and `timedelta(minutes=0)` is falsey, so a lifetime of `0` would have been read as "unset" and silently become 15 minutes. `Settings` therefore refuses a lifetime below 1 or above 1440 minutes ([section 1.5.1](#151-every-setting-and-what-actually-reads-it)), which makes the configured value the only one that can govern. The ceiling exists because of the section immediately below: nothing here can withdraw a token early, so its lifetime is the whole of its blast radius.
+There is one more way that fallback can bite, and nothing closes it: `create_access_token` tests `if expires_delta:`, and `timedelta(minutes=0)` is falsey, so **`ACCESS_TOKEN_EXPIRE_MINUTES=0` is read as "unset" and silently becomes 15 minutes.** Nothing refuses that value, or a three-day one at the other end ([section 1.5.1](#151-every-setting-and-what-actually-reads-it)) — bounding it is **NT-39**. The upper end matters because of the section immediately below: nothing here can withdraw a token early, so its lifetime is the whole of its blast radius.
 
-Responses that carry a token or a profile — all four authentication routes — are sent with `Cache-Control: no-store`, so a bearer token is not written to a shared or on-disk cache. That is the only response header this application sets for itself; the browser and transport policy headers belong to whatever terminates TLS in front of it ([section 1.11](#111-where-the-logs-go)).
+**No response header is set by this application at all** — not `Cache-Control: no-store` on the token and profile routes, and none of the browser and transport policy headers. All of it belongs to whatever terminates TLS in front of this service, and `no-store` on the two token-bearing responses is the first thing to configure there (**NT-38**, [section 1.11](#111-where-the-logs-go)).
 
 A rejected request yields **401** with a `WWW-Authenticate: Bearer` header, but **the body depends on which of two guards rejected it**, and they are different pieces of code:
 
@@ -970,25 +961,29 @@ The route exists because the SPA posts to it and clears its stored token in a `f
 
 | Enforced | How |
 | --- | --- |
-| A role allow-list | `buyer` or `seller` only, trimmed and lower-cased; anything else is a 422 and is logged |
-| Address shape and normalisation | trimmed, lower-cased, syntax-checked, capped at 254 characters — so one address is one account |
-| A password rule | at least 8 characters, at most 72 **bytes** encoded, because bcrypt silently ignores the rest |
-| A name rule | trimmed, non-blank, at most 100 characters |
-| Atomic uniqueness | a `user_emails/{sha256(email)}` marker claimed with a conditional `create()` before the account is written, and released if that write fails |
-| Attempt limits | 10 sign-ins and 5 registrations per minute, per client address and per account, answering 429 with `Retry-After` and a message that reveals nothing |
-| Uniform credential rejection | one 401 body for an unknown address and for a wrong password, and one deliberate bcrypt verification on the unknown-address path so the two cost the same |
+| Field presence and type | Pydantic v1 requires all five registration fields and both login fields, and coerces each to `str`; a missing or uncoercible value is a 422 |
+| A duplicate-email check | registration queries `users` for the address and answers 409 before writing anything |
+| Uniform credential rejection | one 401 body, with `WWW-Authenticate: Bearer`, for an unknown address and for a wrong password alike |
+| No hash in any response | every payload is projected field by field, so `hashed_password` cannot leak ([section 4.5](#45-projection-discipline-there-is-no-response_model)) |
 
 | Not enforced | What that permits today | Tracked as |
 | --- | --- | --- |
+| A role allow-list | one anonymous request can register itself as `admin`, and `delete_listing` trusts that role, so it can then delete any seller's listing | **NT-24** |
+| Any bound or shape check on a credential field | an address with no domain, a one-character password, a blank name and a 254-character-plus address are all accepted and stored; a password over 72 bytes is silently truncated by bcrypt | **NT-24** |
+| Address canonicalisation | ` A@b.com ` and `a@b.com` are two accounts, and signing in with a spelling other than the one registered answers 401 | **NT-24** |
+| Atomic uniqueness | the 409 is a query followed by a write, so two simultaneous registrations for one address can both succeed | **NT-40**, [section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced) |
+| Any attempt limit | both routes accept as many attempts as a caller cares to send — no counter, no delay, no 429, no `Retry-After` | **NT-26** |
+| Any response header | the application sets none at all, so a token travels in a response no `Cache-Control` marks as unstorable | **NT-38** |
 | Proof that the address belongs to the registrant | anyone can register an address they do not control, and hold the account its real owner would expect | **NT-36** |
-| A cluster-wide attempt limit | the counters are per worker process, so N workers permit N times the ceiling | **NT-26** |
-| Any limit on what an account may then create | one account may write unlimited listings and messages, each bounded individually but unbounded in number | **NT-25** |
+| Any limit on what an account may then create | one account may write unlimited listings and messages, each of them unbounded in size as well as in number | **NT-25** |
 | A privacy lifecycle for what registration stores | an address, both names, a role and a hash are persisted with no retention rule, no export path and no deletion path | **NT-37** |
-| A grant path for `admin` | the role cannot be obtained through the API at all, so an administrator means a direct database write the application neither authenticates nor audits | **NT-14** |
+| A grant path for `admin` | the role is self-grantable today, which is the defect; once **NT-24** closes it there is no path at all, so the two belong together | **NT-14** |
+
+**One thing the 409 costs, and it is a deliberate trade rather than an oversight.** `POST /api/auth/register` answers **409 `Email is already registered`** for an address that exists and **201** for one that does not, so an unauthenticated caller can test any address and learn whether it has an account here — and with no attempt limit (**NT-26**) it can test a list of them. Login is careful not to leak that; registration cannot be, because a client sending a duplicate address has to be told what is wrong with it. The usual answer is to keep the 409 and put the ceiling in front of it, which is what **NT-26** is for; answering 201 to a duplicate and mailing the real owner instead needs **NT-36**'s machinery first.
 
 ## 2.6 THE SPA CONTRACT — TREAT IT AS FROZEN
 
-The React client is already written against a specific contract, and the backend was shaped to satisfy it rather than the reverse. **Read this section as two claims, because only one of them is operational.** The wire shapes below are what the client's source expresses; they are frozen, and changing any of them breaks it. Whether the client can *execute* them is a separate question, and today the answer is no — [section 2.6.2](#262-why-none-of-it-executes-yet) sets out every reason. **Nothing described here has ever been observed over a real HTTP request**, from this repository or anywhere else; it was established by reading the client, and the assertions that back it ([section 6](#6-verifying-behaviour-in-process)) drive the backend directly, not through the SPA.
+The React client is already written against a specific contract, and the backend was shaped to satisfy it rather than the reverse. **Read this section as two claims, because only one of them is operational.** The wire shapes below are what the client's source expresses; they are frozen, and changing any of them breaks it. Whether the client can *execute* them is a separate question, and today the answer is no — [section 2.6.2](#262-why-none-of-it-executes-yet) sets out every reason. **No part of it has ever been exercised by the SPA itself**: the wire shapes were established by reading the client's source, and every check that backs them drives the backend directly — in process ([section 6](#6-verifying-behaviour-in-process)) and over HTTP with `curl` under the local development profile ([section 1.7.1](#171-the-local-development-profile)). Both confirm the backend's half of each shape below; neither says anything about the client's.
 
 Changing any of the following breaks the SPA, whenever it starts working:
 
@@ -1094,24 +1089,28 @@ The fourth of those is the regression guard for this table: it compares the nine
 
 ## 2.8 WHAT THE WRITE ENDPOINTS BOUND
 
-Two facts make bounds a correctness concern here rather than a nicety: **a Firestore document may not exceed 1 MiB**, and handlers write `model.dict()` straight into a collection, so an unbounded field is an unbounded document. Every external call these endpoints make is also blocking, which makes **where each bound sits** as important as whether it exists.
+Two facts make bounds a correctness concern here rather than a nicety: **a Firestore document may not exceed 1 MiB**, and handlers write `model.dict()` straight into a collection, so an unbounded field is an unbounded document. Every external call these endpoints make is also blocking, which makes **where each bound sits** as important as whether it exists — and on that second question this API currently has three bounds, all of them in one handler and none of them in front of a provider call.
 
-`create_listing` runs in this order: the seller-role gate, then the **photo bounds**, then the photo loop — one blocking Cloud Vision call per entry — then the maintenance record-count check and the maintenance loop it guards, then assembly, then the serialized-size check, then the Firestore write. Read two consequences off that order: **no rejected request ever writes to Firestore**, because every guard precedes the write; and **no rejected request pays for a provider call either**, because the photo bounds sit above the loop rather than below it. A 422 from the maintenance or serialized-size check still arrives after the Vision calls for that request, which is why the photo bounds are deliberately tighter than the document ceiling.
+`create_listing` runs in this order: the seller-role gate, then the photo loop — one blocking Cloud Vision call per entry, with **nothing bounding how many entries there are** — then the maintenance record-count check and the maintenance loop it guards, then assembly, then the serialized-size check, then the Firestore write. Read two consequences off that order: **no rejected request ever writes to Firestore**, because every guard precedes the write; but **a rejected request has already paid for every provider call**, because the only bounds sit below the photo loop rather than above it. A caller who sends fifty photos and then trips the serialized-size check has cost fifty Cloud Vision round trips for a 422.
 
 | Endpoint | Bound | Answer when exceeded | Enforced by |
 | --- | --- | --- | --- |
-| `POST /api/listings/listings` | At most **12 photos** (`_MAX_PHOTOS`), at most **256 KiB per entry** (`_MAX_PHOTO_BYTES`), at most **900 KiB across all of them** (`_MAX_PHOTO_TOTAL_BYTES`), and no blank entry. Measured on the **encoded** payload, which is what is handed to the provider | 422 `Unable to process vehicle photos` | The handler, **before the first Cloud Vision call**. The response names no bound; the log line does, keyed to the request's `correlation_id` |
 | `POST /api/listings/listings` | At most **20 maintenance records** (`_MAX_MAINTENANCE_RECORDS`), and at most **900 KiB of decoded content in aggregate** across them (`_MAX_MAINTENANCE_CONTENT_BYTES`). A record whose `content` is **present but empty**, or of a type that is neither `str`, `bytes` nor `bytearray`, is rejected — but a record with **no `content` key at all, or `content: null`, is skipped silently** rather than rejected, and contributes nothing to `maintenance_data` | 422 `Unable to process maintenance documents` | The handler; the aggregate is checked as it accumulates, so it stops at the record that crosses the line |
 | `POST /api/listings/listings` | The serialized listing — request fields plus the derived `photo_analysis` and `maintenance_data` — must stay under **1,000,000 bytes** (`_MAX_SERIALIZED_LISTING_BYTES`) | 422 `Listing payload is too large to store` | The handler, after assembly and **before** the Firestore write |
-| `POST /api/messages/messages` | `content` is trimmed, must be **non-blank**, and must be at most **4000 characters** and **16 KiB encoded** | 422, raised by the model before the handler is entered | `app/schema/message.py` |
-| `POST /api/auth/register` | Address shape and length, password length in characters **and** bytes, name length, role allow-list — [section 2.2.1](#221-what-registration-accepts) | 422, raised by the model before the handler is entered | `app/api/auth.py`'s `RegisterRequest` |
 
-**What is still unbounded is quantity, not size.** Nothing limits how many listings or messages one account may create, and no list endpoint pages its results — `GET /api/listings/listings` and `GET /api/messages/messages` both stream whole collections ([NT-20](#52-work-worth-picking-up)). A caller who is willing to make many small, individually valid requests can still grow a response until it is expensive to serve, and creation quotas are the missing half of that ([NT-25](#52-work-worth-picking-up)).
+That is the whole list. **Four things a reader expects to find here are not bounded at all**, and each is a task rather than a footnote:
 
-Three things to carry from the table:
+| Not bounded | What one request can do today | Tracked as |
+| --- | --- | --- |
+| `VehicleListing.photos` — count, per-entry size, aggregate size | a caller decides how many outbound Cloud Vision calls one request makes; a blank entry is accepted and analysed | **NT-25** |
+| `Message.content` | a blank body, or an arbitrarily long one, is written to Firestore exactly as sent | **NT-25** |
+| Every registration field | an address with no domain, a one-character password, a blank name, a self-granted `admin` role | **NT-24** |
+| How many listings or messages one account may create | unlimited, each permanent, every one enlarging an unpaginated list response | **NT-25**, **NT-20** |
 
-- **Where a bound lives changes what it protects.** A bound on the model rejects the request before your handler exists, which is the right home for a plain field like `Message.content`; a bound in the handler is the only option when the value is derived, as the serialized-listing check is, or when it must precede an outbound call, as the photo bounds do.
-- **These are byte bounds, not length bounds.** `len()` on a `str` under-counts every non-ASCII character, so what is checked is always the size of the encoded payload that is actually handed on. Copy that when you add one.
+Three things to carry when you add the missing ones:
+
+- **Where a bound lives changes what it protects.** A bound on the model rejects the request before your handler exists, which is the right home for a plain field like `Message.content` — with one caution, that `app/api/messages.py` rebuilds the same model from stored documents on the read path, so a validator there also runs against everything already written. A bound in the handler is the only option when the value is derived, as the serialized-listing check is, or when it must precede an outbound call, which is exactly where the photo bound belongs.
+- **Make them byte bounds, not length bounds.** `len()` on a `str` under-counts every non-ASCII character, so check the size of the encoded payload that is actually handed on. The maintenance aggregate does this — copy it.
 - **The 1 MiB ceiling is Firestore's, not ours.** An over-size document that slips past these checks is rejected by Firestore with an error no handler here catches — which is why the serialized check exists at all, and why any new field you add to a written model needs one too ([section 4.3](#43-add-a-schema)).
 
 ## 2.9 THE PURCHASE PATH
@@ -1120,20 +1119,18 @@ Three things to carry from the table:
 
 1. **Authorise.** The caller must be the request's `buyer_id`, or 403.
 2. **Check availability.** `vehicles/{vehicle_listing_id}` must exist with `status == 'available'`, or 400. Note the field: the schema has no `vehicle_id`, and reading one was the `AttributeError` that made this endpoint fail on every request.
-3. **Settle the terms against that record.** Where the vehicle document carries a `price`, the request's `amount` must match it to within half a cent; where it carries a `seller_id`, the request's must match exactly. Either disagreement is a **400** raised before any charge. Where the document carries neither — which today is every vehicle document, because nothing creates one — the request's own terms are used and that fact is logged rather than hidden (**HCF-7**, **HCF-16**).
-4. **Refuse a payment intent already charged.** If any transaction records the same `stripe_payment_intent_id`, the request answers **409** and no charge is attempted. That is what turns the common failure — a client retrying a request whose answer it never saw — into a refusal rather than a second charge.
-5. **Charge**, synchronously — `process_payment(stripe_payment_intent_id, amount, 'usd')`. The token is the request's payment intent id because that is the only Stripe-credential-shaped field the frozen schema declares (**HCF-1**), and the currency is pinned because the schema has no currency field.
-6. **Read the result by key.** `payment_result.get('success')` — the helper returns a plain `dict`, and `.get` rather than `['success']` means a malformed result is treated as a failed payment instead of raising. Falsey means 400, before anything is written.
-7. **On success**, write the transaction document with `status: 'completed'` and its own id, then update the vehicle to `status: 'sold'`.
+3. **Charge**, synchronously — `process_payment(stripe_payment_intent_id, amount, 'usd')`. The token is the request's payment intent id because that is the only Stripe-credential-shaped field the frozen schema declares (**HCF-1**), and the currency is pinned because the schema has no currency field.
+4. **Read the result by key.** `payment_result.get('success')` — the helper returns a plain `dict`, and `.get` rather than `['success']` means a malformed result is treated as a failed payment instead of raising. Falsey means 400, before anything is written.
+5. **On success**, write the transaction document with `status: 'completed'` and its own id, then update the vehicle to `status: 'sold'`.
 
-**Three things this path still does not do, all of which matter if real money is involved.** They are the delivered state, each recorded in [section 5.1](#51-decisions-awaiting-confirmation), and none of them is something you have misconfigured:
+That is every step. **Four things this path does not do, all of which matter if real money is involved** — they are the delivered state, not something you have misconfigured:
 
-- **Two buyers can both pay for one car.** The availability read and the `'sold'` update are separate, unguarded steps, so two genuinely concurrent requests can both see `'available'` and both be charged. The intent check in step 4 does not help here: two concurrent requests carry two different intents. Only an atomic reservation does (**HCF-14**).
-- **The two writes are not atomic.** A crash between them leaves a charged card with either no transaction document or a vehicle still marked `'available'` (**HCF-14**).
-- **The provider has no idempotency key.** `process_payment` sends none, so the guarantee in step 4 is application-side only: it stops a replay this service can see, not one that reaches Stripe by another path (**NT-27**).
-- **Terms are only as authoritative as the record.** Step 3 can only compare against fields the vehicle document actually carries, and nothing populates one, so on today's data it warns rather than refuses (**HCF-7**, **HCF-16**).
+- **The amount and the seller come from the request and are checked against nothing.** A caller names its own price and names the seller the sale is recorded against — and that named seller becomes a principal who may later read the transaction. The vehicle document is read for its `status` and nothing else, so even a document carrying a `price` and a `seller_id` does not constrain the request (**NT-41**).
+- **A replayed payment intent is charged again.** Nothing looks for a transaction already recording the same `stripe_payment_intent_id`, and `process_payment` sends no provider-level idempotency key, so a client retrying a request whose answer it never saw pays twice — at the application *and* at the provider (**NT-27**).
+- **Two buyers can both pay for one car.** The availability read and the `'sold'` update are separate, unguarded steps, so two concurrent requests can both see `'available'` and both be charged. Only an atomic reservation closes it (**NT-28**).
+- **The two writes are not atomic.** A crash between them leaves a charged card with either no transaction document or a vehicle still marked `'available'`, and nothing reconciles either state afterwards (**NT-28**).
 
-One consequence for local work: nothing in this system creates a vehicle document (**HCF-7**), so to exercise the endpoint at all you must write `vehicles/{id}` yourself with `{"status": "available"}` — and give it a `price` and a `seller_id` too if you want step 3 to do anything, which is also the shape whatever eventually creates these documents should write.
+One consequence for local work: nothing in this system creates a vehicle document (**HCF-7**), so to exercise the endpoint at all you must write `vehicles/{id}` yourself with `{"status": "available"}` — that one field is all the handler reads, and a `price` and a `seller_id` are what whatever eventually creates these documents will need to write before **NT-41** can settle a purchase's terms from the record.
 
 # 3. COMMON PITFALLS
 
@@ -1146,11 +1143,11 @@ Start here. Match the message, then read the section.
 | What you see | What it means | Section |
 | --- | --- | --- |
 | `ModuleNotFoundError: No module named 'app'` | `PYTHONPATH` is not set | [1.6](#16-set-pythonpath--mandatory) |
-| `pydantic...ValidationError: 1 validation error for Settings` | Either one of the eight required variables is unset, or a value is outside its policy — a `SECRET_KEY` under 32 characters, an `ACCESS_TOKEN_EXPIRE_MINUTES` outside 1–1440, an `ALGORITHM` outside the HMAC family, or an `ALLOWED_ORIGINS` entry containing `*`. The message names which | [1.5](#15-configure-the-environment) |
+| `pydantic...ValidationError: 1 validation error for Settings` | One of the eight required variables is unset, or a value cannot be coerced to its declared type. The message names the field. Nothing checks a value against a *policy*, so this is the only settings failure there is (**NT-39**) | [1.5](#15-configure-the-environment) |
 | `ImportError: python-dotenv is not installed` | You have a `.env` file and the dependency that reads it is not installed. Delete the file and export the variables | [1.5](#15-configure-the-environment) |
-| `SettingsError: error parsing env var "allowed_origins"` | You are running an older checkout; the current one accepts both forms | [3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash) |
-| `ALLOWED_ORIGINS may not contain a wildcard` at import | Deliberate. Credentials are enabled on the CORS middleware, so a wildcard would admit every origin — name each one in full | [3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash) |
-| A failure is logged but you wanted the traceback | By design: tracebacks and provider text sit behind `DEBUG`. Raise the `app` namespace to `DEBUG`, into a sink whose readers may see request content | [1.11](#111-where-the-logs-go) |
+| `SettingsError: error parsing env var "allowed_origins"` | You are running an older checkout; the current one accepts both forms | [3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here) |
+| A log line with no `correlation_id` in it, where the code clearly attaches one | Expected: `logging.basicConfig` renders no `extra` keys, so the id is on the record and not in the text. Configure a formatter that emits it, or read the record | [1.11](#111-where-the-logs-go) |
+| `INFO` lines from `httpx` or the Google client stack you did not ask for | Expected: logging is configured on the **root** logger, so every library at `INFO` prints alongside the application (**NT-29**) | [1.11](#111-where-the-logs-go) |
 | `ImportError: cannot import name 'Stripe' from 'stripe'` | Known, out of scope, not your setup | [3.8](#38-a-clean-boot-still-stops-in-the-payment-module) |
 | `TypeError: object dict can't be used in 'await' expression` | You awaited a synchronous service function | [3.5](#35-never-await-a-service-function-and-never-read-a-dict-by-attribute) |
 | `AttributeError: 'dict' object has no attribute 'success'` | You read a dict result by attribute instead of by key | [3.5](#35-never-await-a-service-function-and-never-read-a-dict-by-attribute) |
@@ -1158,25 +1155,23 @@ Start here. Match the message, then read the section.
 | `AttributeError: 'Settings' object has no attribute '…'` | A setting is read but not declared on `Settings` | [4.6](#46-add-a-setting) |
 | `ImportError: cannot import name 'x_router'` | A router was imported under a name its module does not export | [4.2](#42-mount-it-in-mainpy) |
 | 404 on a path you are sure exists | Probably the doubled segment: try `/api/listings/listings` | [3.9](#39-the-doubled-path-segments-are-deliberate) |
-| 422 from `POST /api/auth/register` | Either a field is absent, or a value failed policy: `role` outside `buyer`/`seller`, a malformed or over-254-character address, a password under 8 characters or over 72 bytes, a blank or over-100-character name. The message names the field | [2.2.1](#221-what-registration-accepts) |
+| 422 from `POST /api/auth/register` | A field is absent, `null`, or uncoercible to `str`. That is the only thing checked: no value is validated for shape, length or allowed content, so a malformed address or a one-character password answers **201** (**NT-24**) | [2.2.1](#221-what-registration-accepts) |
 | 422 from `POST /api/auth/login` where you expected 401 | The body is not shaped like a login attempt — a field is missing, `null`, uncoercible, or the payload is not JSON. Credential rejection is 401; request-shape rejection is 422 | [2.5](#25-authentication-and-tokens) |
+| 401 from `POST /api/auth/login` with credentials you are sure are right | Check the spelling of the address, including its case and any surrounding space: nothing canonicalises it, and the lookup is an exact match, so an account registered as `A@b.com` cannot be signed into as `a@b.com` (**NT-24**) | [3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced) |
 | 422 `field required` for `id`, `seller_id`/`buyer_id`, `status`, `created_at` or `updated_at` when creating a listing or transaction | Not your mistake: `VehicleListing` and `Transaction` declare every field required, so the body has to carry all of them. **Send real values rather than placeholders, though, because the handlers overwrite almost none of them** — creating a listing replaces only `seller_id`, from your token; creating a transaction replaces only `id` and `status`. Everything else you send is stored as sent, and a placeholder `buyer_id` answers **403** rather than 200, because it is compared with the caller instead of being assigned. **NT-23** | [4.3](#43-add-a-schema) |
-| 422 `Unable to process vehicle photos` | More than 12 photos, an entry over 256 KiB, over 900 KiB of photo payload in total, or a blank entry. Which one is in the log line, not in the response | [2.8](#28-what-the-write-endpoints-bound) |
-| 429 with a `Retry-After` header from register or login | The attempt ceiling for this minute is reached — 10 sign-ins or 5 registrations, per client address and per account. Wait the header out; it says nothing about whether the account exists | [2.2.1](#221-what-registration-accepts) |
-| 409 `A transaction is already recorded for this payment` | That `stripe_payment_intent_id` has already been charged. This is the guard against a retry paying twice, not an error in your request — use a new intent | [2.9](#29-the-purchase-path) |
-| 400 `Purchase terms do not match the vehicle record` | The vehicle document carries a `price` or a `seller_id` and your request disagrees with it. Fix the request, or the record | [2.9](#29-the-purchase-path) |
-| 422 from `POST /api/messages/messages` | The body is blank, over 4000 characters, or over 16 KiB encoded | [2.8](#28-what-the-write-endpoints-bound) |
+| A listing creation that is slow, or a bill from Cloud Vision larger than you expected | Nothing bounds `photos`, so one request makes one provider call per entry however many you send (**NT-25**) | [2.8](#28-what-the-write-endpoints-bound) |
 | 401 `Not authenticated` where you expected `Could not validate credentials` | The `Authorization` header is missing or is not a Bearer header, so the token never reached the dependency | [2.5](#25-authentication-and-tokens) |
-| `TypeError: … got multiple values for keyword argument 'id'` on `GET /api/messages/messages` | Known messaging defect | [3.10](#310-messaging-is-reachable-but-not-functional) |
-| CORS failure in the browser with the API answering fine in `curl` | Origin is not in `ALLOWED_ORIGINS`, or the SPA is on Vite's default port 5173 | [1.8](#18-run-the-spa-optional), [3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash) |
+| 500 from either `/api/messages/messages` route | Known messaging defect, and it is **HCF-8** rather than anything you did — sending fails on the timestamp sentinel after the write, listing fails on a duplicated `id` keyword | [3.10](#310-messaging-is-reachable-but-not-functional) |
+| CORS failure in the browser with the API answering fine in `curl` | Origin is not in `ALLOWED_ORIGINS`, or the SPA is on Vite's default port 5173 | [1.8](#18-run-the-spa-optional), [3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here) |
 | `Failed to resolve import "app/services/api"` from Vite, or `Cannot find module 'app/utils/auth'` from `tsc` | Pre-existing and not your setup: the SPA's client module graph does not resolve — an unexported client, two modules that do not exist, and a prefix mapped nowhere. **NT-30** | [1.8](#18-run-the-spa-optional), [2.6.2](#262-why-none-of-it-executes-yet) |
 | `ReferenceError: process is not defined` in the browser, or a request from the SPA arriving at the dev server — `http://localhost:3000/auth/login` rather than port 8000 | The client reads `process.env.REACT_APP_API_BASE_URL` and Vite satisfies neither half of that: no `process`, and only `VITE_`-prefixed names on `import.meta.env`. The base it needs is `http://localhost:8000/api`. **NT-31** | [1.8](#18-run-the-spa-optional), [2.6.2](#262-why-none-of-it-executes-yet) |
 | `pytest` reports collection errors | Expected; the suite is broken | [3.7](#37-pytest-is-not-a-gate) |
-| `ImportError: python-dotenv is not installed` | There is a `.env` file in the working directory and the optional extra is not installed | [1.5](#15-configure-the-environment) |
-| 409 `Email is already registered` on register | An earlier registration used that address — in any spelling, since addresses are canonicalised — or a `user_emails` marker for it exists without an account behind it | [2.5.2](#252-what-the-public-routes-do-and-do-not-check) |
+| 409 `Email is already registered` on register | An earlier registration used that address in **exactly** that spelling. A different case or a stray space is not a duplicate — it is a second account (**NT-24**) | [2.5.2](#252-what-the-public-routes-do-and-do-not-check) |
 | 422 `Unable to process maintenance documents` | More than 20 records, over 900 KiB of content in total, or a record whose `content` is present but empty or of an unusable type. A record carrying **no** `content` is skipped rather than rejected, so it is not this | [4.4](#44-call-services-synchronously-and-guard-them) |
+| 422 `Listing payload is too large to store` | The assembled listing — your fields plus the derived analysis and maintenance data — serialises to over 1,000,000 bytes. The photo analysis counts towards it | [2.8](#28-what-the-write-endpoints-bound) |
 | 400 `Vehicle is not available for purchase` | No `vehicles/{vehicle_listing_id}` document, or its `status` is not `available` — remember **no module creates or populates** one, so you have to write it yourself; the purchase path only ever *updates* a document that already exists, to `'sold'` | [2.9](#29-the-purchase-path) |
-| Nothing at all in the log where you expected a line | Something reconfigured the `app` logger, or you are reading a logger outside that namespace | [1.11](#111-where-the-logs-go) |
+| A card charged twice for one vehicle | Expected, and it is not a provider fault: nothing refuses a replayed payment intent and no idempotency key is sent (**NT-27**) | [2.9](#29-the-purchase-path) |
+| Nothing at all in the log where you expected a line | Something reconfigured logging after import, or you are reading a logger below the root's level | [1.11](#111-where-the-logs-go) |
 
 ## 3.2 PYDANTIC V1 IS MANDATORY
 
@@ -1194,13 +1189,13 @@ Start here. Match the message, then read the section.
 
 **What to do.** Never upgrade `bcrypt` on its own. If hashing breaks, check `pip show bcrypt` first — it is the likeliest cause and takes ten seconds to rule out.
 
-## 3.4 `ALLOWED_ORIGINS` TAKES TWO FORMS, AND NEITHER MAY CRASH
+## 3.4 `ALLOWED_ORIGINS` TAKES TWO FORMS, AND A WILDCARD IS NOT SAFE HERE
 
 **Symptom.** Historically, exporting the obvious `ALLOWED_ORIGINS=http://localhost:3000` raised `SettingsError: error parsing env var "allowed_origins"` **at import**, before the application existed.
 
 **Cause.** Pydantic v1 JSON-decodes complex-typed environment values inside its settings source, *before* any field validator can run. A bare comma-separated string is not valid JSON, so the decode failed and took the whole process with it — the very class of import-time failure this backend was repaired for. A `pre=True` validator cannot intercept it, because it never runs.
 
-**What to do.** Nothing — it is handled, via a `Config.parse_env_var` override that special-cases this one field and delegates everything else to the default behaviour. Both of these are correct, and so are the edge cases:
+**What to do.** Nothing about the parsing — it is handled, via a `Config.parse_env_var` override that special-cases this one field and delegates everything else to the default behaviour. Both of these are correct, and so are the edge cases:
 
 ```bash
 export ALLOWED_ORIGINS="http://localhost:3000,http://localhost:5173"
@@ -1214,15 +1209,18 @@ export ALLOWED_ORIGINS='["http://localhost:3000","http://localhost:5173"]'
 | `["http://a.test","http://b.test"]` | `['http://a.test', 'http://b.test']` |
 | empty, or whitespace only | `[]` — restrictive, and never a crash |
 | ` http://a.test , , http://b.test ` | `['http://a.test', 'http://b.test']` — entries trimmed, blanks dropped |
-| `*`, or any entry containing `*` | **refused at import**, with a message naming the fix; see below |
+| `*` | `['*']` — **accepted, and it means allow-all; see below** |
+| `https://*.example.com` | `['*.example.com'…]` verbatim — accepted and then matches **nothing**, because this middleware does no pattern matching |
 
-> **`ALLOWED_ORIGINS='*'` is refused at import, and that is deliberate.** Any entry containing `*` — a bare wildcard or a pattern like `https://*.example.com`, which this middleware could not honour anyway — stops the process with a message telling you to name each origin in full. The alternative was to accept it and hope nobody deployed it, which is how this kind of value reaches production.
+> **`ALLOWED_ORIGINS='*'` is accepted, and it is the one value you must not deploy.** Nothing refuses it: the field is a `List[str]` with no validator, so a wildcard imports cleanly and then governs (**NT-39** is the task that would refuse it at import, which is where a value like this should be caught).
 >
-> **The reason it cannot be a "local diagnostic" is that the framework does not fail safe.** Because `allow_credentials=True`, Starlette answers a preflight by echoing back the *exact requesting origin* rather than a literal `*` (`preflight_explicit_allow_origin` in `starlette/middleware/cors.py`), so **every** origin passes the check. The wildcard is not a half-measure; it is an allow-all. Set exact origins: `ALLOWED_ORIGINS="https://app.example.com,https://admin.example.com"`.
+> **It is worse than it looks, because the framework does not fail safe.** Because `allow_credentials=True`, Starlette answers a preflight by echoing back the *exact requesting origin* rather than a literal `*` (`preflight_explicit_allow_origin` in `starlette/middleware/cors.py`), so **every** origin passes the check and every response looks individually approved. The wildcard is not a half-measure; it is an allow-all wearing the appearance of a specific answer. Set exact origins: `ALLOWED_ORIGINS="https://app.example.com,https://admin.example.com"`.
 >
-> **What that allow-all actually buys an attacker, stated precisely.** This API authenticates with a bearer token that the SPA stores and attaches explicitly, and it sets no cookie and keeps no server-side session — so a page the user did not visit cannot make an *authenticated* request to this backend today. A browser only attaches ambient credentials, and CORS only relaxes the same-origin policy for *reading responses*; a token in `localStorage` is not ambient. What a permissive origin list does give away is (a) the ability for any site to read **unauthenticated** responses that a browser could otherwise not read cross-origin — here that includes the public listing endpoints, and [section 2.8](#28-what-the-write-endpoints-bound) explains why those responses carry raw maintenance-document content — and (b) the whole attack surface the moment anyone moves this API to cookie or session authentication, which is a one-line change on the client and a total change in exposure. Treat exact origins as the state you want to be in *before* that happens, not after.
+> **A pattern is not a middle ground either.** `https://*.example.com` is stored verbatim and compared verbatim, so it matches no real origin at all — you get the restrictive behaviour by accident rather than the permissive one, which is a confusing way to discover that this middleware has no pattern support.
 >
-> Narrowing the method and header lists, which are still `['*']`, is task **NT-11**; they are not the origin check and do not become safe because the origin list is now exact.
+> **What an allow-all actually buys an attacker, stated precisely.** This API authenticates with a bearer token that the SPA stores and attaches explicitly, and it sets no cookie and keeps no server-side session — so a page the user did not visit cannot make an *authenticated* request to this backend today. A browser only attaches ambient credentials, and CORS only relaxes the same-origin policy for *reading responses*; a token in `localStorage` is not ambient. What a permissive origin list does give away is (a) the ability for any site to read **unauthenticated** responses that a browser could otherwise not read cross-origin — here that includes the public listing endpoints, and [section 2.8](#28-what-the-write-endpoints-bound) explains why those responses carry raw maintenance-document content — and (b) the whole attack surface the moment anyone moves this API to cookie or session authentication, which is a one-line change on the client and a total change in exposure. Treat exact origins as the state you want to be in *before* that happens, not after.
+>
+> Narrowing the method and header lists, which are still `['*']`, is task **NT-11**; they are not the origin check and do not become safe because the origin list is exact.
 
 If you add another complex-typed setting, it needs the same treatment; [section 4.6](#46-add-a-setting) shows where.
 
@@ -1288,7 +1286,7 @@ ImportError: cannot import name 'Stripe' from 'stripe'
 
 | You want to | Use | Datastore |
 | --- | --- | --- |
-| Assert behaviour — before a commit, or after changing a handler | The in-process harness in [section 6](#6-verifying-behaviour-in-process): one script, 139 assertions, a few seconds | An **in-memory double**. No emulator, no network, no credentials — and it asserts that before it runs |
+| Assert behaviour — before a commit, or after changing a handler | The in-process harness in [section 6](#6-verifying-behaviour-in-process): one script, 99 assertions, a few seconds | An **in-memory double**. No emulator, no network, no credentials — and it asserts that before it runs |
 | Actually serve traffic — to poke it with `curl`, open Swagger, or point a client at it | The local development profile in [section 1.7.1](#171-the-local-development-profile) | The **Firestore emulator**, with a throwaway project id, under a profile that refuses to start without it |
 
 Both install the same two stand-ins, and neither puts them in the repository: editing `app/services/payment.py` or `app/services/ai_vision.py` is a different change with its own authorization. Use one of the two rather than assembling your own, because three details are easy to get wrong and each has cost someone here an afternoon:
@@ -1320,7 +1318,7 @@ Both install the same two stand-ins, and neither puts them in the repository: ed
 
 **What to do.** Do not chase it as a regression, and do not "fix" it by changing the message schema — a schema that rejects the sentinel simply fails one line earlier. Both defects are in route logic that is out of scope for the current work and are tracked together as **HCF-8**. Stated precisely, with the qualification that matters: **13 routes are registered — read off disk — and 11 of them behaved as documented, both in process against a double and over HTTP under the local development profile ([section 1.7.1](#171-the-local-development-profile)). On an unmodified checkout none of the 13 answers at all**, because the application does not import ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)).
 
-**The body itself is bounded, and that part is done.** `Message.content` is trimmed, required to be non-blank, and capped at 4000 characters and 16 KiB encoded by a validator on the model, so an oversized or empty message is a **422 before the handler is entered** — which is the one messaging improvement reachable without touching the frozen route logic. Two residuals remain in that logic, and both wait for **HCF-8**: a client-supplied `id` or `read` flag is still stored as sent, because the same model is rebuilt from stored documents on the read path and a validator that discarded an incoming `id` would discard the server's own on the way back out; and **sending writes before it fails**, so a client retrying a request whose answer it never saw duplicates the message. Whoever repairs the route should give it idempotency in the same change.
+**Three residuals sit in the same logic, and all of them wait for HCF-8.** `Message.content` is required and typed and **bounded by nothing**, so a blank or arbitrarily long body is written as sent (**NT-25**) — and bounding it on the model is not a free win, because `app/api/messages.py` rebuilds that same model from stored documents on the read path, so a validator there also runs against everything already written and has to tolerate it. A client-supplied `id` or `read` flag is stored as sent for the same reason. And **sending writes before it fails**, so a client retrying a request whose answer it never saw duplicates the message; whoever repairs the route should give it idempotency in the same change.
 
 ## 3.11 CLIENTS ARE BUILT AT IMPORT, NOT AT STARTUP
 
@@ -1337,27 +1335,26 @@ Both install the same two stand-ins, and neither puts them in the repository: ed
 
 So a clean `import app.main` builds two of the four — Firestore, then Vision — and then stops inside `app/services/payment.py` without building the Stripe client ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module)). Three of the four are on the import path and only the fourth is not: the Cloud Storage client is built solely if you import `app.db.cloud_storage` yourself, which nothing does (**HCF-5**) — yet `GOOGLE_CLOUD_STORAGE_BUCKET` is still required, because `Settings` declares it without a default and settings validation does not care who reads it. Configuration must be valid *before* any import — which is why [section 1.5](#15-configure-the-environment) comes before [section 1.7](#17-run-the-api).
 
-**What to do.** Export the variables first. Note the corollary, because it explains something you will otherwise find puzzling: **the startup hook in `app/main.py` deliberately performs no initialization.** It once imported and awaited `initialize_db`, `initialize_vision_model` and `initialize_document_processor`, none of which was ever defined anywhere in the repository — three `ImportError`s waiting at line 8. Since the clients are already built at import and the document processor needs no client, there was no initialization work left to do, so the awaits were **removed rather than stubbed out**, and the hook now logs one line — `startup complete: firestore and vision clients initialised at import`, which you will see because the same module configures the `app` logger at `INFO` ([section 1.11](#111-where-the-logs-go)). Whether to reintroduce real initializers — for lazy construction, or a startup health check — is an open decision, **HCF-2**. If you add one, put it in that hook; do not add a second startup event.
+**What to do.** Export the variables first. Note the corollary, because it explains something you will otherwise find puzzling: **the startup hook in `app/main.py` deliberately performs no initialization.** It once imported and awaited `initialize_db`, `initialize_vision_model` and `initialize_document_processor`, none of which was ever defined anywhere in the repository — three `ImportError`s waiting at line 8. Since the clients are already built at import and the document processor needs no client, there was no initialization work left to do, so the awaits were **removed rather than stubbed out**, and the hook now logs one line — `startup complete: firestore and vision clients initialised at import`, which you will see because the same module calls `logging.basicConfig(level=logging.INFO)` on the root logger ([section 1.11](#111-where-the-logs-go)). Whether to reintroduce real initializers — for lazy construction, or a startup health check — is an open decision, **HCF-2**. If you add one, put it in that hook; do not add a second startup event.
 
 Being built at import is also why credentials are not needed for the compile and lint gates: those never import the modules, they only parse them.
 
-## 3.12 ONE ADDRESS IS ONE ACCOUNT, AND HOW THAT IS ENFORCED
+## 3.12 ONE ADDRESS IS ONE ACCOUNT, AND HOW IT IS NOT ENFORCED
 
 **Symptom.** You expect a duplicate registration to be refused, and you want to know what actually stops it — a query, or something stronger.
 
-**Cause of the old behaviour.** Uniqueness used to rest on a query run before the write, and a query cannot see a request that has not committed yet: two simultaneous registrations both found nothing and both wrote. `authenticate_user` then resolved sign-in with `.limit(1)`, so which of the two passwords worked was not determined. Firestore's equality filter is also case-sensitive, so ` A@b.test ` and `a@b.test` were two accounts as far as that query was concerned.
+**Cause.** It is a query, and a query cannot enforce uniqueness. `POST /api/auth/register` reads `users` for the submitted address and answers **409 `Email is already registered`** if it finds one, then writes. Between that read and that write another request can do exactly the same thing, so **two simultaneous registrations for one address both succeed**. `authenticate_user` then resolves sign-in with `.limit(1)`, so which of the two passwords works is not determined.
 
-**What happens now.** Two things, in this order:
+**And the address is not normalised**, which weakens even the sequential case: Firestore's equality filter is case-sensitive and nothing here trims or lower-cases, so ` A@b.test ` and `a@b.test` are two accounts, and signing in with a spelling other than the one you registered answers 401. That half is task **NT-24**.
 
-1. **The address is canonicalised** — trimmed and lower-cased — by a validator on `RegisterRequest` and on `LoginRequest`, so one address has one representation everywhere: in the duplicate query, in the stored document, and in the sign-in lookup.
-2. **The address is claimed atomically.** Registration creates `user_emails/{sha256(canonical_email)}` with `create()`, which is a *conditional* write: it fails with `AlreadyExists` if the document is there. That happens **before** the account is written, so of two simultaneous registrations exactly one proceeds and the other gets the same **409 `Email is already registered`** a sequential duplicate gets. If the account write then fails, the claim is released, so an address is never stranded.
+**What a real constraint takes**, when you come to add it (**NT-40**) — and the order matters, because normalising without a constraint just moves the collision:
 
-The pre-write query is still there. It is the fast path, and it also covers any account created before that marker collection existed — those have no marker, so the query is the only thing that catches them.
+1. **Canonicalise first.** Trim and lower-case the address on both request models, so one address has one representation in the duplicate query, in the stored document and in the sign-in lookup.
+2. **Then make the claim conditional.** A marker document — `user_emails/{sha256(canonical_email)}` — written with `create()` rather than `set()` is a *conditional* write: it raises `AlreadyExists` if the document is there. Claim it **before** the account is written, and of two simultaneous registrations exactly one proceeds while the other gets the same 409 a sequential duplicate gets. Release the claim if the account write then fails, or an address is stranded with nothing behind it. [Section 4.7](#47-uniqueness-and-money-neither-pattern-is-in-place) has the shape.
+3. **Keep the query.** It stays useful as the fast path and as the only thing that catches accounts created before the marker collection existed.
+4. **Budget for the deployment half.** A new collection is a resource no existing IAM policy or security rule grants, so the grant has to land with the code or every registration starts answering 500 instead of 201.
 
-**What to do.** Nothing, for uniqueness. Two things worth knowing:
-
-- **A `user_emails` document with no user behind it means a 409 nobody can explain.** That can only happen if a process died between the claim and the compensating release. Delete the marker to free the address.
-- **An in-memory double cannot prove any of this.** It serialises everything, so a race never happens. The concurrency assertion needs a Firestore emulator — see [section 1.10.1](#1101-the-two-sanctioned-stubs) for the fail-closed conditions, and expect exactly one 201 out of four simultaneous attempts.
+**What to do meanwhile.** Treat one-address-one-account as a convention this API asks for rather than one it enforces, and know that an in-memory double cannot show you the failure: it serialises everything, so the race never happens. Proving it either way needs a Firestore emulator — see [section 1.10.1](#1101-the-two-sanctioned-stubs) for the fail-closed conditions, and expect **more than one** 201 out of four simultaneous attempts today.
 
 # 4. HOW TO EXTEND
 
@@ -1389,13 +1386,13 @@ def get_widget(widget_id: str, current_user: User = Depends(get_current_user)):
 
 `Depends(get_current_user)` is the whole authentication story: it resolves the bearer token, loads the user document and raises 401 with a `WWW-Authenticate: Bearer` header if anything is wrong. Add authorization inline in the handler, matching the style in [section 2.2](#22-roles-and-who-may-do-what).
 
-**`def` or `async def` is the one decision in this template that has a wrong answer, so make it deliberately.** The rule is simple: `async def` is correct only if the body actually `await`s something. Every I/O client in this codebase is synchronous — the Firestore client, Cloud Vision, PyPDF2, Stripe — so a handler that touches any of them has nothing to await, and declaring it `async` puts blocking calls directly on the event loop where they delay every other in-flight request. A plain `def` handler goes to Starlette's threadpool instead, which is what you want. That is why the example above is a `def`, and why the six handlers named below are.
+**`def` or `async def` is the one decision in this template that has a wrong answer, so make it deliberately.** The rule is simple: `async def` is correct only if the body actually `await`s something. Every I/O client in this codebase is synchronous — the Firestore client, Cloud Vision, PyPDF2, Stripe — so a handler that touches any of them has nothing to await, and declaring it `async` puts blocking calls directly on the event loop where they delay every other in-flight request. A plain `def` handler goes to Starlette's threadpool instead, which is what you want. That is why the example above is a `def`, and why the four handlers named below are.
 
 Three consequences worth carrying:
 
-- **Six handlers get this right and seven do not; copy the six.** The four authentication handlers, `create_listing` and `create_transaction` are plain `def`, so their Cloud Vision, PyPDF2, Stripe and Firestore calls run in the threadpool. `get_listings`, `get_listing`, `update_listing`, `delete_listing`, `get_transaction` and both message routes are still `async def` bodies performing synchronous I/O on the event loop, left that way only because converting frozen route logic needs authorization — tracked as **NT-22**. Follow the rule in new code rather than the majority of the existing code.
+- **Four handlers get this right and nine do not; copy the four.** The four authentication handlers — `register`, `login`, `logout` and `read_current_user` — are plain `def`, so their bcrypt hashing and Firestore reads and writes run in the threadpool. The other nine are `async def` bodies performing synchronous I/O directly on the event loop: `create_listing` (Cloud Vision and PyPDF2), `get_listings`, `get_listing`, `update_listing`, `delete_listing`, `create_transaction` (Stripe), `get_transaction` and both message routes. They are left that way because their signatures are frozen route logic and converting them needs authorization — tracked as **NT-22**. Follow the rule in new code rather than the majority of the existing code.
 - **Never make a handler `async` and then `await` something that is not awaitable.** That was a real defect in this repository, on two live call sites; see [section 3.5](#35-never-await-a-service-function-and-never-read-a-dict-by-attribute).
-- **One thing to check when you move a body off the event loop**, because it caught this codebase: code that relies on `signal.SIGALRM` only works on the main thread, and a threadpool thread is not the main thread. `app/services/document_processing.py` guards PDF extraction with `SIGALRM` when it can and falls back to an unguarded read when it cannot, so `create_listing` loses that wall-clock ceiling by being a `def`. That was the right trade — a slow document now occupies one thread instead of the whole process, and the byte, page and aggregate ceilings still apply — but if the code you are converting has a timeout of that shape, replace it with one that does not depend on signals.
+- **Check for signal-based timeouts before you move a body off the event loop**, because this codebase has one. `signal.SIGALRM` can only be armed on the main thread, and a threadpool thread is not the main thread: `app/services/document_processing.py` guards PDF extraction with `SIGALRM` when it can and falls back to an **unguarded** read when it cannot. `create_listing` is `async def`, so it runs on the main thread and that wall-clock ceiling does apply today — but the same fact means converting it to `def` under **NT-22** would silently drop the ceiling, leaving only the byte, page and aggregate limits. Neither shape is free: the `async def` it has keeps the ceiling and blocks the event loop for the duration; a `def` frees the loop and loses it. If the body you are converting has a timeout of that shape, replace it with one that does not depend on signals in the same change.
 
 ## 4.2 MOUNT IT IN `main.py`
 
@@ -1432,14 +1429,14 @@ Conventions that matter:
 
 - **Fields your handler assigns must be optional**, or the client cannot post a valid body — and a field counts as server-assigned only if a handler actually writes it. Get that distinction right before you copy anything from the two pre-existing write-path schemas, because **they declare every field required while their handlers overwrite almost none of them:**
   - `create_listing` overwrites exactly one field: `seller_id`, from the token. The **stored** document keeps the `id` you sent — only the object returned to you carries the generated document id — and `status`, `created_at` and `updated_at` are persisted exactly as submitted.
-  - `create_transaction` overwrites exactly two: `id` and `status`. `buyer_id` is not assigned at all — it is **compared** with the caller and answers 403 on a mismatch, so it is request input that a placeholder cannot satisfy. `seller_id`, `amount`, `stripe_payment_intent_id`, `created_at` and `updated_at` are persisted exactly as submitted, which is the same fact [section 2.9](#29-the-purchase-path) records as **HCF-16**.
+  - `create_transaction` overwrites exactly two: `id` and `status`. `buyer_id` is not assigned at all — it is **compared** with the caller and answers 403 on a mismatch, so it is request input that a placeholder cannot satisfy. `seller_id`, `amount`, `stripe_payment_intent_id`, `created_at` and `updated_at` are persisted exactly as submitted, which is the same fact [section 2.9](#29-the-purchase-path) records as **NT-41**.
 
   So a caller has to send all of those fields today, and most of what it sends is what ends up stored. `Message` is the schema that follows the rule: only `recipient_id` and `content` are required. Follow `Message` in anything new — mark a field `Optional[...] = None` **only where your handler is the one writing it**, and write it there — and see **NT-23** for why loosening the two existing schemas is a handler change as much as a schema change. Both schema files and both handler bodies are frozen for now, so this is documented rather than fixed.
 - **Use `typing.Optional` and `typing.List`.** `X | None` in an annotation genuinely breaks on the 3.9 CI floor; `list[X]` would work there (PEP 585) but is not the spelling any module in this repository uses — see [section 1.2](#12-prerequisites).
 - **Pydantic v1 ignores unknown keys and permits attribute assignment.** That is why handlers can construct a model from a Firestore dict carrying extra derived keys, and then set `model.id = doc_ref.id` afterwards.
 - **A Firestore sentinel value needs a permissive annotation.** `Optional[Any]` is used for a timestamp field that holds `SERVER_TIMESTAMP` on the way out and a real timestamp on the way back in.
-- **Validate what an endpoint accepts, on the model.** A `@validator` runs while FastAPI binds the body, so a bad request is a 422 that names the field and your handler never runs — nothing is queried, hashed or written. Return the normalised value from the validator so the handler has exactly one thing to trust. There are three worked examples to copy: `Message.content` in `app/schema/message.py` bounds one field, `RegisterRequest` in `app/api/auth.py` normalises an address and constrains a role against an allow-list ([section 2.2.1](#221-what-registration-accepts)), and `Settings` in `app/core/config.py` validates configuration at import. Note what all three return — the *cleaned* value, trimmed and case-normalised — because every authorization check in this codebase compares stored strings exactly, so a value normalised in the validator is a value the rest of the code never has to normalise again.
-- **Bound every field that reaches Firestore, authenticated or not.** A Firestore document may not exceed **1 MiB**, and handlers here write `model.dict()` straight into a collection, so an unbounded `str` is an unbounded document. The minimum is a named `_MAX_*_BYTES` ceiling, a non-empty check, and a length measured on the **UTF-8 encoding** rather than the character count — `len(value)` under-counts every non-ASCII string. Two in-repo precedents to copy from: `_MAX_CONTENT_BYTES` in `app/schema/message.py` for a plain client-supplied field, and `_MAX_MAINTENANCE_CONTENT_BYTES` in `app/api/listings.py` for a value the handler has to accumulate before it can be measured. Authentication only changes who can do it, not whether it works.
+- **Validate what an endpoint accepts, on the model — and note that nothing here does yet.** A Pydantic v1 `@validator` runs while FastAPI binds the body, so a bad request is a 422 that names the field and your handler never runs: nothing is queried, hashed or written. Return the *cleaned* value from the validator — trimmed, case-normalised — because every authorization and uniqueness check in this codebase compares stored strings exactly, so a value normalised once at the boundary is a value the rest of the code never has to normalise again. **There is no in-repo example to copy**: `grep -rn "validator" backend/app/` finds two comments and zero declarations, so every model in this repository accepts anything its annotations allow. That is why an email is not canonicalised, a role is not constrained and a password is not length-checked against bcrypt's 72-byte limit (**NT-24**), and why a message body is unbounded (**NT-25**). Put a validator on your own models, and read those two tasks before you assume an existing model has cleaned anything for you.
+- **Bound every field that reaches Firestore, authenticated or not.** A Firestore document may not exceed **1 MiB**, and handlers here write `model.dict()` straight into a collection, so an unbounded `str` is an unbounded document. The minimum is a named `_MAX_*_BYTES` ceiling, a non-empty check, and a length measured on the **UTF-8 encoding** rather than the character count — `len(value)` under-counts every non-ASCII string. The one in-repo precedent is `_MAX_MAINTENANCE_CONTENT_BYTES` in `app/api/listings.py`, for a value the handler has to accumulate before it can be measured; note where it sits, which is *after* the input has already been decoded ([section 2.8](#28-what-the-write-endpoints-bound)). Nothing bounds a plain client-supplied field — `Message.content` and `VehicleListing.photos` are both unbounded (**NT-25**). Authentication only changes who can send an oversized document, not whether it is stored.
 
 ### 4.3.1 When The Code And The Specification Disagree, The Code Wins
 
@@ -1449,9 +1446,9 @@ The judgement generalises: **when a frozen consumer and a document disagree, con
 
 ## 4.4 CALL SERVICES SYNCHRONOUSLY, AND GUARD THEM
 
-Copy this shape from `app/api/listings.py`. Bound the input before any outbound call; one correlation id per request, hoisted so every log line in the handler shares it; one call per item, each guarded, so a failure degrades the result instead of failing the request.
+Copy this shape from `app/api/listings.py`: one correlation id per request, hoisted so every log line in the handler shares it; one call per item, each guarded, so a failure degrades the result instead of failing the request.
 
-The block below is an **excerpt of the real handler, quoted as it stands on disk** — comments trimmed for length and a few added for orientation, nothing else altered. The body stops after the photo loop; the real handler continues with the same bound-then-guard-then-call shape for maintenance records, then assembly, a serialized-size check and the Firestore write.
+The block below is an **excerpt of the real handler, quoted as it stands on disk** — comments trimmed for length and a few added for orientation, nothing else altered. The body stops after the photo loop; the real handler continues with the maintenance record-count check and its own guarded loop, then assembly, a serialized-size check and the Firestore write. **Read it for the calling convention, not as a complete pattern** — the bullets below name what it is missing.
 
 ```python
 import logging
@@ -1466,72 +1463,41 @@ from app.services.ai_vision import analyze_vehicle_photo
 
 logger = logging.getLogger(__name__)        # renders under the `app` namespace
 
-_MAX_PHOTOS = 12                            # bounds live beside the handler
-_MAX_PHOTO_BYTES = 256 * 1024
-_MAX_PHOTO_TOTAL_BYTES = 900 * 1024
-
 router = APIRouter()
 
 
-def _bounded_photo_payloads(photos, correlation_id):
-    """Normalise to bytes and refuse the list before any provider call."""
-    if len(photos) > _MAX_PHOTOS:
-        logger.warning("too many photos",
-                       extra={"correlation_id": correlation_id,
-                              "count": len(photos)})
-        raise HTTPException(status_code=422,
-                            detail="Unable to process vehicle photos")
-    payloads, total_bytes = [], 0
-    for photo in photos:
-        # Normalise the argument to the type the callee declares -- bytes here.
-        payload = photo.encode('utf-8') if isinstance(photo, str) else photo
-        # ... a blank entry, an entry over _MAX_PHOTO_BYTES, or an aggregate
-        # over _MAX_PHOTO_TOTAL_BYTES each answer the same 422, each logged
-        # with the correlation id so the log says which bound, not the client.
-        total_bytes += len(payload)
-        payloads.append(payload)
-    return payloads
-
-
-# A plain `def`: nothing in this body is awaited, and all of its work blocks.
 @router.post('/listings')
-def create_listing(listing: VehicleListing,
-                   current_user: User = Depends(get_current_user)):
+async def create_listing(listing: VehicleListing,
+                         current_user: User = Depends(get_current_user)):
     if current_user.role != 'seller':
         raise HTTPException(status_code=403, detail="Only sellers can create listings")
 
     correlation_id = str(uuid.uuid4())      # once per request, not once per loop
 
-    payloads = _bounded_photo_payloads(listing.photos, correlation_id)
+    # One call per photo, each guarded. Nothing bounds how many there are.
     photo_analysis = []
-    for payload in payloads:
+    for photo in listing.photos:
+        # Normalise the argument to the type the callee declares -- bytes here.
+        payload = photo.encode('utf-8') if isinstance(photo, str) else photo
         try:
             photo_analysis.append(analyze_vehicle_photo(payload))
-        except Exception as failure:
-            logger.warning(
+        except Exception:
+            logger.exception(
                 "photo analysis failed",
-                extra={"correlation_id": correlation_id,
-                       "error_type": type(failure).__name__},
-            )
-            logger.debug(
-                "photo analysis failure detail",
-                exc_info=True,
                 extra={"correlation_id": correlation_id},
             )
-    # ... the real handler goes on to process maintenance records, assemble the
-    # listing, check its serialized size and write it to Firestore.
+    # ... the real handler goes on to bound and process maintenance records,
+    # assemble the listing, check its serialized size and write it to Firestore.
 ```
 
-Six things to copy from it:
+Four things to copy from it, and two it does not do:
 
-- **Bound the input before the first outbound call.** The count, the per-item size and the aggregate are all checked while the data is still in memory, which costs nothing, and a rejected request therefore performs **no** provider call at all. A bound placed after the loop — as the maintenance and serialized-size guards necessarily are — stops the write but not the work that was already paid for ([section 2.8](#28-what-the-write-endpoints-bound)).
-- **Measure the encoded payload, not the string.** `len()` on a `str` under-counts every non-ASCII character, and the encoded payload is what you hand on.
-- **Say less in the response than in the log.** The 422 names no bound; the log line names which one, with the request's correlation id. Which ceiling a request hit is operator information, and telling a caller lets it tune around them.
 - **No `await` on the callee.** It is synchronous ([section 3.5](#35-never-await-a-service-function-and-never-read-a-dict-by-attribute)), so awaiting the dict it returns is invalid on its own. The old `await analyze_vehicle_photo(listing.photos)` never got as far as proving that, because the wrong argument (next bullet) raised `TypeError` inside the callee first, on every request. Two independent defects, and this loop removes both — never reintroduce either.
 - **One item per call**, with the argument normalised to the declared type. `analyze_vehicle_photo` declares `image_data: bytes` and takes one image, not a collection; the old call passed the whole `List[str]`.
-- **Two log calls, not one, in the `except`.** A `logger.warning` carrying the correlation id and `error_type` is what a production process prints; the traceback and the provider's own text go to `logger.debug(..., exc_info=True)`, which only appears when an operator asks for it ([section 1.11](#111-where-the-logs-go)). `logger.exception` here would publish absolute paths, library internals and whatever the provider chose to quote back. The guard itself matters too: the photo pipeline has a known unresolved defect (**HCF-4**), so an unguarded call would turn every listing creation into a 500 for the seller.
-
-One thing this handler still does not do, so do not read it as complete: **the calls are inline**, so a provider round trip occupies one threadpool thread for the duration of the request, and `analyze_vehicle_photo` accepts no timeout. Moving this work to a background job, and giving the provider calls deadlines, is part of task **NT-22**.
+- **One correlation id per request, hoisted above the loops.** Both of this handler's loops log with the same id, so one failing listing can be traced across them. Note what it costs you today: `logging.basicConfig` renders no `extra` keys, so the id is carried on the record and not printed until someone configures a formatter that emits it ([section 1.11](#111-where-the-logs-go), **NT-29**).
+- **Guard the call itself.** The photo pipeline has a known unresolved defect (**HCF-4**), so an unguarded call would turn every listing creation into a 500 for the seller. `logger.exception` records the failure with its traceback and the request proceeds with a degraded analysis, which is the right trade for an enrichment step — but weigh it per call site: a traceback published to a shared sink carries absolute paths, library internals and whatever text the provider chose to return, so for anything quoting a provider's message prefer a `logger.warning` with an allow-list of fields and put the traceback behind `logger.debug(..., exc_info=True)`.
+- **It does not bound its input, and it should.** Nothing checks how many photos arrived or how large each is, so the caller decides how many outbound provider calls one request makes. When you add that (**NT-25**), put it **above** the loop: a bound below it stops the write but not the work already paid for, which is exactly the position the maintenance and serialized-size guards are in ([section 2.8](#28-what-the-write-endpoints-bound)). Measure the encoded payload rather than the string, and say less in the response than in the log — which ceiling a request hit is operator information.
+- **It does not time anything out, and the calls are inline.** A provider round trip occupies the event loop for its whole duration, because this handler is `async def` ([section 4.1](#41-add-a-router)), and `analyze_vehicle_photo` accepts no timeout. Moving this work to a background job and giving the provider calls deadlines is part of task **NT-22**.
 
 ## 4.5 PROJECTION DISCIPLINE: THERE IS NO `response_model`
 
@@ -1551,7 +1517,7 @@ def _public_user(user: User) -> dict:
 
 **Never return a `User` object from a handler.** If you introduce another model with sensitive fields, give it a projection helper in the same way. Adding `response_model` declarations across the API would enforce this at the framework level and is task **NT-13**; until then the discipline is manual.
 
-One subtlety to know before you add a return annotation: **FastAPI infers a `response_model` from one.** Five handlers carry annotations — four in `app/api/listings.py` (`get_listings` → `List[VehicleListing]`, `get_listing` → `VehicleListing`, `update_listing` → `VehicleListing`, `delete_listing` → `dict`) and one in `app/api/messages.py` (`get_messages` → `List[Message]`) — so those five are filtered through the annotated model whether or not that was intended. The four authentication handlers and both transaction handlers deliberately carry none, returning plain dicts so that the four-key body the SPA expects survives intact. Annotate a return type only when you want that filtering, and check what it removes before you do.
+One subtlety to know before you add a return annotation: **FastAPI infers a `response_model` from one.** Five handlers carry annotations — four in `app/api/listings.py` (`get_listings` → `List[VehicleListing]`, `get_listing` → `VehicleListing`, `update_listing` → `VehicleListing`, `delete_listing` → `dict`) and one in `app/api/messages.py` (`get_messages` → `List[Message]`) — so those five are filtered through the annotated model whether or not that was intended. The other eight carry none, and that means two different things. The four authentication handlers return hand-built dicts, deliberately, so that the four-key body the SPA expects survives intact and `_public_user` remains the only thing deciding which user fields go out. The remaining four — `create_listing`, `create_transaction`, `get_transaction` and `send_message` — return a Pydantic model with no annotation to filter it, so **every field of that model is serialized**, including any the handler set from a Firestore document. That is safe only because none of those models carries a secret; it is not safe by construction. Annotate a return type only when you want the filtering, project explicitly when you want to choose the fields, and never rely on the absence of an annotation to hide anything.
 
 ## 4.6 ADD A SETTING
 
@@ -1559,16 +1525,16 @@ Declare it on `Settings` in `backend/app/core/config.py`. Reading `settings.ANYT
 
 - **Required**: annotate with no default, and accept that every environment must now supply it or fail to boot. Eight settings are in this category.
 - **Optional**: give it a default. `SENTRY_DSN: Optional[str] = None` is the in-file precedent.
-- **Complex-typed** (`List`, `Dict`, nested models): it needs handling in `Config.parse_env_var`, or a plain comma-separated value from an operator raises `SettingsError` at import. See [section 3.4](#34-allowed_origins-takes-two-forms-and-neither-may-crash).
-- **Security-relevant**: give it a `@validator` and refuse a value outside policy, rather than letting the code that reads it discover the problem. Four settings already do this — key length, algorithm allow-list, token-lifetime bounds and the wildcard-origin refusal ([section 1.5.1](#151-every-setting-and-what-actually-reads-it)) — and the test is simple: if a wrong value would be *accepted and then quietly weaken something*, it belongs in a validator. A refusal at import is the one failure an operator cannot miss.
+- **Complex-typed** (`List`, `Dict`, nested models): it needs handling in `Config.parse_env_var`, or a plain comma-separated value from an operator raises `SettingsError` at import. See [section 3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here).
+- **Security-relevant**: give it a `@validator` and refuse a value outside policy, rather than letting the code that reads it discover the problem. **No setting here does this yet** — every one of the ten is checked for its type and nothing else, so a five-character `SECRET_KEY`, a zero or three-day token lifetime, a mistyped `ALGORITHM` and a bare `*` origin all import cleanly and then govern ([section 1.5.1](#151-every-setting-and-what-actually-reads-it), task **NT-39**). The test is simple: if a wrong value would be *accepted and then quietly weaken something*, it belongs in a validator, because a refusal at import is the one failure an operator cannot miss and a weakened deployment is the one they never see.
 
 Then document it in [section 1.5.1](#151-every-setting-and-what-actually-reads-it) — a required variable with no documentation is a boot failure waiting for the next person — and give it a reader in the same change. Two required settings currently have no consumer at all (**NT-8**, **NT-9**), which is a small trap for everyone who follows.
 
-## 4.7 UNIQUENESS AND MONEY: ONE PATTERN IS IN PLACE, ONE IS NOT
+## 4.7 UNIQUENESS AND MONEY: NEITHER PATTERN IS IN PLACE
 
-Firestore has no unique index and no multi-document constraint, and an external payment provider has no rollback. Of the two places that need a pattern for that, **registration now has one and the purchase path still does not** — read the first as the shape to copy, and the second as what to build when it is authorized.
+Firestore has no unique index and no multi-document constraint, and an external payment provider has no rollback. Two places in this codebase need a pattern for that — registration and the purchase path — and **neither has one today**. Both are written down here as the shape to build, because both are a task rather than a precedent: **NT-40** for uniqueness, **NT-27** and **NT-28** for the money.
 
-**A marker document is how you get uniqueness, and registration uses one.** A query cannot enforce it: two requests can both find nothing and both write. Derive a document id from the value that must be unique and claim it with a *conditional* write. `create()` fails if the document exists, which makes the claim atomic on its own — no transaction required:
+**A marker document is how you get uniqueness, and nothing here uses one yet.** A query cannot enforce it: two requests can both find nothing and both write, which is exactly what registration does today ([section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced)). Derive a document id from the value that must be unique and claim it with a *conditional* write. `create()` fails if the document exists, which makes the claim atomic on its own — no transaction required:
 
 ```python
 marker_ref = db.collection('user_emails').document(
@@ -1585,7 +1551,7 @@ except Exception:
     raise
 ```
 
-A digest rather than the raw value, because a Firestore id may not contain `/` and may not be `.` or `..` — and because a digest keeps the address itself out of an id that other things may read. **The compensating delete is not optional**: without it, a failed account write leaves an address nobody can ever register, with nothing behind it to explain why.
+A digest rather than the raw value, because a Firestore id may not contain `/` and may not be `.` or `..` — and because a digest keeps the address itself out of an id that other things may read. **The compensating delete is not optional**: without it, a failed account write leaves an address nobody can ever register, with nothing behind it to explain why. Two further things the sketch assumes and a real change must supply: the address has to be canonicalised *before* it is hashed (**NT-24**), or two spellings claim two markers and the constraint buys nothing; and a new collection is a resource no existing IAM policy or security rule grants, so the grant has to ship with the code or every registration answers 500 instead of 201.
 
 If you need more than one document to appear together — a record and its marker, say — reach for a transaction instead, reading inside it so contention is detected:
 
@@ -1602,13 +1568,13 @@ def _commit(txn):
 _commit(transaction)
 ```
 
-**Reserve before you call an external service, and compensate if it fails — this half does not exist yet.** The purchase path refuses a payment intent it has already recorded, which stops a *retry* from paying twice, but two genuinely simultaneous buyers carry two different intents and nothing stops both from being charged. What is missing is a reservation: claim the thing being bought — move the vehicle to a `pending_payment` status and record the attempt — inside one transaction, *then* charge, then either release on a decline or settle on success (**HCF-14**, **NT-27**, **NT-28**).
+**Reserve before you call an external service, and compensate if it fails — this half does not exist either.** The purchase path reads the vehicle, charges, then writes: nothing records the attempt first, so a client that retries a request whose answer it never saw is charged again, and two simultaneous buyers for one vehicle are both charged before either write lands ([section 2.9](#29-the-purchase-path)). What is missing is a reservation: claim the thing being bought — move the vehicle to a `pending_payment` status and record the attempt, keyed by the payment credential — inside one transaction, *then* charge, then either release on a decline or settle on success (**NT-27**, **NT-28**).
 
 Three rules that come from getting this wrong:
 
-- **Translate datastore errors, never let them surface.** Contention aborts a transaction without saying why: `google.api_core.exceptions.AlreadyExists` means someone else won, and a bare `GoogleAPICallError` means "unknown — re-read and decide". Catch both and answer 409 or 503; an uncaught abort is a 500 for what is really a race you already handle.
-- **Do everything that can fail before the write that cannot be undone.** Registration follows this: it builds the `User` and mints the token *before* it claims the marker and writes the account, so a validation or signing failure cannot leave an account whose owner was never told it exists — and whose retry would answer 409.
-- **Make a retry safe.** Look for the work already recorded — by payment credential, by marker, by whatever identifies the operation — and answer with that result, or a 409, instead of repeating the side effect. The transaction path does this by `stripe_payment_intent_id`; do the same for anything that moves money or sends a message.
+- **Translate datastore errors, never let them surface.** Contention aborts a transaction without saying why: `google.api_core.exceptions.AlreadyExists` means someone else won, and a bare `GoogleAPICallError` means "unknown — re-read and decide". Catch both and answer 409 or 503; an uncaught abort is a 500 for what is really a race you already handle. This is not hypothetical bookkeeping — it is the same route by which a missing IAM grant on a new collection arrives, as `PermissionDenied`.
+- **Do everything that can fail before the write that cannot be undone.** Registration already gets the ordering right for the wrong reason: it builds the `User` and mints the token before it writes the account, so a validation or signing failure cannot leave an account whose owner was never told it exists. Keep that ordering when you add the marker — claim, then write, then answer — and keep the release path on every failure after the claim.
+- **Make a retry safe.** Look for the work already recorded — by payment credential, by marker, by whatever identifies the operation — and answer with that result, or a 409, instead of repeating the side effect. **Nothing in this repository does this yet**: neither the purchase path nor the message send is idempotent, so both duplicate their side effect on a retry. Build it into anything new that moves money or sends a message, rather than adding it afterwards.
 
 # 5. SUGGESTED NEXT TASKS
 
@@ -1616,7 +1582,7 @@ Everything below was found while making this backend importable and giving authe
 
 Two groups. **HCF** entries need a *decision* — a human has to choose between defensible options, and picking one unilaterally would be the wrong kind of initiative. **NT** entries need *work*, and most are self-contained enough to be a good first contribution.
 
-**Read HCF-11 through HCF-16 before you deploy anything.** Six entries about holding up against an uncooperative caller: **four are now implemented** and their rows say so, and the two that remain — HCF-14 and HCF-16, both on the purchase path — are the reason this API should not take real money yet. [Section 5.3](#53-where-to-start) orders everything by exposure.
+**The HCF register below is closed at ten entries**, and it is closed deliberately: it is the register the Agent Action Plan carried to a human, and this guide is not entitled to add to it. Everything else found since — including six questions about how this API holds up against an uncooperative caller — is filed in [section 5.2](#52-work-worth-picking-up) as work, not as a decision someone else has already taken. **Read NT-24 through NT-28, NT-39, NT-40 and NT-41 before you deploy anything**; they are why this API should not take real money or meet an untrusted caller yet, and [section 5.3](#53-where-to-start) orders everything by exposure.
 
 ## 5.1 DECISIONS AWAITING CONFIRMATION
 
@@ -1625,24 +1591,13 @@ Two groups. **HCF** entries need a *decision* — a human has to choose between 
 | **HCF-1** | Should `Transaction` gain `payment_method`, `currency`, or a `vehicle_id` distinct from `vehicle_listing_id`? Explicit fields would enable genuine multi-currency and multi-instrument payments. | The **caller** was corrected instead of the schema: it now uses the existing `vehicle_listing_id` and passes `stripe_payment_intent_id` as the payment token, with currency pinned to `'usd'`. `backend/app/schema/transaction.py` is untouched. Related, and part of the same decision: `stripe_payment_intent_id` names a **PaymentIntent**, while `process_payment` passes its `token` argument to a legacy **Charge** creation — a generation mismatch that a currency or payment-method field would not fix on its own. |
 | **HCF-2** | Should the three startup initializers be reinstated as real functions? | Removed, with the rationale recorded in the code. The Firestore and Vision clients are already built at import and the document processor needs no client, so there was nothing left to initialize; the awaits were removed rather than stubbed. Confirm that no lazy construction or startup health check is wanted. See [section 3.11](#311-clients-are-built-at-import-not-at-startup). |
 | **HCF-3** | `backend/app/services/payment.py` line 1 does `from stripe import Stripe`, which the installed SDK cannot satisfy — it exposes `StripeClient`. | Flagged, not fixed: authorization is needed to touch `app/services/payment.py`. **This is why an unstubbed boot cannot be the acceptance gate** for backend work. The highest-value task here. |
-| **HCF-4** | `backend/app/services/ai_vision.py` lines 20 and 44 call `client.image(...)`, which the installed Cloud Vision SDK does not provide, so real photo analysis fails. | Flagged; it sits inside logic that is out of scope. The calling loop is guarded, so a failure is logged with a correlation id and degrades the analysis instead of failing the request. |
-| **HCF-5** | `VehicleListing.photos` holds URL **strings** while `analyze_vehicle_photo` declares **bytes**, so a fetch step is needed before analysis can produce meaningful labels. | The corrected call is type-correct and guarded — each entry is encoded to bytes — but no fetch was added, because that would be a behavioural expansion. Do not expect `app/db/cloud_storage.py` to supply the missing half: it exposes `upload_file`, `delete_file` and `get_file_url`, and `get_file_url` returns a URL string, so there is **no download or read-bytes path anywhere in the codebase**. Whoever takes this on has to write one, and **a fetch of a caller-supplied URL is a server-side request forgery primitive unless it is written as a hardened fetch from the start** — a timeout alone is nowhere near enough. The minimum: allow only `http`/`https` and reject every other scheme; resolve the host and check the resolved IP against a deny-list of private, loopback, link-local, multicast and reserved ranges **and** the cloud metadata endpoint (`169.254.169.254`, and `metadata.google.internal` here), re-checking after every redirect rather than only before the first request, because DNS can change between the check and the connection; cap redirects at a small number and revalidate each hop; require a response `Content-Type` in an image allow-list and cap the body in bytes *while streaming*, not after; set a connect and a read timeout; and never forward the response body or error text back to the caller, since that is how an internal service's reply becomes readable. Decide too whether photos should be uploaded through `cloud_storage.py` in the first place — an upload path the client uses is a smaller attack surface than a fetch path an attacker names. Settle **HCF-13** in the same change: real image bytes make an unbounded photo list far more expensive than URL strings do. |
+| **HCF-4** | `backend/app/services/ai_vision.py` lines 20 and 44 call `client.image(...)`, which the installed Cloud Vision SDK does not provide, so real photo analysis fails. | Flagged; it sits inside logic that is out of scope. Worth knowing which failure you will actually see: **line 14's `Image.open` raises first** for anything that is not real image bytes, and today's payloads are URL strings, so **HCF-5** is what fires and this defect sits unreached behind it. Either way the calling loop is guarded, so the failure is logged with a traceback and degrades the analysis instead of failing the request. |
+| **HCF-5** | `VehicleListing.photos` holds URL **strings** while `analyze_vehicle_photo` declares **bytes**, so a fetch step is needed before analysis can produce meaningful labels. | The corrected call is type-correct and guarded — each entry is encoded to bytes — but no fetch was added, because that would be a behavioural expansion. Do not expect `app/db/cloud_storage.py` to supply the missing half: it exposes `upload_file`, `delete_file` and `get_file_url`, and `get_file_url` returns a URL string, so there is **no download or read-bytes path anywhere in the codebase**. Whoever takes this on has to write one, and **a fetch of a caller-supplied URL is a server-side request forgery primitive unless it is written as a hardened fetch from the start** — a timeout alone is nowhere near enough. The minimum: allow only `http`/`https` and reject every other scheme; resolve the host and check the resolved IP against a deny-list of private, loopback, link-local, multicast and reserved ranges **and** the cloud metadata endpoint (`169.254.169.254`, and `metadata.google.internal` here), re-checking after every redirect rather than only before the first request, because DNS can change between the check and the connection; cap redirects at a small number and revalidate each hop; require a response `Content-Type` in an image allow-list and cap the body in bytes *while streaming*, not after; set a connect and a read timeout; and never forward the response body or error text back to the caller, since that is how an internal service's reply becomes readable. Decide too whether photos should be uploaded through `cloud_storage.py` in the first place — an upload path the client uses is a smaller attack surface than a fetch path an attacker names. Settle **NT-25** in the same change: real image bytes make an unbounded photo list far more expensive than URL strings do. |
 | **HCF-6** | Served paths are `/api/listings/listings` and siblings, not the documented `/api/listings`. | Paths and prefixes left exactly as they are, per the contract freeze. Both the specification and the SPA use the single-segment form, so fixing this is a coordinated breaking change. See [section 3.9](#39-the-doubled-path-segments-are-deliberate). |
-| **HCF-7** | Nothing **creates or populates** a `'vehicles'` document. `app/api/transactions.py` reads one to check availability and updates it to `status = 'sold'`, so the collection is written — but only ever updated, never created, and by no other module. | Flagged; explicitly out of scope. Consequence today: transaction creation cannot succeed against data this system produced, because no vehicle document with `status == 'available'` ever comes into existence. You have to write a `vehicles/{id}` document by hand to exercise the endpoint at all ([section 2.9](#29-the-purchase-path)). Deciding whether `listings` and `vehicles` are one collection or two is the data-model decision behind **HCF-1**; the obvious resolution is for listing creation to write it, and whatever does so should also carry the `price` and `seller_id` that **HCF-16** needs in order to settle a purchase’s terms from the record. |
+| **HCF-7** | Nothing **creates or populates** a `'vehicles'` document. `app/api/transactions.py` reads one to check availability and updates it to `status = 'sold'`, so the collection is written — but only ever updated, never created, and by no other module. | Flagged; explicitly out of scope. Consequence today: transaction creation cannot succeed against data this system produced, because no vehicle document with `status == 'available'` ever comes into existence. You have to write a `vehicles/{id}` document by hand to exercise the endpoint at all ([section 2.9](#29-the-purchase-path)). Deciding whether `listings` and `vehicles` are one collection or two is the data-model decision behind **HCF-1**; the obvious resolution is for listing creation to write it, and whatever does so should also carry the `price` and `seller_id` that **NT-41** needs in order to settle a purchase’s terms from the record. |
 | **HCF-8** | `backend/app/api/messages.py` writes a non-serializable Firestore `SERVER_TIMESTAMP` sentinel into its own response (line 38), and lines 54 and 56 hydrate with `Message(**msg.to_dict(), id=msg.id)` against a document that already carries an `id` key, raising a duplicate-keyword `TypeError` once any message exists. | Creating the missing schema restored **importability and reachability only** — **both message endpoints remain non-functional.** Post-fix state: 13 routes registered (read statically off disk), of which 11 behaved as documented — in process against a double, and over HTTP under the local development profile of [section 1.7.1](#171-the-local-development-profile); an unmodified checkout still serves none of them (**HCF-3**). A schema change cannot fix this; the route logic has to change. See [section 3.10](#310-messaging-is-reachable-but-not-functional). |
 | **HCF-9** | Swagger's "Authorize" password flow cannot complete, because login consumes JSON rather than form data. | The frozen client contract governs; a separate form-encoded token route would be a tenth endpoint and exceed scope. Obtain a token from `POST /api/auth/login` and paste it as a bearer header. |
 | **HCF-10** | Logout is stateless — no revocation mechanism exists anywhere. | Flagged and documented as a limitation, never presented as revocation. Any real solution needs a token store or a denylist, plus a `jti` claim to key it on. See [section 2.5.1](#251-logout-is-stateless). |
-
-The six entries below are the ones that decide whether this API holds up against an uncooperative caller. **Four have since been implemented** — a dedicated security review found them, and each row now records what was built rather than what was proposed. **Two remain open, both on the purchase path**, and they are the reason this service should not take real money yet. Read all six before this API meets an untrusted caller.
-
-| ID | Item | Interim position taken |
-| --- | --- | --- |
-| **HCF-11** | Should `POST /api/auth/register` restrict `role`? | **Implemented.** `role` is trimmed, lower-cased and checked against `('buyer', 'seller')`; anything else — `admin` included — answers **422** and the attempt is logged. Nothing that follows from that decision is outstanding except the other half of the problem: **NT-14**, an authenticated and audited way to grant the role deliberately, since there is now no way to obtain it through the API at all. See [section 2.2](#22-roles-and-who-may-do-what). |
-| **HCF-12** | Should the credential fields be validated and email uniqueness made atomic? | **Implemented.** The address is normalised (trim, lower-case, syntax check, 254-character ceiling); a name must be non-blank and at most 100 characters; a password must be at least 8 characters and at most 72 **bytes**, because bcrypt hashes only the first 72 and passlib truncates the rest silently. Uniqueness is atomic through a `user_emails/{sha256(email)}` marker claimed with a conditional `create()` and released if the account write fails, so four simultaneous registrations for one address yield exactly one account — verified against a Firestore emulator, since a double cannot show it. Sign-in timing was equalised in the same change: the unknown-address path spends one deliberate bcrypt verification so it cannot be told apart from a wrong password. One thing deliberately **not** done: nothing proves the address belongs to the registrant (**NT-36**). See [section 3.12](#312-one-address-is-one-account-and-how-that-is-enforced) and [section 4.7](#47-uniqueness-and-money-one-pattern-is-in-place-one-is-not). |
-| **HCF-13** | Should the photo list be bounded? | **Implemented.** More than 12 photos, an entry over 256 KiB, an aggregate over 900 KiB, or a blank entry each answer **422** — measured on the encoded payload and enforced **before the first outbound call**, so a rejected request pays for no provider work. `Message.content` was bounded in the same change (non-blank, 4000 characters, 16 KiB encoded). Two things this did not do: it did not bound *how many* listings or messages an account may create (**NT-25**), and the ceilings are sized for URL strings — **recheck them alongside HCF-5**, since real image bytes change what 256 KiB means. |
-| **HCF-14** | Should the purchase path be made concurrency-safe and idempotent? | **Half done, and the open half is the dangerous one.** A repeat is now refused: before charging, the handler looks for a transaction already recording the same `stripe_payment_intent_id` and answers **409** with no provider call, which covers the common case of a client retrying a request whose answer it never saw. **Still unguarded:** two genuinely simultaneous buyers carry two different intents, so both can read `'available'` and both be charged; the transaction write and the `'sold'` update are still two separate writes, so a crash between them leaves a charged card with no transaction or an unsold vehicle; and the provider call still carries no idempotency key. What is needed is a reservation — the vehicle into a `pending_payment` status with an attempt record, in one Firestore transaction, released on a decline — plus **NT-27** and **NT-28**, in one change. See [section 2.9](#29-the-purchase-path) and [section 4.7](#47-uniqueness-and-money-one-pattern-is-in-place-one-is-not). |
-| **HCF-15** | Should the public authentication routes be throttled? | **Implemented.** Fixed one-minute windows per client peer address and per account — 10 sign-ins, 5 registrations — answering **429** with `Retry-After` and one message whether or not the account exists, clearing the counters after a successful sign-in, logging the bucket that filled but never the address, pruning windows that can no longer be consulted, and ignoring `X-Forwarded-For` deliberately (nothing here terminates TLS or strips it, so honouring it would let a caller reset its own counter). The counters are **per process**, so a deployment with several workers multiplies the ceiling — that half is **NT-26**, and it is a real limitation rather than a footnote. |
-| **HCF-16** | Should a purchase's amount and seller be settled from the vehicle record rather than the request? | **Implemented as far as the data allows, which today is not far enough.** Where the vehicle document carries a `price`, the request's amount must match it to within half a cent; where it carries a `seller_id`, the request's must match exactly; either disagreement is a **400** raised before the charge. But **nothing creates or populates a vehicle document** (**HCF-7**), so on data this system produced there is no price and no seller to compare against, and the handler logs that it is proceeding on the request's own terms. The check is therefore a guard that becomes real the moment HCF-7 is settled — **whatever starts writing `vehicles/{id}` must write `price` and `seller_id`**, and until then a caller can still name its own price on a hand-written record that omits them. Making the record mandatory (a **409** when it cannot supply the terms) is the remaining decision, and it belongs with HCF-7. |
 
 ## 5.2 WORK WORTH PICKING UP
 
@@ -1661,7 +1616,7 @@ The six entries below are the ones that decide whether this API holds up against
 | **NT-11** | Narrow the CORS policy | `allow_methods` and `allow_headers` are both `['*']` with `allow_credentials=True`. Only the missing *setting* was a defect; narrowing the policy is a security improvement that was not authorized here. |
 | **NT-12** | Migrate to timezone-aware datetimes | `datetime.utcnow()` is the codebase's convention and is non-deprecated on the 3.9 floor, but 3.12 warns and a future release removes it. This has to be done consistently across token issuance, expiry and every stored timestamp — coordinated, not incidental. |
 | **NT-13** | Declare `response_model` on the routes — and strip raw maintenance content while you are there | No route declares one today, which is why hand-written projection is the only thing keeping password hashes out of responses ([section 4.5](#45-projection-discipline-there-is-no-response_model)). It is also why a second, larger disclosure is still open: `create_listing` keeps whatever `maintenance_records[*].content` a seller sends, writes it into the listing document beside the derived `maintenance_data`, and **both listing reads are unauthenticated**, so a receipt or service invoice — names, addresses, phone numbers, a VIN — becomes world-readable. Do both halves in one change: store the raw content privately, or not at all, and return only approved derived metadata through an explicit response model. Until then, treat the maintenance fields as public and send only what you would publish. |
-| **NT-14** | Add a privileged administrator-elevation workflow | There is no deliberate way to create an administrator: no endpoint grants the role and nothing audits a grant. What is missing in code is an authenticated, administrator-only path that grants the role and writes its own audit record — and, since a role change takes effect on the very next request ([section 2.5](#25-authentication-and-tokens)), a corresponding path to revoke it. Until then the intended procedure is a direct Firestore write, which is **unauthenticated, unauthorized and unrecorded by the application**; [section 2.2](#22-roles-and-who-may-do-what) sets out the operator-channel, approval and audit-logging controls that have to compensate. Its stated prerequisite is met: **NT-24** is done, so registration now refuses `admin` and an elevation path would no longer be guarding a door that is already open. It was not added here because the change set is fixed at four authentication routes; a fifth would need authorization. |
+| **NT-14** | Add a privileged administrator-elevation workflow | There is no deliberate way to create an administrator: no endpoint grants the role and nothing audits a grant. What is missing in code is an authenticated, administrator-only path that grants the role and writes its own audit record — and, since a role change takes effect on the very next request ([section 2.5](#25-authentication-and-tokens)), a corresponding path to revoke it. Until then the intended procedure is a direct Firestore write, which is **unauthenticated, unauthorized and unrecorded by the application**; [section 2.2](#22-roles-and-who-may-do-what) sets out the operator-channel, approval and audit-logging controls that have to compensate. **Do it with NT-24, not before it**: registration currently stores whatever `role` a caller sends, `admin` included, so an elevation endpoint would be guarding a door that is already open. It was not added here because the change set is fixed at four authentication routes; a fifth would need authorization. |
 | **NT-15** | Fix the frontend's identity and its entry point | Several independent pre-existing gaps, none of which is the client-to-API seam — **NT-30** and **NT-31** own that. `frontend/package.json` is named `task-management-frontend` and described as a task-management app; `frontend/public/index.html` is titled "Personal Finance Tracker"; the SPA serves nothing to render, because Vite resolves its entry `index.html` from the project root while the file sits in `public/` and there is no `vite.config.ts` to point it elsewhere; the compose backend is published on port 5000 rather than 8000; and the compose stack runs a `postgres:13` service with a `DATABASE_URL`, contradicting the Firestore implementation entirely. The `@/…` import prefix that the pages and components use is mapped nowhere either, and eight of its targets — including `components/PhotoGallery`, `components/ProfileForm` and `services/document_processing` — are files that do not exist. |
 | **NT-16** | Get continuous integration green | [`.github/workflows/backend_ci.yml`](../.github/workflows/backend_ci.yml) has four defects you can prove from this clone and one dependency you cannot: it installs from a `requirements.txt` that does not exist (**NT-1**), runs a non-collectable test suite (**NT-5**), builds a Docker image with no Dockerfile (**NT-3**), and **pins Python 3.9, on which the verified dependency set cannot be installed at all** — five of the cloud and media packages declare `Requires-Python >= 3.10`, so that runner would silently resolve older versions than anyone tested ([section 1.2](#12-prerequisites)). Moving the runner and keeping the 3.9 *source* rule, or moving both together, is a decision to take explicitly rather than by dropping whichever is inconvenient. It also references four repository secrets — `GCP_PROJECT_ID`, `GCP_SA_KEY`, `GKE_CLUSTER_NAME` and `GKE_ZONE` — and whether those are configured is **not observable from a local checkout**; confirm it in the repository settings rather than assuming either way. Its `flake8 .` step lints the whole tree with default rules, not the F-code selection this project actually uses, so it would report a different set of findings from [section 1.9](#19-verify-your-checkout). |
 | **NT-17** | Adopt a component library or design system | None is in use. Tailwind CSS is declared in `frontend/package.json` but is not wired up — there is no `tailwind.config.js`, no `postcss.config.js`, and **not one `.css` file in the repository**. Adopting one is a separate deliverable, not a side effect of backend work. |
@@ -1669,24 +1624,26 @@ The six entries below are the ones that decide whether this API holds up against
 | **NT-19** | Add `CONTRIBUTING.md` | No such file exists, and [`README.md`](../README.md) points at this guide in its place. A short document covering branch naming, the commit style already visible in the log, and the two gates in [section 1.9](#19-verify-your-checkout) would be enough. |
 | **NT-20** | Page and order the collection queries | Every list query in this codebase streams a whole collection with no `limit`, no `order_by` and no cursor, so response time and memory grow with the data: `app/api/listings.py`'s `get_listings` streams all `listings` matching its filters (and applies none of them when a filter is zero-like, a truthiness quirk worth fixing in the same pass); `app/api/messages.py` runs **two** unbounded streams and then sorts the combined result **in memory**; `app/db/firestore.py`'s `query_documents` helper streams whatever it is given; and `app/tasks/background_jobs.py` scans `listings` and `transactions` by status. Add `limit`/`start_after` paging and explicit `order_by`, and return a page cursor rather than a bare list. Firestore also needs a composite index for any ordered multi-filter query, so this task includes declaring those indexes. |
 | **NT-21** | Batch the per-document writes in the task module | `app/tasks/background_jobs.py` issues **one `update()` per result** — `update_listing_status` writes once per expired listing, `process_scheduled_refunds` once per refunded transaction, and both re-resolve the document reference they already hold. That is an N+1 write pattern against a per-second write budget. Use `db.batch()` (or `bulk_writer()`), reuse the reference from the streamed snapshot, and chunk at Firestore's 500-write batch limit. **NT-6** must land first — the module cannot import today. |
-| **NT-22** | Move the remaining blocking handlers off the event loop, and give the providers deadlines | Six handlers are now plain `def` and get Starlette's threadpool: the four authentication routes plus `create_listing` and `create_transaction`, which were the two worst — Cloud Vision once per photo, PyPDF2 once per record, and a network round trip to Stripe. **Seven are still `async def` bodies doing synchronous I/O directly on the event loop**: `get_listings`, `get_listing`, `update_listing`, `delete_listing`, `get_transaction` and both message routes. One slow read there still delays every other in-flight request. Converting them is mechanical — delete the `async` keyword, since none of them awaits anything — but it changes handler signatures that are frozen for the current work. Do it together with **NT-20**, whose paging changes the same lines. Two things to carry from the conversions already done: `fastapi.concurrency.run_in_threadpool` is the alternative where a signature must stay `async`, and a `SIGALRM`-based timeout stops working off the main thread ([section 4.1](#41-add-a-router)) — which is why `analyze_vehicle_photo` and `process_payment` need real deadline parameters when their signatures are opened, rather than a signal-based guard. |
-| **NT-23** | Loosen the write-path schemas **and make the handlers the writers**, in one change | `VehicleListing` (`backend/app/schema/listing.py`) and `Transaction` (`backend/app/schema/transaction.py`) declare every field required, including `id`, `seller_id`/`buyer_id`, `status`, `created_at` and `updated_at`, so a caller has to invent placeholder values purely to pass body validation and any client written the obvious way gets a 422 listing five fields it should never have had to send. **The schema half on its own is not the fix, because the server does not currently write most of those fields:** `create_listing` overwrites only `seller_id`, and `create_transaction` only `id` and `status` — everything else a caller sends is what gets stored, and `buyer_id` is *compared* with the caller rather than assigned, so optionalising it alone would turn every valid purchase into a 403 against `None`. Do both halves together: give each field `Optional[...] = None` as `Message` does ([section 4.3](#43-add-a-schema)), and in the same change derive `buyer_id` from `current_user`, the seller and the amount from the vehicle record (**HCF-16**), `status` and both timestamps server-side, and persist the generated document id rather than the caller's `id`. Anything less admits incomplete documents and a response hydration that fails on the fields nobody filled in. It was not done here because both schema files and both handler bodies are frozen for the current work — and because it changes what an existing client may send, it wants the same coordination as **HCF-6**. |
-| **NT-24** | ~~Validate and bound the registration body~~ — **done**; kept for the reasoning, because the same reasoning applies to the next unauthenticated body anyone adds | `POST /api/auth/register` is the only unauthenticated write in this API, and it used to validate nothing beyond field presence. What it enforces now is listed in [section 2.2.1](#221-what-registration-accepts); this entry records *why* each part of it is there. **(a) `role` was stored verbatim, `admin` included.** The role is read back on every request by `get_current_user` and trusted by `delete_listing`, so any anonymous caller could register itself as an administrator and delete any seller's listing — the reason the field is now constrained to an allow-list of the roles a caller may give itself, `buyer` and `seller`, with `admin` refused and the attempt logged. The case is normalised in the same validator because every authorization check compares the stored string exactly, so `Seller` would otherwise be stored as written and then fail the seller gate. **(b) No field carried a bound.** `email` is trimmed, shape-checked and capped at 254 characters, the longest address SMTP carries — hand-rolled, because pydantic's `EmailStr` needs `email-validator`, which is not installed and is blocked by the same no-new-dependency scope as **NT-1**. The password has a minimum length and a hard **72-byte UTF-8 ceiling**: bcrypt hashes only the first 72 bytes and `passlib` discards the rest silently, so a longer password would promise strength it does not have and two sharing a 72-byte prefix would be interchangeable — refusing it is the honest answer where truncating quietly is the one option to avoid. The names are trimmed, rejected when whitespace-only, and capped. All of it lives in `@validator`s on `RegisterRequest` rather than in the handler, so a bad body is a 422 before the duplicate lookup, before bcrypt and before Firestore ([section 4.3](#43-add-a-schema)), and each validator returns the normalised value — which is also what closes the ` a@b.com ` / `a@b.com` duplicate-account gap, since the pre-write duplicate check and the uniqueness marker now see the same trimmed address that gets stored. `LoginRequest` is deliberately left with canonicalisation only and no shape check, so a sign-in attempt can never be answered 422 in a way that distinguishes it from a rejected credential ([section 2.5](#25-authentication-and-tokens)). What is **not** done, and is tracked separately: proving the address belongs to the person registering it (**NT-31**). |
-| **NT-25** | Bound *quantity*, not just size — the per-request bounds are done | The three per-request gaps this entry used to list are closed: the photo list is capped in count, per-entry bytes and aggregate bytes before the first provider call, and `Message.content` is bounded and required to be non-blank by its model ([section 2.8](#28-what-the-write-endpoints-bound)). What remains is the other axis. **(a) Nothing limits how much an account may create.** One registered seller may write unlimited listings, one account unlimited messages — each individually valid, all of them permanent, and every one of them enlarging an unpaginated list response. A per-account daily quota, or a cost-based limit, is the missing control, and it pairs with **NT-20**: an unbounded collection is only expensive because nothing pages it. **(b) The registration throttle is per process** (**NT-26**), so creation volume is bounded per worker rather than globally. **(c) Recheck the photo ceilings once HCF-5 lands** — a 256 KiB per-entry cap sized for a URL string is the wrong cap once photos are real image bytes. |
-| **NT-26** | Give the attempt counters somewhere shared to live | The throttle itself exists (**HCF-15**), and its counters are module state in one worker process. That means the effective ceiling is *N* times the configured one for *N* workers, and a restart forgets every window — so it raises the cost of credential stuffing without bounding it. Move the counters to a shared store (Redis, Memorystore, Firestore with a TTL) or push the policy to a gateway. **Note the constraint before you start:** no dependency may be added to this project without authorization, so a Redis-backed implementation needs that decision first — which is part of why the in-process version shipped rather than nothing. Whatever replaces it should keep the properties the current one has: one message whether or not the account exists, a `Retry-After` header, counters cleared on a successful sign-in, and the bucket logged rather than the address. |
-| **NT-27** | Give the payment call an idempotency key | `process_payment` sends none, so nothing at the provider prevents a double charge and nothing application-side does either today (**HCF-14**). A provider-level key makes the guarantee end-to-end, but it means editing `app/services/payment.py`, which is frozen pending **HCF-3**. Do all three in one change. |
-| **NT-28** | Finalise a purchase in one transaction, and reconcile | The transaction document and the vehicle’s `'sold'` update are two separate writes, so a crash between them leaves a charged card with no matching transaction, or a sale with an unsold vehicle. Move both into one Firestore transaction, and add a job that sweeps charges with no transaction: settle them, or refund through `create_refund` and release the vehicle. Part of the same work as **HCF-14**. |
-| **NT-29** | Decide what the logs should feed | [Section 1.11](#111-where-the-logs-go) configures the `app` namespace at `INFO` with a plain text formatter, which is right for a terminal and wrong for a log aggregator. If this system gets one, swap the formatter for JSON and give each request an id at middleware level rather than per handler, so that every line of a request — not only listing creation’s — carries the same identifier. |
+| **NT-22** | Move the blocking handlers off the event loop, and give the providers deadlines | **Nine of the thirteen handlers are `async def` bodies doing synchronous I/O directly on the event loop**, so one slow read or one slow provider call delays every other in-flight request: `create_listing` (Cloud Vision once per photo, PyPDF2 once per maintenance record), `create_transaction` (a network round trip to Stripe), `get_listings`, `get_listing`, `update_listing`, `delete_listing`, `get_transaction` and both message routes. Only the four authentication routes are plain `def` and get Starlette's threadpool. Converting the rest is mechanical — delete the `async` keyword, since none of them awaits anything — but it changes handler signatures that are frozen for the current work, which is why it was not done here. Do it together with **NT-20**, whose paging changes the same lines. Three things to carry into it: `fastapi.concurrency.run_in_threadpool` is the alternative where a signature must stay `async`; a `SIGALRM`-based timeout stops working off the main thread, so converting `create_listing` silently drops the PDF wall-clock ceiling it has today ([section 4.1](#41-add-a-router)); and neither `analyze_vehicle_photo` nor `process_payment` accepts a deadline, so both need real timeout parameters when their signatures are opened rather than a signal-based guard. |
+| **NT-23** | Loosen the write-path schemas **and make the handlers the writers**, in one change | `VehicleListing` (`backend/app/schema/listing.py`) and `Transaction` (`backend/app/schema/transaction.py`) declare every field required, including `id`, `seller_id`/`buyer_id`, `status`, `created_at` and `updated_at`, so a caller has to invent placeholder values purely to pass body validation and any client written the obvious way gets a 422 listing five fields it should never have had to send. **The schema half on its own is not the fix, because the server does not currently write most of those fields:** `create_listing` overwrites only `seller_id`, and `create_transaction` only `id` and `status` — everything else a caller sends is what gets stored, and `buyer_id` is *compared* with the caller rather than assigned, so optionalising it alone would turn every valid purchase into a 403 against `None`. Do both halves together: give each field `Optional[...] = None` as `Message` does ([section 4.3](#43-add-a-schema)), and in the same change derive `buyer_id` from `current_user`, the seller and the amount from the vehicle record (**NT-41**), `status` and both timestamps server-side, and persist the generated document id rather than the caller's `id`. Anything less admits incomplete documents and a response hydration that fails on the fields nobody filled in. It was not done here because both schema files and both handler bodies are frozen for the current work — and because it changes what an existing client may send, it wants the same coordination as **HCF-6**. |
+| **NT-24** | Validate and bound the registration body | `POST /api/auth/register` is the only unauthenticated write in this API, and it validates **nothing** beyond field presence and type — no `@validator` exists anywhere in `backend/app/` ([section 2.2.1](#221-what-registration-accepts)). Four consequences, in order of severity. **(a) `role` is stored verbatim, `admin` included.** The role is read back on every request by `get_current_user` and trusted by `delete_listing`, so any anonymous caller can register itself as an administrator and delete any seller's listing. Constrain it to the roles a caller may give itself — `buyer` and `seller` — refuse anything else with a 422, log the attempt, and add **NT-14** so the role can still be granted deliberately. **(b) The address is not canonicalised**, so ` A@b.com ` and `a@b.com` are two accounts and signing in with a spelling other than the one registered answers 401. Trim and lower-case it in the validator, because every authorization check and the duplicate query compare the stored string exactly — and note that this is the prerequisite for **NT-40**. **(c) No field carries a bound.** Cap the address at 254 characters, the longest SMTP carries, and shape-check it by hand: pydantic's `EmailStr` needs `email-validator`, which is not installed and is blocked by the same no-new-dependency scope as **NT-1**. Trim the names, reject whitespace-only, cap them. **(d) A password over 72 bytes is silently truncated.** bcrypt hashes only the first 72 bytes and `passlib` discards the rest without a word, so a longer password promises strength it does not have and two sharing a 72-byte prefix are interchangeable — impose a minimum length and a hard **72-byte UTF-8 ceiling**, because refusing is the honest answer where truncating quietly is the one option to avoid. Put all of it in `@validator`s on `RegisterRequest` rather than in the handler, so a bad body is a 422 before the duplicate lookup, before bcrypt and before Firestore ([section 4.3](#43-add-a-schema)), and return the normalised value so the handler has one thing to trust. **Leave `LoginRequest` with canonicalisation only and no shape check**, or a sign-in attempt becomes answerable 422 in a way that distinguishes it from a rejected credential ([section 2.5](#25-authentication-and-tokens)). Ownership of the address is a separate task (**NT-36**). |
+| **NT-25** | Bound the write bodies, and then bound how many of them one account may send | Two axes, and **neither is bounded today**. **(a) Per request.** `VehicleListing.photos` is an unbounded `List[str]`, so a caller decides how many outbound Cloud Vision calls one request makes — thirteen photos is thirteen provider calls, and a blank entry is accepted and analysed ([section 2.8](#28-what-the-write-endpoints-bound)). `Message.content` is an unbounded `str` written straight into a Firestore document that may not exceed 1 MiB. Add a count ceiling, a per-entry byte ceiling and an aggregate byte ceiling for photos, and a non-blank check with a byte ceiling for the message body — measured on the **UTF-8 encoding**, and enforced **before the first outbound call**, so a rejected request pays for no provider work. The maintenance guards in `app/api/listings.py` show the shape and also show the trap: they sit *after* the input has been decoded, so they stop the write but not the work. One caution for the message body: `app/api/messages.py` rebuilds `Message` from stored documents on the read path, so a validator there also runs against everything already written and has to tolerate it. **(b) Per account.** One registered seller may write unlimited listings, one account unlimited messages — each individually valid, all permanent, every one enlarging an unpaginated list response. A per-account daily quota or a cost-based limit is the missing control, and it pairs with **NT-20**. **(c) Size the photo ceilings against HCF-5** — a cap chosen for URL strings is the wrong cap once photos are real image bytes. |
+| **NT-26** | Throttle the public authentication routes | `POST /api/auth/login` and `POST /api/auth/register` accept **as many attempts as a caller cares to send**. Nothing counts, nothing delays and nothing answers 429, so credential stuffing against a known address costs an attacker only bandwidth, and registration can be used both to fill the `users` collection and — because the 409 distinguishes a registered address from an unregistered one ([section 2.5.2](#252-what-the-public-routes-do-and-do-not-check)) — to enumerate accounts. What is needed is a window per client peer and per account, a fixed minute being enough to start, answering **429** with a `Retry-After` header and one message whether or not the account exists, clearing the counters after a successful sign-in, and logging the bucket that filled rather than the address. Three things to decide before writing it, because each has a wrong answer that looks right: **where the counters live** — module state in one worker means the effective ceiling is *N* times the configured one for *N* workers and a restart forgets every window, so a shared store (Redis, Memorystore, Firestore with a TTL) or a gateway policy is what makes the bound real, and **no dependency may be added here without authorization** (**NT-1**), so that decision comes first; **whether `X-Forwarded-For` is honoured** — nothing in this repository terminates TLS or strips the header, so trusting it lets a caller reset its own counter, while ignoring it behind a proxy collapses every request onto one peer key and caps the whole deployment, which means the trusted-proxy depth has to be configuration rather than a constant; and **what the failure path costs** — a bcrypt verification is expensive by design, so any work added to equalise timing between a wrong password and an unknown address must sit behind the ceiling, never in front of it. |
+| **NT-27** | Make a repeated purchase safe, at the application and at the provider | Two halves of one defect, and neither exists today. **Application-side**: nothing looks for a transaction already recording the request's `stripe_payment_intent_id`, so a client retrying a request whose answer it never saw is charged a second time — the ordinary case, and the cheap one to close, though a query before the charge is a check rather than a guarantee and the real fix is the reservation in **NT-28**. **Provider-side**: `process_payment` sends no idempotency key, so nothing at Stripe prevents the duplicate either. A provider-level key makes the guarantee end-to-end, but it means editing `app/services/payment.py`, which is frozen pending **HCF-3**. Do all three in one change. |
+| **NT-28** | Finalise a purchase in one transaction, reserve before charging, and reconcile | Three related gaps on the money path. The availability read and the `'sold'` update are separate unguarded steps, so **two simultaneous buyers can both see `'available'` and both be charged**. The transaction document and the `'sold'` update are two separate writes, so a crash between them leaves a charged card with no matching transaction, or a sale with an unsold vehicle. And nothing records the attempt *before* the charge, so there is nothing to reconcile against afterwards. What closes all three is a reservation: claim the vehicle — into a `pending_payment` status, with an attempt record keyed by the payment credential — inside one Firestore transaction, *then* charge, then release on a decline or settle on success, with both final writes in one transaction. Add a sweep for charges with no transaction: settle them, or refund through `create_refund` and release the vehicle. Do it with **NT-27**; [section 4.7](#47-uniqueness-and-money-neither-pattern-is-in-place) has the shape. |
+| **NT-29** | Decide what the logs should feed | [Section 1.11](#111-where-the-logs-go) is one `logging.basicConfig(level=logging.INFO)` call, which is right for a terminal and wrong for anything else. Three things it costs. **It renders no `extra` keys**, so the `correlation_id` that `create_listing` attaches to every one of its records is carried on the record and never printed — the one identifier that ties a request's log lines together is invisible until someone configures a formatter that emits it. **It configures the root logger**, so every third-party library that logs at `INFO` — `httpx`, the Google client stack — prints alongside the application. And **it is plain text**, so nothing downstream can parse a field. If this system gets a log aggregator: swap in a JSON formatter that serialises the record's own attributes, set explicit levels per namespace instead of one root level, and assign the request id in middleware rather than per handler, so that every line of a request — not only listing creation's — carries the same identifier. |
 | **NT-30** | Make the SPA's API client importable | The client does not compile, so **nothing in the contract at [section 2.6](#26-the-spa-contract--treat-it-as-frozen) can execute** however exactly the backend satisfies it. Three defects, all in `frontend/`, each with its line number in [section 2.6.2](#262-why-none-of-it-executes-yet): `createApiInstance` is a module-local `const` in `services/api.ts` that `services/auth.ts` and `services/payment.ts` both import; `app/utils/auth` and `app/utils/storage` are imported and exist nowhere in the tree; and the `app/…` prefix is mapped neither in `frontend/tsconfig.json` nor by a bundler alias, there being no `vite.config.ts`. Export the client, supply the two modules — or repoint both imports at a single storage module — and map the prefix **in `tsconfig.json` *and* in a Vite config, because the two resolvers are independent and one without the other leaves either a type error or a runtime resolution failure**. Use one key name throughout: `services/auth.ts` writes and clears `authToken`, so `getAuthToken` has to read that key or the interceptor never finds the token login just stored. Do this with **NT-31** — a client that compiles but cannot address the API is no further forward. The `@/…` prefix needs the same mapping treatment and belongs with **NT-15**. |
 | **NT-31** | Give the SPA a usable API base | `frontend/src/services/api.ts:4` reads `process.env.REACT_APP_API_BASE_URL`. `REACT_APP_` is a Create-React-App convention and this is a Vite project: Vite exposes only `VITE_`-prefixed variables, through `import.meta.env`, and puts no `process` in a browser build — so that read throws or yields nothing, axios is left resolving every path against the page's own origin, and exporting the variable changes nothing because nothing reads it. Adopt `import.meta.env.VITE_API_BASE_URL` and give it the value **`http://localhost:8000/api`** — the Uvicorn origin plus `API_V1_STR` — from `frontend/.env.local` in development and from the deployment environment elsewhere; `services/payment.ts:4` needs the same treatment for `REACT_APP_STRIPE_PUBLIC_KEY`. Then align `infrastructure/docker/docker-compose.yml`, which sets a third name, `REACT_APP_API_URL`, and publishes the backend on port 5000 rather than 8000. Afterwards the three authentication calls compose exactly onto their routes and the listing calls still answer 404 (**HCF-6**) — expect that rather than reading it as a new defect. Pairs with **NT-30**. |
 | **NT-32** | Redact the client's error logging | `frontend/src/services/api.ts:24` logs the whole rejected axios error from its response interceptor, and `frontend/src/services/auth.ts:27` and `:39` log some of them a second time. That object is not a message: `config.data` on a sign-in **is** the `{email, password}` body and `config.headers.Authorization` **is** a live bearer token, so a browser console — and anything that forwards console output onwards — ends up holding plaintext passwords and usable tokens. Log an allow-list instead: the HTTP status, a stable application code, a safe message. Never `config`, `data`, `headers`, the token, the email or the password; and drop the duplicated auth-layer logging rather than redacting it twice. This is the client-side half of the rule the backend already follows ([section 1.11](#111-where-the-logs-go)), and it is the only frontend item on this list that is a security fix rather than a repair. Decide the storage question in the same change: the token currently lives in web storage, which is readable by any script that runs on the page, and moving to a cookie would need the CORS and CSRF story rewritten (**NT-11**), so it is a decision, not a refactor. |
 | **NT-33** | Settle the client's two unmatched endpoints | The client calls two paths this API does not serve under any prefix, and both answer 404 even after **NT-30** and **NT-31**: `services/api.ts:48`'s `uploadPhoto()` posts `multipart/form-data` with the file under the field name `photo` to `/upload` and expects a string back, and `services/payment.ts:21`'s `createPaymentIntent()` posts `{amount, currency}` to `/payments/create-intent` and expects a `clientSecret`. Each can be settled two ways, and both ways need a decision. **Implement them** — which means new routes, and the change set that gave this backend its authentication surface was fixed at four, so a fifth needs authorization. An upload route at least has somewhere to land: `app/db/cloud_storage.py` is complete, exposes `upload_file`, and has no importer today. A payment-intent route would also have to settle the generation mismatch in **HCF-1**, since `process_payment` creates a legacy Charge out of what the schema calls a PaymentIntent id. **Or remove the calls**, if the SPA is not going to use them. Decide the upload half together with **HCF-5** and **NT-25**: it determines where photo bytes come from, and therefore what has to bound them. |
 | **NT-34** | Declare the SPA's undeclared dependencies | `frontend/src` imports eight packages that `frontend/package.json` does not declare: `@stripe/react-stripe-js` and `@stripe/stripe-js` (`src/index.tsx`, `components/PaymentForm.tsx`, `services/payment.ts`), `browser-image-compression` (`utils/imageProcessing.ts`, `services/imageProcessing.ts`), `date-fns` (`utils/formatting.ts`), `dompurify` (`utils/validation.ts`), `formik` (`components/VehicleDetailsForm.tsx`), `react-dropzone` (`components/MaintenanceDocumentUploader.tsx`, `components/PhotoUploader.tsx`) and `zod` (`utils/validation.ts` and all four `src/schema/` modules). `npm install` therefore leaves every one of those imports unresolvable, so the affected modules fail for `tsc` and for Vite whatever **NT-30** does about the client's own graph. Two decisions, not one: whether each package is wanted at all, and for those that stay, which versions. Check the call sites while you are there rather than only the manifest — `utils/validation.ts:3` imports `dompurify` as a default export and then calls it, `sanitize(input)`, but DOMPurify's default export is an object with a `sanitize` method, so that line is a `TypeError` waiting to happen even once the package is installed. Declaring a dependency is a manifest change and this project authorises none without a decision, the same constraint as **NT-1**. Also missing and worth settling in the same pass: `eslint` and `vitest`, which `package.json`'s own `lint` and `test` scripts invoke and which nothing declares, so both scripts fail immediately. |
-
 | **NT-35** | Upgrade `python-jose`, and plan the framework upgrade behind it | The pinned `python-jose 3.3.0` is affected by CVE-2024-33663 and CVE-2024-33664, both addressed from 3.4.0. Reachability is limited today — every token is HS256 JWS and `ALGORITHM` is restricted to the HMAC family — but this is a known-vulnerable pin, not a cleared one. Upgrading is a dependency change and needs the same authorization as **NT-1**. Look at the wider set in the same pass: `fastapi 0.95.2` and `starlette 0.27.0` are also old enough to carry advisories that the current route surface happens not to exercise, and every one of them gets harder to patch the longer the pin set sits. Any framework move has to be planned against the Pydantic-v1 constraint ([section 3.2](#32-pydantic-v1-is-mandatory)) and the runtime floors in [section 1.2](#12-prerequisites). |
 | **NT-36** | Verify that an address belongs to the person registering it | Registration validates an address's *shape* and enforces its uniqueness, and neither is ownership: anyone can register an address they do not control, and hold the account its real owner would later expect — which also makes any future password-reset-by-email flow unsafe to build on top. What is missing is a confirmation step: a signed, single-use, expiring token sent to the address, an account marked unverified until it is presented, and a decision about what an unverified account may do. Password reset and email change need the same machinery, so design all three together rather than bolting the first one on. |
 | **NT-37** | Give stored personal data a lifecycle | Registration persists an address, both names, a role and a password hash; messages persist their bodies; listings persist whatever maintenance content a seller sent (**NT-13**). None of it has a retention period, a consent record, an export path or a deletion path — **deleting a user is not an operation this API has**, and nothing cascades, so a subject request cannot be answered today. Decide the purpose and retention for each collection, then add an authenticated export and an authenticated deletion with defined cascade rules (what happens to a sold vehicle's transaction record, which almost certainly must be retained, versus the messages around it, which need not be). This is the work that turns a demo datastore into one that can hold real users. |
-| **NT-38** | Own the browser security headers at the edge | This application sets exactly one response header of its own: `Cache-Control: no-store` on the token and profile routes. HSTS, a content-security policy, `X-Content-Type-Options`, frame options, referrer policy and host validation are all absent, and they belong to whatever terminates TLS in front of it — which this repository does not contain, so there is nothing to inherit them from. Write that configuration alongside the ingress, and decide there whether any of it should instead be middleware here (a `TrustedHostMiddleware` and a small header middleware are the usual answer when the app can be deployed without a known proxy). Pair it with **NT-11**: the CORS method and header lists are still `['*']`. |
+| **NT-38** | Own the browser security headers at the edge | **This application sets no response header of its own at all** — not `Cache-Control`, not HSTS, not a content-security policy, not `X-Content-Type-Options`, frame options or referrer policy, and it validates no `Host`. Two consequences worth separating. The first is the edge's: all of those headers belong to whatever terminates TLS in front of this service, and this repository does not contain it, so there is nothing to inherit them from — write that configuration alongside the ingress, and decide there whether any of it should instead be middleware here (a `TrustedHostMiddleware` and a small header middleware are the usual answer when the app can be deployed without a known proxy). The second is this application's own: a token travels in the body of the register, login and `/me` responses, and nothing marks those responses unstorable, so a shared cache or a browser may keep them. A `Cache-Control: no-store` on those three routes is a few lines and needs no edge at all. Pair the whole task with **NT-11**: the CORS method and header lists are still `['*']`. |
+| **NT-39** | Validate the security-relevant settings at import | All ten settings are checked for their type and nothing else, so four wrong values import cleanly and then govern: a `SECRET_KEY` short enough to brute-force (HS256 signs with the raw bytes, so a five-character key is a five-character key), an `ACCESS_TOKEN_EXPIRE_MINUTES` of `0` — which mints tokens that are already expired — or of three days, an `ALGORITHM` outside the HMAC family or in the wrong case, and an `ALLOWED_ORIGINS` of `*`, which with `allow_credentials=True` is an allow-all ([section 3.4](#34-allowed_origins-takes-two-forms-and-a-wildcard-is-not-safe-here)). Add a `@validator` per field and refuse each one, so the failure is a `ValidationError` at import that an operator cannot miss rather than a weakened deployment nobody sees. Two cautions: `ALLOWED_ORIGINS` is parsed in `Config.parse_env_var` before validators run, so put the wildcard refusal in the validator and leave the parsing where it is; and choose the lifetime bounds deliberately, because a refusal is a boot failure for anyone whose current value falls outside them. |
+| **NT-40** | Make email uniqueness atomic | Registration's 409 is a query followed by a write, so two simultaneous registrations for one address can both succeed, and `authenticate_user`'s `.limit(1)` then makes it undetermined which password signs in ([section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced)). Firestore has no unique index, so the constraint has to be a conditional write: a `user_emails/{sha256(canonical_email)}` marker claimed with `create()` before the account is written and released if that write fails — [section 4.7](#47-uniqueness-and-money-neither-pattern-is-in-place) has the shape, including the compensating delete that is not optional. **Do NT-24 first**, or two spellings of one address claim two markers and the constraint buys nothing. Budget for the deployment half too: a new collection is a resource no existing IAM policy or security rule grants, so the grant has to land with the code or every registration answers 500 instead of 201. An in-memory double cannot verify this either way; it needs an emulator, under the conditions in [section 1.10.1](#1101-the-two-sanctioned-stubs). |
+| **NT-41** | Settle a purchase's terms from the vehicle record | `POST /api/transactions/transactions` takes the `amount` and the `seller_id` from the request and compares them with nothing, so a caller names its own price and names the seller the sale is recorded against — and that named seller becomes a principal entitled to read the transaction ([section 2.9](#29-the-purchase-path)). The fix is to read the terms from `vehicles/{vehicle_listing_id}`, which the handler already fetches for its `status`, and refuse a request that disagrees. **It is blocked on data, not on code**: nothing creates or populates a vehicle document (**HCF-7**), so there is no `price` and no `seller_id` to compare against, and a check written today would have nothing to check. Settle HCF-7 first, make whatever writes `vehicles/{id}` write both fields, then decide the harder half — whether a record that cannot supply the terms is a **409** rather than a request the server trusts. Do it with **NT-23**, which stops the caller sending those fields at all. |
 
 ## 5.3 WHERE TO START
 
@@ -1694,16 +1651,20 @@ The six entries below are the ones that decide whether this API holds up against
 
 | # | Blocker | What it permits today | Task |
 | --- | --- | --- | --- |
-| 1 | **A purchase is not atomic and the provider has no idempotency key** | Two simultaneous buyers can both be charged for one vehicle, and a crash between the two final writes leaves a charged card with no transaction record or an unsold vehicle. Money moves; nothing reconciles it | **HCF-14**, **NT-27**, **NT-28** |
-| 2 | **Purchase terms are only as authoritative as a record nothing writes** | The amount and seller are checked against the vehicle document *where it carries them*, and nothing creates one — so on this system's own data a caller still names its own price. Settle what writes `vehicles/{id}`, with `price` and `seller_id`, then make the record mandatory | **HCF-7**, **HCF-16** |
-| 3 | **Raw maintenance-document content is publicly readable** | Whatever a seller uploads is stored on the listing and returned by two unauthenticated endpoints, so a receipt or invoice publishes names, addresses and a VIN. This one needs no attacker at all — an ordinary crawler is enough | **NT-13** |
-| 4 | **The attempt ceilings are per worker process** | The throttle raises the cost of credential stuffing but does not bound it: *N* workers permit *N* times the ceiling, and a restart forgets every window | **NT-26** |
-| 5 | **No account can be deleted and nothing has a retention rule** | A subject access or deletion request cannot be answered, and personal data accumulates with no defined purpose or lifetime | **NT-37** |
-| 6 | **A known-vulnerable JWT library is pinned** | Reachability is limited today because every token is HS256 JWS, but the pin is a published-advisory version and the whole pin set is old enough to be hard to patch | **NT-35** |
-| 7 | **Browser security headers have no owner** | No HSTS, no CSP, no frame or content-type options, no referrer policy, no host validation — and no ingress configuration in this repository to hold them | **NT-38**, **NT-11** |
-| 8 | **Anyone can register an address they do not own** | Shape and uniqueness are enforced; ownership is not, so any future password-reset flow inherits the problem | **NT-36** |
-| 9 | **The frontend logs bearer tokens** | Whole Axios errors, headers included, reach `console.error`. Latent only because the SPA does not render | **NT-32** |
-| 10 | **List endpoints are unpaginated and creation is unquantified** | One account may create unlimited listings and messages, and every list response streams a whole collection | **NT-20**, **NT-25** |
+| 1 | **Registration validates nothing, so `admin` is self-granted** | One anonymous, unthrottled request registers itself as an administrator, and `delete_listing` trusts that role — so any seller's listing can be deleted by anyone who can reach the API. The same absence accepts a malformed address, a one-character password and a blank name | **NT-24**, then **NT-14** |
+| 2 | **A purchase can be charged twice, and two buyers can both pay for one car** | Nothing refuses a replayed payment intent and no idempotency key is sent, so a client retrying a request whose answer it never saw pays again; the availability read and the `'sold'` update are unguarded, so two concurrent requests both succeed; and a crash between the two final writes leaves a charged card with nothing reconciling it. Money moves | **NT-27**, **NT-28** |
+| 3 | **Purchase terms come from the request** | A caller names its own price and names the seller the sale is recorded against — and that named seller becomes a principal entitled to read the transaction. Blocked on **HCF-7**: nothing writes a vehicle record to check against | **NT-41**, **HCF-7** |
+| 4 | **Raw maintenance-document content is publicly readable** | Whatever a seller uploads is stored on the listing and returned by two unauthenticated endpoints, so a receipt or invoice publishes names, addresses and a VIN. This one needs no attacker at all — an ordinary crawler is enough | **NT-13** |
+| 5 | **Neither public route has any attempt limit** | Credential stuffing against a known address costs only bandwidth, and the register 409 tells an unauthenticated caller which addresses have accounts, so the same absence enumerates them | **NT-26** |
+| 6 | **Nothing bounds a write body** | One request decides how many outbound Cloud Vision calls it makes, and a message body of any size is written as sent — an authenticated caller can spend the project's provider budget and fill its datastore | **NT-25** |
+| 7 | **No setting is validated beyond its type** | A five-character `SECRET_KEY`, a token lifetime of zero or three days, and an `ALLOWED_ORIGINS` of `*` — which with credentials enabled is an allow-all — all import cleanly and then govern | **NT-39** |
+| 8 | **No account can be deleted and nothing has a retention rule** | A subject access or deletion request cannot be answered, and personal data accumulates with no defined purpose or lifetime | **NT-37** |
+| 9 | **A known-vulnerable JWT library is pinned** | Reachability is limited today because every token is HS256 JWS, but the pin is a published-advisory version and the whole pin set is old enough to be hard to patch | **NT-35** |
+| 10 | **Browser security headers have no owner** | No HSTS, no CSP, no frame or content-type options, no referrer policy, no host validation, and not even a `Cache-Control: no-store` on the routes that return a token — and no ingress configuration in this repository to hold any of it | **NT-38**, **NT-11** |
+| 11 | **Uniqueness is a query, and addresses are not canonicalised** | Two simultaneous registrations for one address both succeed, and two spellings of one address are two accounts | **NT-40**, **NT-24** |
+| 12 | **Anyone can register an address they do not own** | Ownership is never proved, so any future password-reset flow inherits the problem | **NT-36** |
+| 13 | **The frontend logs bearer tokens** | Whole Axios errors, headers included, reach `console.error`. Latent only because the SPA does not render | **NT-32** |
+| 14 | **List endpoints are unpaginated** | Every list response streams a whole collection, and nothing limits how many documents one account may add to it | **NT-20**, **NT-25** |
 
 **If you want the single most useful change to the *project* rather than to its security posture: HCF-3.** It is the one gap between a fresh clone and a served API, and everything else becomes easier to verify once `uvicorn app.main:app` actually stays up. It is not on the list above because a service that cannot start cannot be attacked — which is the only reason the ten above are not already urgent, and a poor reason to relax about them.
 
@@ -1718,7 +1679,7 @@ If you would rather start small, **NT-8**, **NT-10**, **NT-19** and **NT-32** ar
 | **NT-19** — write `CONTRIBUTING.md` | There is no automated gate, which is exactly why it needs care: check that every link in it resolves, and that the gates it documents are the same commands as [section 1.9](#19-verify-your-checkout) and [section 1.10](#110-before-you-call-a-change-done) rather than a paraphrase that will drift. |
 | **NT-32** — redact the client's error logging | `grep -rn "console.error" frontend/src/services/` shows no call passing a raw error object, and a failed sign-in in the browser console shows a status and a message with no `config`, `headers`, `data`, email, password or token anywhere in it. Check the logout and current-user handlers too — they log the same errors a second time, and both have to stop. |
 
-If you want to make the project verifiable, **NT-5** — a collectable test suite — is worth more than any other single contribution on this list. The harness in [section 6](#6-verifying-behaviour-in-process) is its specification: 139 assertions that already exist and that nothing runs for you.
+If you want to make the project verifiable, **NT-5** — a collectable test suite — is worth more than any other single contribution on this list. The harness in [section 6](#6-verifying-behaviour-in-process) is its specification: 99 assertions that already exist and that nothing runs for you.
 
 If you are looking at this before it carries real traffic, do **NT-20**, **NT-21** and **NT-22** while the data is still small. Each one is a pattern repeated in several places, and every one of them gets more expensive to change once there are documents to migrate and clients depending on a list response that has no page cursor.
 
@@ -1726,13 +1687,14 @@ If you are looking at this before it carries real traffic, do **NT-20**, **NT-21
 
 ## 6.1 WHAT THIS IS, AND WHAT IT IS NOT
 
-Everything this guide says about what the endpoints *do* — that registration answers 201 and a repeat answers 409, that the vision helper is called once per photo with `bytes`, that a declined charge writes nothing, that a log line carries its correlation id — was established by running the script in [section 6.3](#63-the-script). It is published here so that you can repeat it rather than take it on trust, and so that when you change a handler you can find out in a few seconds whether you broke one of those properties.
+Everything this guide says about what the endpoints *do* — that registration answers 201 and a sequential repeat answers 409, that the vision helper is called once per photo with `bytes`, that a declined charge writes nothing, that a log record carries its correlation id — was established by running the script in [section 6.3](#63-the-script). It is published here so that you can repeat it rather than take it on trust, and so that when you change a handler you can find out in a few seconds whether you broke one of those properties.
 
 It is **verification only**, and that has consequences worth being explicit about:
 
 - **It is not a test suite and it is not committed.** Save it outside the working tree — `/tmp/verify_backend.py` is fine — or delete it when you are done. The repository has no `.gitignore` ([section 1.3](#13-create-an-isolated-environment)), so a copy left in the tree shows up as an untracked path in `git status --porcelain` — which is the half of [gate 3](#193-gate-3--change-containment) that catches it. A committed-diff comparison would not: git does not track it, so there is nothing to diff. Making these checks permanent means rewriting `backend/tests/` against the real `app.*` layout, which is task **NT-5**; until someone does, this script is the closest thing the project has to a specification for that work.
 - **It needs no cloud credentials, no emulator, no server and no network.** It replaces Firestore with an in-memory double and both unsatisfiable third-party constructors with stand-ins, and it removes every environment variable that could point a client somewhere real. It cannot reach a Google Cloud project, a shared Firestore emulator or a Stripe account, and it asserts that before it does anything else. That is the fail-closed default described in [section 1.10.1](#1101-the-two-sanctioned-stubs), and it is the only procedure this guide publishes for driving the app.
-- **Two properties are deliberately outside it**, because an in-memory double cannot model them: that four simultaneous registrations for one address yield exactly one account, and that a replayed payment intent is refused under real query semantics. Verify those against a Firestore emulator, under the conditions in [section 1.10.1](#1101-the-two-sanctioned-stubs) — assert the emulator variables before importing anything, use a throwaway project id, delete what you wrote — and report which gate you used.
+- **Some of what it pins is a gap, not a guarantee.** Several assertions record what this API accepts today and a policy would refuse — a self-granted `admin` role, an unbounded photo list, a replayed payment intent — because a gap nobody has written down is a gap that gets rediscovered as a surprise. Each such row in [section 6.4](#64-what-it-asserts) names the task that would close it, and the day one is closed the harness fails and has to be updated on purpose.
+- **Concurrency is deliberately outside it**, because an in-memory double cannot model it: two simultaneous registrations for one address, and two simultaneous buyers for one vehicle, are both unguarded here (**NT-40**, **NT-28**) and neither is observable against a double. Take them to a Firestore emulator, under the conditions in [section 1.10.1](#1101-the-two-sanctioned-stubs) — assert the emulator variables before importing anything, use a throwaway project id, delete what you wrote — and report which gate you used.
 - **The one dependency it adds is not a project dependency.** `TestClient` needs `httpx`, and `httpx 0.28` removed the `Client(app=…)` shortcut that `starlette 0.27` relies on, so install `httpx==0.27.2` for the harness. Do not add it to any manifest: no dependency may be added to this project without authorisation ([section 5.2](#52-work-worth-picking-up)), and nothing in `backend/app/` imports it.
 
 ## 6.2 BEFORE YOU RUN IT
@@ -1751,7 +1713,7 @@ Save the script and run it:
 python /tmp/verify_backend.py
 ```
 
-It prints one line per assertion and a summary, takes a few seconds, and exits 0 only when every assertion held. It may pause briefly before the attempt-limit gate: those counters run in fixed one-minute windows, and starting a burst inside a fresh window is cheaper than making the assertion tolerant of a rollover it could not tell apart from a broken ceiling.
+It prints one line per assertion and a summary, takes a few seconds, and exits 0 only when every assertion held. The settings gate at the end is the slow part: each `ALLOWED_ORIGINS` form needs its own subprocess, because `Settings` is built once at import and cannot be re-read in a live process.
 
 ```text
 PASS fail closed: the application holds the double, not a client
@@ -1761,7 +1723,7 @@ PASS 13 routes are registered
 ...
 PASS an unset required setting still refuses to import
 
-139 assertions, 139 passed, 0 failed
+99 assertions, 99 passed, 0 failed
 ```
 
 A `FAIL` line prints what it got and what it wanted, so the label plus that pair is normally enough to locate the change that caused it.
@@ -1787,7 +1749,6 @@ Vision client that has no such method (HCF-4). So it needs no cloud
 credentials and reaches no network. Exit code 0 means every assertion held.
 """
 
-import io
 import json
 import logging
 import os
@@ -1799,8 +1760,6 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from unittest import mock
-
-from google.api_core.exceptions import AlreadyExists
 
 # --- 0. Fail closed --------------------------------------------------------
 # Configuration is supplied here and every variable that could point a
@@ -1869,16 +1828,6 @@ class Doc:
         self._store.docs(self._name)[self.id] = dict(data)
         self._store.writes += 1
 
-    def create(self, data):
-        # A conditional write, which is the whole point of the email marker in
-        # app/api/auth.py: the real client raises AlreadyExists rather than
-        # overwriting, so the double must too or the atomicity assertion below
-        # would pass for the wrong reason.
-        if self.id in self._store.docs(self._name):
-            raise AlreadyExists('%s/%s already exists' % (self._name, self.id))
-        self.set(data)
-        return Snap(self.id, self._store.docs(self._name)[self.id])
-
     def update(self, data):
         docs = self._store.docs(self._name)
         if self.id not in docs:
@@ -1945,6 +1894,11 @@ class Firestore:
     def count(self, name):
         return len(self.docs(name))
 
+    def collections(self):
+        # Which collections a request actually touched, so an assertion can
+        # say "this and nothing else" rather than only counting one of them.
+        return list(self._collections)
+
     def reset(self):
         self._collections.clear()
         self.writes = 0
@@ -1969,6 +1923,26 @@ def stripe_stand_in():
         error=types.SimpleNamespace(StripeError=StripeError))
     module.error = types.SimpleNamespace(StripeError=StripeError)
     return module
+
+
+class Records(logging.Handler):
+    """Keeps the LogRecord objects, so an `extra` key can be asserted.
+
+    logging.basicConfig's formatter prints the message and nothing a caller
+    attached through `extra`, so asserting a correlation id against formatted
+    text would assert the formatter rather than the handler. Keeping the
+    records asserts what the application actually attached.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def reset(self):
+        self.records = []
 
 
 class Spy:
@@ -2019,33 +1993,12 @@ def register(client, email, role):
     return body['user'], {'Authorization': 'Bearer ' + body['token']}
 
 
-def promote_to_admin(store, user):
-    """Make one account an administrator the only way the API allows.
-
-    Registration refuses the role, so an administrator can only come from an
-    out-of-band write to the document. get_current_user re-reads that document
-    on every request, so the change takes effect on the next call made with the
-    token the account already holds.
-    """
-    store.docs('users')[user['id']]['role'] = 'admin'
-
-
-def reset_limits(app):
-    """Clear the in-process attempt counters between gates.
-
-    They are per-process and deliberately tight (10 sign-ins, 5 registrations
-    per address or peer per minute), and every request here arrives from one
-    peer, so unrelated gates would otherwise exhaust a ceiling that gate_limits
-    exercises on purpose.
-    """
-    app.api.auth._rate_counters.clear()
-
-
 # --- 2. Gates -------------------------------------------------------------
 def gate_composition(app, client, log):
-    eq('the startup hook logs exactly one line', log.getvalue().count(
-        'startup complete: firestore and vision clients initialised at '
-        'import'), 1)
+    eq('the startup hook logs exactly one line',
+       [record.getMessage() for record in log.records].count(
+           'startup complete: firestore and vision clients initialised at '
+           'import'), 1)
     rows = sorted((r.path, ','.join(sorted(r.methods)))
                   for r in app.main.app.routes if r.path.startswith('/api'))
     eq('13 routes are registered', len(rows), 13)
@@ -2075,78 +2028,65 @@ def gate_composition(app, client, log):
 
 def gate_auth(app, store, client, jwt, settings):
     fresh = client.post('/api/auth/register', json={
-        'email': ' Seller@Harness.TEST ', 'password': PASSWORD,
-        'first_name': ' Sam ', 'last_name': 'Seller', 'role': 'Seller'})
+        'email': 'seller@harness.test', 'password': PASSWORD,
+        'first_name': 'Sam', 'last_name': 'Seller', 'role': 'seller'})
     eq('a fresh registration answers 201', fresh.status_code, 201)
     eq('it returns exactly four keys', sorted(fresh.json()),
        ['access_token', 'token', 'token_type', 'user'])
     ok('no hash appears anywhere in that payload',
        'hashed_password' not in fresh.text and '$2b$' not in fresh.text)
     eq('one user document is written', store.count('users'), 1)
-    eq('the token response is not cacheable',
-       fresh.headers.get('cache-control'), 'no-store')
-    eq('the address is stored trimmed and lower-cased',
-       fresh.json()['user']['email'], 'seller@harness.test')
-    eq('the role is stored lower-cased, so the seller gate matches it',
-       fresh.json()['user']['role'], 'seller')
-    eq('the name is stored trimmed', fresh.json()['user']['first_name'], 'Sam')
-    eq('one uniqueness marker is written beside the account',
-       store.count('user_emails'), 1)
+    eq('the account is the only thing written', sorted(store.collections()),
+       ['users'])
+    eq('the body is stored exactly as sent, unnormalised',
+       (fresh.json()['user']['email'], fresh.json()['user']['role']),
+       ('seller@harness.test', 'seller'))
+    ok('no response header is set beyond the framework defaults',
+       'cache-control' not in fresh.headers, dict(fresh.headers))
 
     again = client.post('/api/auth/register', json={
-        'email': 'SELLER@harness.test', 'password': 'another-password',
+        'email': 'seller@harness.test', 'password': 'another-password',
         'role': 'seller', 'first_name': 'Sam', 'last_name': 'Seller'})
     eq('a duplicate email answers 409 with its own detail',
        (again.status_code, again.json()['detail']),
        (409, 'Email is already registered'))
     eq('and writes no second document', store.count('users'), 1)
 
-    # The role a caller may give itself, and every field bound. Each of these
-    # is a 422 raised by a validator, so none of them reaches Firestore.
+    # Nothing about the body is checked beyond field presence and type, so
+    # a request a policy would refuse is stored as sent. Each line here is a
+    # gap, not a feature: they are why NT-24 exists.
     def registration(**overrides):
         body = {'email': 'fresh@harness.test', 'password': PASSWORD,
                 'first_name': 'Fresh', 'last_name': 'Caller', 'role': 'buyer'}
         body.update(overrides)
         return client.post('/api/auth/register', json=body)
 
-    writes = store.writes
     for label, overrides in (
-            ('role admin', {'role': 'admin'}),
-            ('role root', {'role': 'root'}),
-            ('a blank role', {'role': '  '}),
+            ('role admin, self-granted',
+             {'role': 'admin', 'email': 'self-admin@harness.test'}),
             ('an address with no domain', {'email': 'not-an-address'}),
-            ('an address with an empty label', {'email': 'a@b..test'}),
-            ('an over-long address',
-             {'email': 'x' * 250 + '@harness.test'}),
-            ('a seven-character password', {'password': 'sevench'}),
-            ('a password over 72 bytes', {'password': 'p' * 73}),
-            ('a password over 72 bytes once encoded',
-             {'password': 'p' * 60 + 'é' * 7}),
-            ('a blank name', {'first_name': '   '}),
-            ('an over-long name', {'last_name': 'n' * 101})):
-        eq('registration with %s answers 422' % label,
-           registration(**overrides).status_code, 422)
-    eq('and none of them wrote anything',
-       (store.writes, store.count('users')), (writes, 1))
-
-    # The marker is the atomic half of uniqueness: a query cannot stop two
-    # simultaneous requests, a conditional write can. Claiming the address
-    # first is what a concurrent registration effectively does.
-    claimed = 'race@harness.test'
-    store.collection('user_emails').document(
-        app.api.auth._email_key(claimed)).set({'user_id': 'someone-else'})
-    raced = registration(email=claimed)
-    eq('an address already claimed by a marker answers 409',
-       (raced.status_code, raced.json()['detail']),
-       (409, 'Email is already registered'))
-    eq('and writes no account for it', store.count('users'), 1)
+            ('a one-character password',
+             {'password': 'p', 'email': 'short@harness.test'}),
+            ('a blank name',
+             {'first_name': '   ', 'email': 'blank@harness.test'})):
+        eq('registration with %s answers 201' % label,
+           registration(**overrides).status_code, 201)
+    eq('and every one of them is stored', store.count('users'), 5)
+    eq('an administrator can therefore be self-granted', sorted(
+        doc['role'] for doc in store.docs('users').values()),
+       ['admin', 'buyer', 'buyer', 'buyer', 'seller'])
+    # A missing field is still a 422: that is Pydantic, not policy.
+    eq('a body missing a required field answers 422', client.post(
+        '/api/auth/register', json={'email': 'partial@harness.test'}
+    ).status_code, 422)
 
     good = client.post('/api/auth/login', json={
-        'email': ' SELLER@harness.TEST ', 'password': PASSWORD})
-    eq('login accepts the same address in any case or spacing',
-       good.status_code, 200)
-    eq('the token response is not cacheable',
-       good.headers.get('cache-control'), 'no-store')
+        'email': 'seller@harness.test', 'password': PASSWORD})
+    eq('login answers 200', good.status_code, 200)
+    eq('the address is matched exactly, so a different case is a 401',
+       client.post('/api/auth/login', json={
+           'email': 'SELLER@harness.test',
+           'password': PASSWORD}).status_code, 401)
     eq('access_token and token carry one value',
        good.json()['access_token'], good.json()['token'])
     eq('the public user comes back with it',
@@ -2182,8 +2122,8 @@ def gate_auth(app, store, client, jwt, settings):
     out = client.post('/api/auth/logout', headers=headers)
     eq('logout answers 200 and acknowledges',
        (out.status_code, out.json()), (200, {'detail': 'Logged out'}))
-    eq('the profile response is not cacheable either',
-       me.headers.get('cache-control'), 'no-store')
+    ok('the profile response sets no Cache-Control either',
+       'cache-control' not in me.headers)
 
     claims = jwt.decode(token, settings.SECRET_KEY,
                         algorithms=[settings.ALGORITHM])
@@ -2197,13 +2137,9 @@ def gate_auth(app, store, client, jwt, settings):
 def gate_listings(app, store, client, log):
     seller, as_seller = register(client, 'sell@harness.test', 'seller')
     buyer, as_buyer = register(client, 'buy@harness.test', 'buyer')
-    refused = client.post('/api/auth/register', json={
-        'email': 'admin@harness.test', 'password': PASSWORD,
-        'first_name': 'No', 'last_name': 'Admin', 'role': 'admin'})
-    eq('nobody can register itself as an administrator',
-       refused.status_code, 422)
-    admin, as_admin = register(client, 'admin@harness.test', 'buyer')
-    promote_to_admin(store, admin)
+    # An administrator is created by registering as one, because registration
+    # accepts whatever role it is sent -- which is the gap NT-24 records.
+    admin, as_admin = register(client, 'admin@harness.test', 'admin')
     vision = Spy(result={'type': 'Car'})
     with spying(app.api.listings, 'analyze_vehicle_photo', vision):
         made = client.post('/api/listings/listings', headers=as_seller,
@@ -2226,62 +2162,57 @@ def gate_listings(app, store, client, log):
     eq('an empty photo list answers 200 without calling the helper',
        (none.status_code, len(idle.calls)), (200, 0))
 
-    log.seek(0), log.truncate(0)
+    log.reset()
     failing = Spy(raises=RuntimeError('vision provider unavailable'))
     with spying(app.api.listings, 'analyze_vehicle_photo', failing):
         degraded = client.post('/api/listings/listings', headers=as_seller,
                                json=listing_body(photos=['https://a/1.jpg',
                                                          'https://a/2.jpg']))
-    logged = log.getvalue()
+    failures = [record for record in log.records
+                if record.getMessage() == 'photo analysis failed']
     eq('every photo failing still answers 200', degraded.status_code, 200)
     eq('the analysis degrades to empty instead of failing the request',
        store.docs('listings')[degraded.json()['id']]['photo_analysis'], [])
-    eq('each failure is logged once', logged.count('photo analysis failed'), 2)
-    eq('both lines share one correlation id',
-       len({line.split('[correlation_id=')[1].split()[0].rstrip(']')
-            for line in logged.splitlines() if '[correlation_id=' in line}), 1)
-    eq('each line names the class of failure',
-       logged.count('error_type=RuntimeError'), 2)
-    ok('and neither the traceback nor the provider text is emitted at INFO',
-       'Traceback (most recent call last):' not in logged
-       and 'vision provider unavailable' not in logged, logged[-400:])
+    eq('each failure is logged once', len(failures), 2)
+    eq('both records carry one shared correlation id',
+       len({record.correlation_id for record in failures}), 1)
+    ok('each is logged with its traceback, through logger.exception',
+       all(record.levelno == logging.ERROR and record.exc_info is not None
+           for record in failures))
 
-    # The detail still exists; it lives behind DEBUG, which an operator opts
-    # into, rather than in the default output of a production service.
-    log.seek(0), log.truncate(0)
-    namespace = logging.getLogger('app')
-    namespace.setLevel(logging.DEBUG)
-    try:
-        with spying(app.api.listings, 'analyze_vehicle_photo',
-                    Spy(raises=RuntimeError('vision provider unavailable'))):
-            client.post('/api/listings/listings', headers=as_seller,
-                        json=listing_body(photos=['https://a/1.jpg']))
-    finally:
-        namespace.setLevel(logging.INFO)
-    debugged = log.getvalue()
-    ok('at DEBUG the traceback and the provider text are both available',
-       'Traceback (most recent call last):' in debugged
-       and 'RuntimeError: vision provider unavailable' in debugged,
-       debugged[-400:])
+    # One photo of two failing keeps the result of the other: the guard is per
+    # photo, not per request.
+    calls = {'n': 0}
 
-    # The photo list is bounded before the first provider call, so an
-    # unbounded request cannot amplify into arbitrarily many of them.
-    idle_after_bounds = Spy(result={'type': 'Car'})
-    with spying(app.api.listings, 'analyze_vehicle_photo',
-                idle_after_bounds):
-        writes = store.writes
-        for label, photos in (
-                ('more than 12 photos', ['https://a/%d.jpg' % n
-                                         for n in range(13)]),
-                ('a photo entry over 256 KiB', ['u' * 262145]),
-                ('an aggregate over 900 KiB', ['u' * 250000] * 4),
-                ('a blank photo entry', ['https://a/1.jpg', ''])):
-            eq('%s answers 422' % label,
-               client.post('/api/listings/listings', headers=as_seller,
-                           json=listing_body(photos=photos)).status_code, 422)
-        eq('and none of them called the provider or wrote anything',
-           (len(idle_after_bounds.calls), store.writes), (0, writes))
+    def flaky(payload):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('vision provider unavailable')
+        return {'type': 'Car'}
 
+    with spying(app.api.listings, 'analyze_vehicle_photo', flaky):
+        partial = client.post('/api/listings/listings', headers=as_seller,
+                              json=listing_body(photos=['https://a/1.jpg',
+                                                        'https://a/2.jpg']))
+    eq('one failing photo of two keeps the successful result',
+       (partial.status_code,
+        store.docs('listings')[partial.json()['id']]['photo_analysis']),
+       (200, [{'type': 'Car'}]))
+
+    # Nothing bounds the photo list itself, so every entry costs one outbound
+    # call however many are sent. That is the gap NT-25 records.
+    unbounded = Spy(result={'type': 'Car'})
+    with spying(app.api.listings, 'analyze_vehicle_photo', unbounded):
+        many = client.post('/api/listings/listings', headers=as_seller,
+                           json=listing_body(
+                               photos=['https://a/%d.jpg' % n
+                                       for n in range(13)]))
+        eq('thirteen photos answer 200 with thirteen provider calls',
+           (many.status_code, len(unbounded.calls)), (200, 13))
+        eq('a blank photo entry answers 200 as well', client.post(
+            '/api/listings/listings', headers=as_seller,
+            json=listing_body(photos=['https://a/1.jpg', ''])).status_code,
+           200)
     with spying(app.api.listings, 'analyze_vehicle_photo', Spy(result={})):
         eq('a caller who is not a seller answers 403',
            client.post('/api/listings/listings', headers=as_buyer,
@@ -2297,11 +2228,12 @@ def gate_listings(app, store, client, log):
         eq('more than 900 KiB of maintenance content answers 422',
            client.post('/api/listings/listings', headers=as_seller,
                        json=heavy).status_code, 422)
-        # Inside both input bounds and still over the document ceiling, which
-        # is what keeps the serialized-size guard reachable and asserted. The
-        # log line is asserted too, so this case cannot pass by tripping one
-        # of the input bounds instead of the guard it is here to cover.
-        log.seek(0), log.truncate(0)
+        # Inside the maintenance bounds and still over the document ceiling,
+        # which is what keeps the serialized-size guard reachable and
+        # asserted. Its log record is asserted too, so this case cannot pass
+        # by tripping one of the maintenance bounds instead of the guard it is
+        # here to cover.
+        log.reset()
         eq('a serialized listing over 1 MB answers 422',
            client.post('/api/listings/listings', headers=as_seller,
                        json=listing_body(
@@ -2310,8 +2242,9 @@ def gate_listings(app, store, client, log):
                                      'format': 'text'}] * 2)
                        ).status_code, 422)
         ok('and it is the serialized-size guard that refused it',
-           'listing exceeds serialized size budget' in log.getvalue(),
-           log.getvalue()[-200:])
+           any(record.getMessage() ==
+               'listing exceeds serialized size budget'
+               for record in log.records))
     body = listing_body()
     eq('the owner may update the listing',
        client.put('/api/listings/listings/' + listing_id, headers=as_seller,
@@ -2366,51 +2299,29 @@ def gate_purchase(app, store, client):
             store.docs('vehicles')['veh-1']),
            (400, writes, 1, {'status': 'available'}))
 
-    # Replaying a payment intent that has already been charged must not reach
-    # the provider a second time.
+    # Nothing refuses a payment intent that has already been charged, and
+    # nothing checks the request's terms against the vehicle record, so both
+    # go through. These two assertions record gaps: NT-27 and NT-41.
     store.docs('vehicles')['veh-1'] = {'status': 'available'}
     replayed = Spy(result={'success': True, 'charge_id': 'ch_again'})
     with spying(app.api.transactions, 'process_payment', replayed):
         again = client.post('/api/transactions/transactions',
                             headers=as_buyer, json=body)
-    eq('a repeated payment intent answers 409 without charging again',
+    eq('a repeated payment intent is charged a second time',
        (again.status_code, len(replayed.calls), store.count('transactions')),
-       (409, 0, 1))
+       (200, 1, 2))
 
-    # The amount and the seller are settled against the vehicle record wherever
-    # it carries them, so a caller cannot name its own price or its own seller.
-    priced = Spy(result={'success': True, 'charge_id': 'ch_priced'})
     store.collection('vehicles').document('veh-2').set(
-        {'status': 'available', 'price': 15000.0, 'seller_id': seller['id']})
-    with spying(app.api.transactions, 'process_payment', priced):
-        agreed = client.post('/api/transactions/transactions',
-                             headers=as_buyer,
-                             json=purchase_body(buyer['id'], seller['id'],
-                                                'veh-2', intent='pi_agreed'))
-    eq('terms that match the vehicle record answer 200',
-       (agreed.status_code, len(priced.calls)), (200, 1))
-
-    for label, record, sent in (
-            ('an amount the record disagrees with',
-             {'status': 'available', 'price': 20000.0,
-              'seller_id': seller['id']}, {'amount': 15000.0}),
-            ('a seller the record disagrees with',
-             {'status': 'available', 'price': 15000.0,
-              'seller_id': 'someone-else'}, {})):
-        store.collection('vehicles').document('veh-3').set(record)
-        writes = store.writes
-        untouched = Spy(result={'success': True})
-        with spying(app.api.transactions, 'process_payment', untouched):
-            wrong = client.post(
-                '/api/transactions/transactions', headers=as_buyer,
-                json=dict(purchase_body(buyer['id'], seller['id'], 'veh-3',
-                                        intent='pi_wrong_' + label[:6]),
-                          **sent))
-        eq('%s answers 400 before the charge' % label,
-           (wrong.status_code, len(untouched.calls), store.writes),
-           (400, 0, writes))
-        eq('and the vehicle is left alone',
-           store.docs('vehicles')['veh-3']['status'], 'available')
+        {'status': 'available', 'price': 99999.0,
+         'seller_id': 'someone-else'})
+    disagreeing = Spy(result={'success': True, 'charge_id': 'ch_disagree'})
+    with spying(app.api.transactions, 'process_payment', disagreeing):
+        mismatch = client.post(
+            '/api/transactions/transactions', headers=as_buyer,
+            json=purchase_body(buyer['id'], seller['id'], 'veh-2',
+                               intent='pi_mismatch'))
+    eq('a caller may name its own price and its own seller',
+       (mismatch.status_code, len(disagreeing.calls)), (200, 1))
 
     with spying(app.api.transactions, 'process_payment', Spy({})):
         eq('a caller who is not the buyer answers 403',
@@ -2439,76 +2350,6 @@ def gate_purchase(app, store, client):
     eq('an unknown transaction answers 404', client.get(
         '/api/transactions/transactions/nope',
         headers=as_buyer).status_code, 404)
-
-
-def gate_limits(app, store, client):
-    """The two public routes are throttled, and the refusal says nothing.
-
-    The ceiling itself is reached by calling the limiter directly rather than
-    by sending ten sign-ins: each of those would cost a real bcrypt
-    verification, and a burst that slow can straddle a window boundary, which
-    looks exactly like a ceiling that does not work. One HTTP request then
-    proves the refusal reaches the client with its header.
-    """
-    auth = app.api.auth
-    reset_limits(app)
-    register(client, 'limited@harness.test', 'buyer')
-
-    def fill(bucket, subject, ceiling):
-        # Start inside a fresh window, so the count cannot be split across two.
-        remaining = auth._RATE_LIMIT_WINDOW_SECONDS - (
-            time.time() % auth._RATE_LIMIT_WINDOW_SECONDS)
-        if remaining < 5:
-            time.sleep(remaining + 0.1)
-        reset_limits(app)
-        for _ in range(ceiling):
-            auth._enforce_attempt_limit(bucket, subject, ceiling)
-
-    fill('login-peer', 'testclient', auth._MAX_LOGINS_PER_WINDOW)
-    refused = client.post('/api/auth/login', json={
-        'email': 'limited@harness.test', 'password': PASSWORD})
-    eq('a sign-in past the ceiling answers 429 with Retry-After',
-       (refused.status_code, bool(refused.headers.get('retry-after'))),
-       (429, True))
-    ok('the refusal says nothing about the account',
-       'limited@harness.test' not in refused.text
-       and 'account' not in refused.json()['detail'].lower(),
-       refused.json())
-    unknown = client.post('/api/auth/login', json={
-        'email': 'never-registered@harness.test', 'password': PASSWORD})
-    eq('an unknown address is refused by the same counter, not distinguished',
-       (unknown.status_code, unknown.json()['detail']),
-       (429, refused.json()['detail']))
-
-    reset_limits(app)
-    good = client.post('/api/auth/login', json={
-        'email': 'limited@harness.test', 'password': PASSWORD})
-    eq('a correct credential answers 200 once the window is clear',
-       good.status_code, 200)
-    ok('and clears the counters it was charged against',
-       not any(subject in ('limited@harness.test', 'testclient')
-               for _, subject in auth._rate_counters))
-
-    fill('register', 'testclient', auth._MAX_REGISTRATIONS_PER_WINDOW)
-    writes = store.writes
-    beyond = client.post('/api/auth/register', json={
-        'email': 'beyond@harness.test', 'password': PASSWORD,
-        'first_name': 'Beyond', 'last_name': 'Ceiling', 'role': 'buyer'})
-    eq('a registration past the ceiling answers 429', beyond.status_code, 429)
-    eq('and writes neither the account nor its marker',
-       (store.writes, store.count('users'), store.count('user_emails')),
-       (writes, 1, 1))
-
-    # Counters are pruned, so the map is bounded by live traffic rather than by
-    # every address ever submitted.
-    for index in range(50):
-        auth._enforce_attempt_limit('login-account', 'probe%d' % index, 99)
-    stale = (int(time.time() // auth._RATE_LIMIT_WINDOW_SECONDS) - 4, 1)
-    auth._rate_counters[('login-account', 'ancient')] = stale
-    auth._enforce_attempt_limit('login-account', 'trigger-prune', 99)
-    ok('a window that can no longer be consulted is dropped',
-       ('login-account', 'ancient') not in auth._rate_counters)
-    reset_limits(app)
 
 
 def gate_cors(client):
@@ -2555,98 +2396,16 @@ def gate_messaging(app, store, TestClient):
            client.get('/api/messages/messages',
                       headers=as_sender).status_code, 500)
 
-        # The body is bounded by the schema, so an unbounded or blank message
-        # is refused before the recipient lookup and before the write that
-        # HCF-8 cannot yet make safe.
-        writes = store.writes
+        # Nothing bounds the body: a blank or arbitrarily long message reaches
+        # the write exactly as the frozen handler wrote it. NT-25 records it.
         for label, content in (('a blank body', '   '),
-                               ('a body over 4000 characters', 'x' * 4001),
-                               ('a body over 16 KiB once encoded',
-                                'é' * 9000)):
-            eq('%s answers 422' % label,
+                               ('a 5000-character body', 'x' * 5000)):
+            eq('%s reaches the write rather than a 422' % label,
                client.post('/api/messages/messages', headers=as_sender,
                            json={'recipient_id': recipient['id'],
-                                 'content': content}).status_code, 422)
-        eq('and none of them wrote a message',
-           (store.writes, store.count('messages')), (writes, 1))
-
-
-def gate_logging(app):
-    formatter = app.main.ContextFormatter('%(levelname)s %(name)s: '
-                                          '%(message)s')
-
-    def record(message='hello', exc_info=None, **context):
-        item = logging.LogRecord('app.probe', logging.INFO, __file__, 1,
-                                 message, None, exc_info)
-        for key, value in context.items():
-            setattr(item, key, value)
-        return item
-
-    eq('a record with no context renders no brackets',
-       formatter.format(record()), 'INFO app.probe: hello')
-    eq('context renders in alphabetical order', formatter.format(
-        record(listing_id='l1', correlation_id='c1')),
-       'INFO app.probe: hello [correlation_id=c1 listing_id=l1]')
-    eq('backslash, newline, CR and tab are escaped, so no value forges a line',
-       formatter.format(record(note='a\nb\rc\td\\e')),
-       'INFO app.probe: hello [note=a\\nb\\rc\\td\\\\e]')
-    ok('no standard LogRecord field is rendered as context',
-       all(field not in formatter.format(record(k='v')) for field in
-           ('levelno=', 'msg=', 'args=', 'pathname=', 'lineno=', 'name=')))
-    try:
-        raise RuntimeError('boom')
-    except RuntimeError:
-        failed = record('photo analysis failed', sys.exc_info(),
-                        correlation_id='c9')
-    rendered = formatter.format(failed).splitlines()
-    eq('the context stays on the message line, above the traceback',
-       (rendered[0], rendered[1]),
-       ('INFO app.probe: photo analysis failed [correlation_id=c9]',
-        'Traceback (most recent call last):'))
-    ok('the exception itself is rendered', 'RuntimeError: boom' in
-       '\n'.join(rendered))
-
-    namespace = logging.getLogger('app')
-    handler = namespace.handlers[0]
-    eq('the app namespace carries exactly one handler',
-       len(namespace.handlers), 1)
-    ok('it formats with ContextFormatter and the documented format string',
-       isinstance(handler.formatter, app.main.ContextFormatter)
-       and handler.formatter._fmt ==
-       '%(asctime)s %(levelname)s %(name)s: %(message)s')
-    eq('the namespace is INFO with propagation off',
-       (namespace.level, namespace.propagate), (logging.INFO, False))
-    app.main._configure_application_logging()
-    eq('configuring again adds no second handler',
-       (len(namespace.handlers), namespace.handlers[0]), (1, handler))
-
-    saved = (list(namespace.handlers), namespace.level, namespace.propagate)
-    operator = logging.NullHandler()
-    try:
-        namespace.handlers = [operator]
-        namespace.setLevel(logging.WARNING)
-        namespace.propagate = True
-        app.main._configure_application_logging()
-        eq('a namespace an operator already configured is left untouched',
-           (namespace.handlers, namespace.level, namespace.propagate),
-           ([operator], logging.WARNING, True))
-    finally:
-        namespace.handlers, level, propagate = saved
-        namespace.setLevel(level)
-        namespace.propagate = propagate
-
-    stream, root_stream = io.StringIO(), io.StringIO()
-    handler.setStream(stream)
-    root_handler = logging.StreamHandler(root_stream)
-    logging.getLogger().addHandler(root_handler)
-    try:
-        logging.getLogger('app.probe').info('probe line', extra={'k': 'v'})
-    finally:
-        logging.getLogger().removeHandler(root_handler)
-    eq('an INFO record reaches the app handler exactly once',
-       stream.getvalue().count('probe line [k=v]'), 1)
-    eq('and never reaches a root handler as a duplicate',
-       root_stream.getvalue(), '')
+                                 'content': content}).status_code, 500)
+        eq('so three messages are stored, none of them readable',
+           store.count('messages'), 3)
 
 
 def gate_settings():
@@ -2676,33 +2435,31 @@ def gate_settings():
             ('a JSON array parses', '["http://a.test", "http://b.test"]',
              ['http://a.test', 'http://b.test']),
             ('an empty value yields no origins rather than raising', '', []),
-            ('whitespace yields no origins rather than raising', '   ', [])):
+            ('whitespace yields no origins rather than raising', '   ', []),
+            ('spaced entries are stripped one by one',
+             ' http://a.test , http://b.test ',
+             ['http://a.test', 'http://b.test']),
+            ('a bare wildcard is accepted verbatim', '*', ['*']),
+            ('a wildcard pattern is accepted verbatim',
+             'https://*.example.com', ['https://*.example.com'])):
         eq('ALLOWED_ORIGINS: ' + label, parse(value), expected)
 
-    for label, value in (('a bare wildcard', '*'),
-                         ('a wildcard subdomain', 'https://*.example.com'),
-                         ('a wildcard beside a real origin', 'http://a.test,*')):
-        refused = parse(value)
-        ok('ALLOWED_ORIGINS: %s is refused at import' % label,
-           isinstance(refused, str) and 'may not contain a wildcard' in refused,
-           refused)
-
-    for label, overrides, fragment in (
-            ('a short SECRET_KEY', {'SECRET_KEY': 'too-short'},
-             'at least 32 characters'),
-            ('a zero token lifetime', {'ACCESS_TOKEN_EXPIRE_MINUTES': '0'},
-             'at least 1 minute'),
-            ('a token lifetime over a day',
-             {'ACCESS_TOKEN_EXPIRE_MINUTES': '4321'}, 'must not exceed'),
-            ('an unsupported ALGORITHM', {'ALGORITHM': 'none'},
-             'must be one of')):
+    # No setting carries a policy beyond its type, so a value that a policy
+    # would refuse is accepted and then governs. Section 5.2 records the ones
+    # worth adding; these are what a deployment gets today.
+    for label, overrides in (
+            ('a five-character SECRET_KEY', {'SECRET_KEY': 'short'}),
+            ('a zero token lifetime',
+             {'ACCESS_TOKEN_EXPIRE_MINUTES': '0'}),
+            ('a token lifetime of three days',
+             {'ACCESS_TOKEN_EXPIRE_MINUTES': '4321'}),
+            ('a lower-case ALGORITHM', {'ALGORITHM': 'hs256'})):
         environment = dict(os.environ, ALLOWED_ORIGINS='http://localhost:3000')
         environment.update(overrides)
         done = subprocess.run([sys.executable, '-c', probe], env=environment,
                               capture_output=True, text=True)
-        ok('settings: %s is refused at import' % label,
-           done.returncode != 0 and fragment in done.stderr,
-           done.stderr.strip()[-160:])
+        ok('settings: %s imports without complaint' % label,
+           done.returncode == 0, done.stderr.strip()[-160:])
 
     without = dict(os.environ)
     without.pop('SECRET_KEY')
@@ -2739,26 +2496,27 @@ def main():
         ok('fail closed: no emulator or credential variable is in the '
            'environment', not any(os.environ.get(n) for n in FORBIDDEN_ENV))
 
-        log = io.StringIO()
-        logging.getLogger('app').handlers[0].setStream(log)
+        # The application configures logging with logging.basicConfig, whose
+        # formatter renders no `extra` keys, so the records themselves are
+        # captured rather than their printed text: correlation_id is an
+        # attribute on the record, and that is what section 1.11 documents.
+        log = Records()
+        logging.getLogger('app').addHandler(log)
         # TestClient as a context manager, so the startup event runs; a bare
         # TestClient(app) never fires it.
         with TestClient(app.main.app) as client:
             gate_composition(app, client, log)
-            store.reset(), reset_limits(app)
-            gate_auth(app, store, client, jwt, settings)
-            store.reset(), reset_limits(app)
-            gate_listings(app, store, client, log)
-            store.reset(), reset_limits(app)
-            gate_purchase(app, store, client)
             store.reset()
-            gate_limits(app, store, client)
+            gate_auth(app, store, client, jwt, settings)
+            store.reset()
+            gate_listings(app, store, client, log)
+            store.reset()
+            gate_purchase(app, store, client)
             gate_cors(client)
-        store.reset(), reset_limits(app)
+        store.reset()
         gate_messaging(app, store, TestClient)
-        gate_logging(app)
         gate_settings()
-
+        logging.getLogger('app').removeHandler(log)
     passed = sum(RESULTS)
     print('\n%d assertions, %d passed, %d failed'
           % (len(RESULTS), passed, len(RESULTS) - passed))
@@ -2771,50 +2529,36 @@ if __name__ == '__main__':
 
 ## 6.4 WHAT IT ASSERTS
 
-Two fail-closed preflight assertions and nine gates, 139 assertions in all. The order matters: the preflight first, because a run that reached real infrastructure would be worse than no run; composition next, because nothing else can be true if the application does not compose; and the settings gate last, because it spawns subprocesses.
+Two fail-closed preflight assertions and seven gates, 99 assertions in all. The order matters: the preflight first, because a run that reached real infrastructure would be worse than no run; composition next, because nothing else can be true if the application does not compose; and the settings gate last, because it spawns subprocesses.
+
+Several rows below record a **gap** rather than a guarantee — a request that a policy would refuse and this API accepts. They are assertions all the same: they pin what the code does today, so that the day someone adds the policy the harness fails and has to be updated deliberately. Each names the task in [section 5.2](#52-work-worth-picking-up) that would close it.
 
 | Gate | Assertions | What it establishes |
 | --- | --- | --- |
 | Fail closed | 2 | The application under test holds the in-memory double rather than a Firestore client, and no credential or emulator variable survives in the environment. |
 | A — composition | 7 | The startup hook logs exactly one line; 13 routes register across 9 unique paths; the four authentication operations are exactly `POST /register`, `POST /login`, `POST /logout`, `GET /me` under `/api/auth`; the nine pre-existing operations still serve the paths in [section 2.7](#27-the-routes-as-actually-served), character for character; OpenAPI publishes `tokenUrl: /api/auth/login`; `GET /openapi.json` answers 200. |
-| B — authentication and its policy | 40 | The flow: a fresh registration answers 201 with exactly `access_token`, `token_type`, `token`, `user`, one user document **and one `user_emails` marker**, and `Cache-Control: no-store`; a repeat of that address in different case answers 409 with `Email is already registered` and writes nothing more; a correct login answers 200 with `access_token` equal to `token`, again `no-store`; a wrong password and an unknown email both answer 401 with an identical detail and `WWW-Authenticate: Bearer`; `GET /me` answers 200 with exactly the seven public fields and `no-store`; `/me` with no token and with a malformed token both answer 401 with the same challenge; logout answers 200 with `{"detail": "Logged out"}`; the issued token carries exactly `sub` and `exp`, with the configured hour rather than the helper's 15-minute fallback. The policy: the address, the role and the names come back trimmed and lower-cased where they should be; eleven bad bodies — three role values, three addresses, three passwords, two names — each answer 422 with the write counter unchanged; and an address whose marker already exists answers 409 with no account written. No response payload contains `hashed_password` or a bcrypt prefix — checked against the raw response text, not the parsed body, so a nested occurrence cannot slip through. |
-| C — listing creation and its bounds | 27 | Two photos produce exactly two calls into the vision helper, each receiving one `bytes` payload, and both results are stored on the listing document; an empty photo list calls it not at all; every photo raising still answers 200, stores an empty analysis, and logs `photo analysis failed` twice with one shared `correlation_id` and an `error_type` — **and with no traceback and no provider text at `INFO`**, while the same failure at `DEBUG` carries both. Four unbounded photo requests — thirteen entries, an over-256-KiB entry, an over-900-KiB aggregate, a blank entry — each answer 422 with **zero** provider calls and zero writes. A caller who is not a seller answers 403; the record-count, aggregate-content and serialized-size guards each answer 422, the last one asserted through its own log line so it cannot pass by tripping a photo bound instead; the owner may update, another seller may not, a non-owner who is not an admin may not delete, and an administrator — created by an out-of-band write, because registration refuses the role — may. |
-| D — the purchase path and its guards | 18 | A purchase answers 200; the provider receives exactly `('pi_harness_abc', 15000.0, 'usd')` — three positional arguments, the payment-intent id as the token, the pinned currency; the transaction document is written once with `status: 'completed'` and the vehicle becomes `{'status': 'sold'}`. A declined result and a result with **no** `success` key both answer 400 with the store's write counter unchanged, no transaction recorded and the vehicle still `'available'`. Replaying a payment intent already recorded answers 409 with **zero** provider calls. Terms that match a vehicle record carrying `price` and `seller_id` answer 200; a disagreeing amount and a disagreeing seller each answer 400 before the charge, with the vehicle untouched. A caller who is not the buyer answers 403; an absent vehicle and a vehicle that is not `'available'` answer 400; a participant may read the transaction, a third party answers 403, an unknown id answers 404. |
-| E — attempt limits | 8 | The ceiling is reached by calling the limiter directly rather than by sending ten real sign-ins, because each of those costs a bcrypt verification and a burst that slow can straddle a window boundary — which looks exactly like a ceiling that does not work. One HTTP request then proves the refusal reaches the client: 429 with a `Retry-After` header and a detail naming neither the address nor its existence; an unknown address is refused by the same counter rather than distinguished; a correct credential answers 200 once the window is clear and clears the counters it was charged against; a registration past its own ceiling answers 429 and writes neither account nor marker; and a window that can no longer be consulted is pruned, so the counter map is bounded by live traffic. |
-| F — CORS | 2 | A preflight from `http://localhost:3000` answers 200 with the origin echoed and `access-control-allow-credentials: true`; a preflight from any other origin answers 400 with no allow-origin header at all. |
-| G — messaging | 8 | Both message routes are mounted — an unknown recipient produces the handler's own 404, not a route miss — and both are still broken: sending answers 500 on the unserializable `SERVER_TIMESTAMP` sentinel *after* the document has been written, and listing answers 500 on the duplicated `id` keyword (**HCF-8**). What *is* enforced is the body: blank, over 4000 characters, and over 16 KiB once encoded each answer 422 with nothing written. This is what makes "13 registered, 11 functional" a measurement rather than a claim. |
-| H — logging | 13 | See the table below. |
-| I — settings policy | 14 | Six accepted `ALLOWED_ORIGINS` forms — unset, one origin, comma-separated, JSON array, empty, whitespace — each parsed in its own subprocess, because `Settings` is constructed once at import and a value cannot be re-read in a live process; three wildcard forms each **refused** at import; a `SECRET_KEY` under 32 characters, a zero and an over-a-day token lifetime, and an unsupported `ALGORITHM` each refused; plus proof that unsetting a required variable still refuses the import with a `ValidationError`. |
-
-Gate H covers the logging code in `backend/app/main.py` branch by branch, because that code is what decides whether a diagnostic line is legible, forgeable or printed twice:
-
-| Behaviour | Assertion |
-| --- | --- |
-| A record with no `extra` renders no empty brackets | formatted output equals the format string's own result |
-| Several context keys render in a stable order | `[correlation_id=c1 listing_id=l1]`, alphabetical, from an unordered `extra` |
-| A context value cannot forge a log line | backslash, newline, carriage return and tab all escaped, backslash first so the escapes are unambiguous |
-| No standard `LogRecord` attribute leaks into the context | none of `levelno=`, `msg=`, `args=`, `pathname=`, `lineno=`, `name=` appears |
-| Context belongs to the message line, not the traceback | with `exc_info` set, line 1 ends in `[correlation_id=c9]` and line 2 is `Traceback (most recent call last):` |
-| The exception itself still reaches the log | `RuntimeError: boom` present in the rendered record |
-| The namespace is configured once, and correctly | exactly one handler on `app`, a `ContextFormatter`, the documented format string, level `INFO` |
-| Reconfiguration is idempotent | calling `_configure_application_logging()` again leaves the same single handler object |
-| An operator's configuration is never overwritten | with a handler already attached and level `WARNING`, propagation on, the call changes nothing |
-| Nothing prints twice | one `app.*` `INFO` record reaches the app handler exactly once and a root handler not at all |
+| B — authentication | 31 | A fresh registration answers 201 with exactly `access_token`, `token_type`, `token`, `user`, writes one user document and touches no other collection, and stores the body exactly as sent; a repeat of that address answers 409 with `Email is already registered` and writes nothing more; a correct login answers 200 with `access_token` equal to `token`; a wrong password and an unknown email both answer 401 with an identical detail and `WWW-Authenticate: Bearer`; `GET /me` answers 200 with exactly the seven public fields; `/me` with no token and with a malformed token both answer 401 with the same challenge; logout answers 200 with `{"detail": "Logged out"}`; the issued token carries exactly `sub` and `exp`, with the configured hour rather than the helper's 15-minute fallback. No response payload contains `hashed_password` or a bcrypt prefix — checked against the raw response text, not the parsed body, so a nested occurrence cannot slip through, and no response sets a `Cache-Control` header. **Gaps pinned here**: registration accepts `role: admin`, an address with no domain, a one-character password and a blank name, all with 201 and all stored (**NT-24**); sign-in matches the address exactly, so the same account in a different case answers 401 (**NT-24**); and a missing field is a 422 only because Pydantic requires it, not because anything checks it. |
+| C — listing creation | 22 | Two photos produce exactly two calls into the vision helper, each receiving one `bytes` payload, and both results are stored on the listing document; an empty photo list calls it not at all; every photo raising still answers 200, stores an empty analysis, and logs `photo analysis failed` twice at `ERROR` through `logger.exception` — with the traceback attached and one shared `correlation_id` on both records; one photo of two failing keeps the other's result. A caller who is not a seller answers 403; the record-count, aggregate-content and serialized-size guards each answer 422, the last one asserted through its own log record so it cannot pass by tripping a maintenance bound instead; the owner may update, another seller may not, a non-owner who is not an admin may not delete, and an administrator may. **Gap pinned here**: nothing bounds the photo list, so thirteen photos mean thirteen outbound provider calls and a blank entry is accepted (**NT-25**). |
+| D — the purchase path | 14 | A purchase answers 200; the provider receives exactly `('pi_harness_abc', 15000.0, 'usd')` — three positional arguments, the payment-intent id as the token, the pinned currency; the transaction document is written once with `status: 'completed'` and the vehicle becomes `{'status': 'sold'}`. A declined result and a result with **no** `success` key both answer 400 with the store's write counter unchanged, no transaction recorded and the vehicle still `'available'`. A caller who is not the buyer answers 403; an absent vehicle and a vehicle that is not `'available'` answer 400; a participant may read the transaction, a third party answers 403, an unknown id answers 404. **Gaps pinned here**: replaying a payment intent that is already recorded charges it a second time (**NT-27**), and a caller may name its own price and its own seller even when the vehicle record contradicts both (**NT-41**). |
+| E — CORS | 2 | A preflight from `http://localhost:3000` answers 200 with the origin echoed and `access-control-allow-credentials: true`; a preflight from any other origin answers 400 with no allow-origin header at all. |
+| F — messaging | 7 | Both message routes are mounted — an unknown recipient produces the handler's own 404, not a route miss — and both are still broken: sending answers 500 on the unserializable `SERVER_TIMESTAMP` sentinel *after* the document has been written, and listing answers 500 on the duplicated `id` keyword (**HCF-8**). This is what makes "13 registered, 11 functional" a measurement rather than a claim. **Gap pinned here**: nothing bounds the body, so a blank message and a 5000-character one both reach the write (**NT-25**). |
+| G — settings | 14 | Nine accepted `ALLOWED_ORIGINS` forms — unset, one origin, comma-separated, spaced entries, a JSON array, empty, whitespace, a bare `*` and a `*` pattern — each parsed in its own subprocess, because `Settings` is constructed once at import and a value cannot be re-read in a live process; plus proof that unsetting a required variable still refuses the import with a `ValidationError`. **Gaps pinned here**: a five-character `SECRET_KEY`, a zero token lifetime, a three-day lifetime and a lower-case `ALGORITHM` all import without complaint, because no setting carries a policy beyond its type. |
 
 ## 6.5 WHAT IT DOES NOT COVER
 
 Stated plainly, because a coverage claim is worth nothing without its boundary:
 
 - **No real provider traffic.** Cloud Vision and Stripe are stood in for, so the defects inside them (**HCF-3**, **HCF-4**) are neither reproduced nor cleared here. The harness proves the *call sites* are correct — arity, types, synchronicity, how the result is read — and nothing about the providers themselves.
-- **The double is not an emulator.** It models call and response shape only: no index requirements, no ordering guarantees, no transactions, and no concurrency of any kind. Gate B asserts the *mechanism* that makes registration unique — a pre-claimed marker answers 409 — but only an emulator run can show that four simultaneous registrations for one address yield exactly one account, and the same goes for a replayed payment intent under real query semantics. Run both separately, under the fail-closed conditions in [section 1.10.1](#1101-the-two-sanctioned-stubs), and do not read a green harness as covering them.
-- **The attempt ceilings are proven per process.** Gate E shows the ceiling and the 429; the counters are module state, so nothing here says anything about a deployment running several workers (**NT-26**).
-- **The two open purchase defects are not reproduced.** Gate D covers the replay guard, which exists; it does not and cannot cover two genuinely simultaneous buyers, or a crash between the two final writes (**HCF-14**).
-- **A `photos` entry that is already `bytes`.** The handler's `isinstance(photo, str)` guard has a bytes branch, and it is unreachable through HTTP: `VehicleListing.photos` is `List[str]`, and Pydantic v1 coerces every entry to `str` before the handler sees it. The branch is defensive, and it is covered by inspection rather than by a request — do not read the 85 as covering it.
+- **The double is not an emulator.** It models call and response shape only: no index requirements, no ordering guarantees, no transactions, and no concurrency of any kind. Gate B shows that a *sequential* repeat of an address answers 409; it cannot show what two simultaneous registrations do, and the answer there is that both can succeed, because the check is a query rather than a conditional write ([section 3.12](#312-one-address-is-one-account-and-how-it-is-not-enforced)). Take that to an emulator, under the fail-closed conditions in [section 1.10.1](#1101-the-two-sanctioned-stubs), and do not read a green harness as covering it.
+- **Nothing rate-limits anything, so there is no ceiling to prove.** Both public routes accept as many attempts as a caller cares to send (**NT-26**), and the harness records that gap in gate B rather than asserting a limit that does not exist.
+- **The purchase path's concurrency defects are not reproduced.** Gate D pins that a replay is charged twice, which is the sequential case; two genuinely simultaneous buyers, and a crash between the transaction write and the `'sold'` update, are outside what a double can model (**NT-28**).
+- **A `photos` entry that is already `bytes`.** The handler's `isinstance(photo, str)` guard has a bytes branch, and it is unreachable through HTTP: `VehicleListing.photos` is `List[str]`, and Pydantic v1 coerces every entry to `str` before the handler sees it. The branch is defensive, and it is covered by inspection rather than by a request — do not read the 99 as covering it.
+- **What the log *prints*, as opposed to what it carries.** Gate C asserts the `correlation_id` on the record object, because the application configures logging with `logging.basicConfig` and its formatter renders no `extra` keys ([section 1.11](#111-where-the-logs-go)). Whether an operator can *see* that id depends on the formatter they configure, and no assertion here covers that.
 - **Nothing outside the backend's HTTP surface.** The SPA, the Celery module (**NT-6**, which cannot even be imported), the Terraform under `infrastructure/`, and performance or load behaviour of any kind.
 - **It is not a regression gate.** Nothing runs it for you. Continuous integration is red for four unrelated reasons (**NT-16**) and would not run this script even when green, so it protects the properties above only at the moment you choose to run it.
 
 ## 6.6 EXTENDING IT
 
-Add a case where its gate lives, and keep the four properties that make the script safe to run: state is reset between gates with `store.reset()`, the attempt counters are reset with `reset_limits(app)` in the same breath — they are per-process module state, and an unrelated gate would otherwise exhaust a ceiling that gate E exercises on purpose — a stand-in is installed with `mock.patch.object` so it is removed again afterwards, and no assertion depends on the order of anything Firestore returned. Two habits are worth copying — assert against the *store* as well as the response when a handler's real effect is a write, and assert a negative with the write counter (`store.writes` unchanged) rather than with the absence of a document, because the second passes for the wrong reason when a name is misspelled.
+Add a case where its gate lives, and keep the three properties that make the script safe to run: state is reset between gates with `store.reset()`, a stand-in is installed with `mock.patch.object` so it is removed again afterwards, and no assertion depends on the order of anything Firestore returned. Three habits are worth copying — assert against the *store* as well as the response when a handler's real effect is a write; assert a negative with the write counter (`store.writes` unchanged) rather than with the absence of a document, because the second passes for the wrong reason when a name is misspelled; and when what you are pinning is a **gap** rather than a guarantee, say so in the label and name the task that would close it, so that the failure it produces later reads as "the gap was closed" instead of "the harness broke".
 
 If a case you want needs a Firestore behaviour the double does not model — an index requirement, a query shape it does not implement — do not quietly point this script at an emulator. Take the emulator-backed profile in [section 1.7.1](#171-the-local-development-profile) instead, which already carries the guards ([section 3.8](#38-a-clean-boot-still-stops-in-the-payment-module) contrasts the two), and keep this script's fail-closed preflight exactly as it is.

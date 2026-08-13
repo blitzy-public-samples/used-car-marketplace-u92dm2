@@ -18,94 +18,11 @@ logger = logging.getLogger(__name__)
 _MAX_MAINTENANCE_RECORDS = 20
 _MAX_MAINTENANCE_CONTENT_BYTES = 900 * 1024
 _MAX_SERIALIZED_LISTING_BYTES = 1_000_000
-# The same three bounds for the photo list, which had none at all: every entry
-# costs one call into the vision provider, so an unbounded list is a request
-# that amplifies into arbitrarily many outbound calls, provider charges and log
-# records before the serialized-size guard further down can object. Bounded
-# before the first call, never after it.
-_MAX_PHOTOS = 12
-_MAX_PHOTO_BYTES = 256 * 1024
-_MAX_PHOTO_TOTAL_BYTES = 900 * 1024
 
 router = APIRouter()
 
-
-def _bounded_photo_payloads(photos: List[str],
-                            correlation_id: str) -> List[bytes]:
-    """Normalise a photo list to bytes, or refuse it before any provider call.
-
-    Returns one payload per photo, in order, each of the `bytes` type
-    analyze_vehicle_photo declares. Raises 422 for a list that is too long, an
-    entry that is blank or too large, or an aggregate that is too large. The
-    response detail names none of those, because which bound was reached is
-    operator information rather than caller information; the log line carries
-    it, keyed to the request's correlation id.
-    """
-    if len(photos) > _MAX_PHOTOS:
-        logger.warning(
-            "too many photos",
-            extra={"correlation_id": correlation_id, "count": len(photos)},
-        )
-        raise HTTPException(
-            status_code=422,
-            detail="Unable to process vehicle photos",
-        )
-    payloads = []
-    total_bytes = 0
-    for photo in photos:
-        payload = photo.encode('utf-8') if isinstance(photo, str) else photo
-        if not payload:
-            logger.warning(
-                "blank photo entry",
-                extra={"correlation_id": correlation_id},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail="Unable to process vehicle photos",
-            )
-        # The encoded payload is measured, not the string, because the encoded
-        # payload is what is handed to the provider.
-        if len(payload) > _MAX_PHOTO_BYTES:
-            logger.warning(
-                "photo entry is too large",
-                extra={"correlation_id": correlation_id,
-                       "bytes": len(payload)},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail="Unable to process vehicle photos",
-            )
-        total_bytes += len(payload)
-        if total_bytes > _MAX_PHOTO_TOTAL_BYTES:
-            logger.warning(
-                "aggregate photo payload is too large",
-                extra={"correlation_id": correlation_id,
-                       "bytes": total_bytes},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail="Unable to process vehicle photos",
-            )
-        payloads.append(payload)
-    return payloads
-
-# A plain def, not async def: this body awaits nothing and its real work is
-# three blocking synchronous clients -- Cloud Vision per photo, PyPDF2 per
-# maintenance record, then a Firestore write. Declared async, all of that ran
-# directly on the event loop and one slow provider call delayed every other
-# in-flight request; declared sync, Starlette runs it in its threadpool
-# instead. The signature a caller sees is unchanged.
-#
-# One consequence to know rather than discover: app/services/
-# document_processing.py guards PDF extraction with SIGALRM only on the main
-# thread and falls back to an unguarded read elsewhere, so that wall-clock
-# ceiling no longer applies here. What still bounds this work is the aggregate
-# content ceiling below, that module's own page and byte ceilings, and the fact
-# that a slow document now occupies one threadpool thread instead of the whole
-# process. A provider-level timeout is the real answer and needs those
-# signatures opened.
 @router.post('/listings')
-def create_listing(listing: VehicleListing, current_user: User = Depends(get_current_user)):
+async def create_listing(listing: VehicleListing, current_user: User = Depends(get_current_user)):
     # Validate the current user's role (must be a seller)
     if current_user.role != 'seller':
         raise HTTPException(status_code=403, detail="Only sellers can create listings")
@@ -117,39 +34,22 @@ def create_listing(listing: VehicleListing, current_user: User = Depends(get_cur
 
     # Analyze vehicle photos. analyze_vehicle_photo is synchronous and accepts
     # ONE image payload as bytes, so it is called without await, once per
-    # photo. The previous `await analyze_vehicle_photo(listing.photos)` was
-    # wrong twice over, and independently, so no listing could ever be
-    # created. It handed the whole List[str] to a bytes parameter, which the
-    # callee rejects on its first statement with TypeError: a bytes-like
-    # object is required, not 'list' -- for an empty list too, so no photo
-    # count avoided it. And a dict, which is what the callee returns when it
-    # does succeed, cannot be awaited: the await would have been wrong even
-    # with a correct argument. Normalising to bytes and bounding the list both
-    # happen first, in one place, so that nothing outbound is attempted for a
-    # request that is going to be refused anyway. Each call is then guarded
-    # because the vision pipeline can still fail per photo, and a degraded
-    # analysis must never become a 500 for the seller.
-    payloads = _bounded_photo_payloads(listing.photos, correlation_id)
+    # photo, with each entry normalised to bytes the same way the maintenance
+    # loop below does. The previous `await analyze_vehicle_photo(
+    # listing.photos)` was wrong twice over, and independently, so no listing
+    # could ever be created: it handed the whole List[str] to a bytes
+    # parameter, and a dict -- what the callee returns when it does succeed --
+    # cannot be awaited either. Each call is guarded because the vision
+    # pipeline can still fail per photo, and a degraded analysis must never
+    # become a 500 for the seller.
     photo_analysis = []
-    for payload in payloads:
+    for photo in listing.photos:
+        payload = photo.encode('utf-8') if isinstance(photo, str) else photo
         try:
             photo_analysis.append(analyze_vehicle_photo(payload))
-        except Exception as failure:
-            # The class of failure and the correlation id, and nothing else. A
-            # traceback carries absolute paths and provider text, and the
-            # provider's own message can quote the request that caused it, so
-            # both belong in a sink an operator opts into rather than in the
-            # default output of a production service.
-            logger.warning(
+        except Exception:
+            logger.exception(
                 "photo analysis failed",
-                extra={
-                    "correlation_id": correlation_id,
-                    "error_type": type(failure).__name__,
-                },
-            )
-            logger.debug(
-                "photo analysis failure detail",
-                exc_info=True,
                 extra={"correlation_id": correlation_id},
             )
 
@@ -187,20 +87,9 @@ def create_listing(listing: VehicleListing, current_user: User = Depends(get_cur
             maintenance_data.append(
                 process_maintenance_document(content, doc_format)
             )
-    except Exception as failure:
-        # Sanitized for the same reason as the photo loop above: a PyPDF2
-        # traceback quotes file contents and paths, and this handler is
-        # reachable by any caller who registered itself as a seller.
-        logger.warning(
+    except Exception:
+        logger.exception(
             "maintenance processing failed",
-            extra={
-                "correlation_id": correlation_id,
-                "error_type": type(failure).__name__,
-            },
-        )
-        logger.debug(
-            "maintenance processing failure detail",
-            exc_info=True,
             extra={"correlation_id": correlation_id},
         )
         raise HTTPException(

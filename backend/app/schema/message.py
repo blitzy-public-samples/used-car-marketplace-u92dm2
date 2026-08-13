@@ -1,17 +1,5 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 from typing import Any, Optional
-
-# Bounds on the message body. It reaches Firestore through
-# app/api/messages.py's message.dict() with nothing in between, so an
-# unbounded body is a request that writes as much as the caller cares to
-# send: Firestore refuses a document over 1 MiB with an error the frozen
-# handler does not catch, and everything under that limit is stored. The
-# character cap is the readable limit; the byte cap is the one that actually
-# protects the write, because a character outside ASCII costs up to four
-# bytes. A validator rather than a check in the handler, so an oversized or
-# blank body is a 422 before the recipient lookup and before the write.
-_MAX_CONTENT_CHARACTERS = 4000
-_MAX_CONTENT_BYTES = 16 * 1024
 
 
 class Message(BaseModel):
@@ -30,30 +18,14 @@ class Message(BaseModel):
     # and the DatetimeWithNanoseconds value returned on read.
     timestamp: Optional[Any] = None
 
-    @validator('content')
-    def _content_is_present_and_bounded(cls, value: str) -> str:
-        content = value.strip()
-        if not content:
-            raise ValueError('content must not be blank')
-        if len(content) > _MAX_CONTENT_CHARACTERS:
-            raise ValueError(
-                'content must not exceed %d characters'
-                % _MAX_CONTENT_CHARACTERS
-            )
-        if len(content.encode('utf-8')) > _MAX_CONTENT_BYTES:
-            raise ValueError(
-                'content must not exceed %d bytes when UTF-8 encoded'
-                % _MAX_CONTENT_BYTES
-            )
-        return content
-
     # id, sender_id, read and timestamp are server-owned, and it is worth
-    # stating why they are not forced to a server value here: this one model
+    # stating why nothing here forces them to a server value: this one model
     # is bound to the request body AND rebuilt from stored documents by
     # app/api/messages.py, on the send response and on every read. A
     # validator that discarded an incoming id would also discard the id that
-    # handler passes on the way back out, which would turn a client-side
-    # nuisance into wrong data. Until the frozen route logic can be changed
-    # (HCF-8), sender_id is protected by the handler overwriting it, while a
-    # client-supplied id or read flag is stored as sent -- recorded as a
-    # residual in documentation/ONBOARDING.md rather than half-guarded here.
+    # handler passes on the way back out, and one that rejected a stored
+    # value would turn a single bad document into a failed read of the whole
+    # list. Until the frozen route logic can be changed (HCF-8), sender_id is
+    # protected by the handler overwriting it, while a client-supplied id or
+    # read flag is stored as sent -- recorded as a residual in
+    # documentation/ONBOARDING.md rather than half-guarded here.
