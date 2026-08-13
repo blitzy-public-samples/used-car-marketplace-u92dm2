@@ -19,14 +19,16 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
 
     class Config:
-        # A .env file is read only when pydantic's optional python-dotenv
-        # extra is installed. It is not part of this project's dependency
-        # set, so with the documented install a .env file present in the
-        # working directory makes Settings() raise ImportError at import.
-        # Exported environment variables are the supported path; see
-        # documentation/ONBOARDING.md section 1.5.
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+        # No env_file is declared, deliberately. Pydantic v1 reads a .env file
+        # only through its optional python-dotenv extra, which this project
+        # does not install, so a declared env_file could never load a file --
+        # it could only make Settings() raise ImportError the moment one
+        # existed in the working directory, killing the process instead of
+        # configuring it and reinstating the import-time boot failure this
+        # module was repaired to remove. Exported environment variables are
+        # the only configuration source; see documentation/ONBOARDING.md
+        # section 1.5. Re-declare env_file only together with an authorised
+        # python-dotenv dependency (open task NT-2).
 
         @classmethod
         def parse_env_var(cls, field_name: str, raw_val: str):

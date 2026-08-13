@@ -29,7 +29,13 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
 
     # One correlation id is generated per request and shared by every log line
     # below, so a single failing listing can be traced across both the photo
-    # and the maintenance loop.
+    # and the maintenance loop. It is carried twice, on purpose: interpolated
+    # into the message so it is legible in the log an operator actually reads,
+    # and passed in `extra` so it stays a field of the record for a structured
+    # handler to pick up. Only the second was here before, and the
+    # application configures logging with logging.basicConfig, whose default
+    # format renders no `extra` keys -- so every one of these lines was
+    # emitted with the one identifier that ties a request together invisible.
     correlation_id = str(uuid.uuid4())
 
     # Analyze vehicle photos. analyze_vehicle_photo is synchronous and accepts
@@ -49,7 +55,8 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
             photo_analysis.append(analyze_vehicle_photo(payload))
         except Exception:
             logger.exception(
-                "photo analysis failed",
+                "photo analysis failed [correlation_id=%s]",
+                correlation_id,
                 extra={"correlation_id": correlation_id},
             )
 
@@ -60,7 +67,8 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
     records = listing.maintenance_records
     if len(records) > _MAX_MAINTENANCE_RECORDS:
         logger.warning(
-            "too many maintenance records",
+            "too many maintenance records [correlation_id=%s]",
+            correlation_id,
             extra={"correlation_id": correlation_id},
         )
         raise HTTPException(
@@ -89,7 +97,8 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
             )
     except Exception:
         logger.exception(
-            "maintenance processing failed",
+            "maintenance processing failed [correlation_id=%s]",
+            correlation_id,
             extra={"correlation_id": correlation_id},
         )
         raise HTTPException(
@@ -108,7 +117,8 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
     serialized_size = len(json.dumps(listing_data, default=str).encode())
     if serialized_size > _MAX_SERIALIZED_LISTING_BYTES:
         logger.warning(
-            "listing exceeds serialized size budget",
+            "listing exceeds serialized size budget [correlation_id=%s]",
+            correlation_id,
             extra={"correlation_id": correlation_id},
         )
         raise HTTPException(
