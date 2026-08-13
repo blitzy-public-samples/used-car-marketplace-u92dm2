@@ -1,42 +1,86 @@
 {
-  "name": "task-management-frontend",
+  "name": "used-car-marketplace-frontend",
   "version": "1.0.0",
-  "description": "Frontend for Task Management Application",
+  "description": "Frontend for the Used Car Marketplace platform (React + TypeScript + Vite)",
   "private": true,
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
   "dependencies": {
     "@reduxjs/toolkit": "^1.9.5",
+    "@stripe/react-stripe-js": "^2.3.0",
+    "@stripe/stripe-js": "^2.1.6",
     "axios": "^1.4.0",
+    "browser-image-compression": "^2.0.2",
+    "date-fns": "^2.30.0",
+    "dompurify": "^3.0.6",
+    "formik": "^2.4.5",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-dropzone": "^14.2.3",
     "react-redux": "^8.1.1",
     "react-router-dom": "^6.14.1",
-    "tailwindcss": "^3.3.2"
+    "zod": "^3.22.2"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^5.16.5",
     "@testing-library/react": "^14.0.0",
     "@testing-library/user-event": "^14.4.3",
+    "@types/dompurify": "^3.0.3",
     "@types/jest": "^29.5.2",
     "@types/node": "^20.4.1",
     "@types/react": "^18.2.14",
     "@types/react-dom": "^18.2.6",
+    "@typescript-eslint/eslint-plugin": "^6.7.3",
+    "@typescript-eslint/parser": "^6.7.3",
+    "@vitejs/plugin-react": "^4.0.3",
     "autoprefixer": "^10.4.14",
+    "eslint": "^8.50.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "jsdom": "^22.1.0",
     "postcss": "^8.4.25",
+    "tailwindcss": "^3.3.2",
     "typescript": "^5.1.6",
     "vite": "^4.4.2",
-    "@vitejs/plugin-react": "^4.0.3"
+    "vitest": "^0.34.6"
   },
   "scripts": {
     "start": "vite",
+    "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
   "eslintConfig": {
+    "root": true,
+    "env": {
+      "browser": true,
+      "es2020": true
+    },
+    "parser": "@typescript-eslint/parser",
+    "parserOptions": {
+      "ecmaVersion": "latest",
+      "sourceType": "module",
+      "ecmaFeatures": {
+        "jsx": true
+      }
+    },
+    "plugins": [
+      "@typescript-eslint",
+      "react-hooks"
+    ],
     "extends": [
-      "react-app",
-      "react-app/jest"
+      "eslint:recommended",
+      "plugin:@typescript-eslint/recommended",
+      "plugin:react-hooks/recommended"
+    ],
+    "ignorePatterns": [
+      "dist",
+      "build",
+      "node_modules"
     ]
   },
   "browserslist": {

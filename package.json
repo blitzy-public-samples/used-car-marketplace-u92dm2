@@ -1,0 +1,20 @@
+{
+  "name": "used-car-marketplace",
+  "version": "1.0.0",
+  "description": "Used Car Marketplace - npm workspace root. The installable Node package lives in frontend/. The Python service lives in backend/.",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "scripts": {
+    "start": "npm run start --workspace=frontend",
+    "dev": "npm run dev --workspace=frontend",
+    "build": "npm run build --workspace=frontend",
+    "test": "npm run test --workspace=frontend",
+    "lint": "npm run lint --workspace=frontend"
+  }
+}

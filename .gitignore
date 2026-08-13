@@ -1,0 +1,32 @@
+# Ignore rules for the Used Car Marketplace repository.
+#
+# Added together with the root npm workspace manifest: before it existed the
+# repository had no ignore rules at all, and `npm install` at the repository
+# root failed with ENOENT instead of installing anything. Now that the install
+# succeeds it materializes a large hoisted node_modules tree at the repository
+# root (the root is an npm workspace root; the installable Node package lives
+# in frontend/), so these rules keep `git status` meaningful.
+#
+# Note: package-lock.json is deliberately NOT ignored - the single root lockfile
+# is committed so that `npm ci` is reproducible locally and in CI.
+
+# Node.js dependencies (hoisted to a single root tree by npm workspaces)
+node_modules/
+
+# Frontend build output (Vite writes dist/; build/ is legacy CRA output)
+frontend/dist/
+frontend/build/
+
+# Local environment files / overrides - never commit real credentials
+.env
+.env.*.local
+
+# Python backend artifacts (scripts/setup_environment.sh creates ./venv)
+venv/
+__pycache__/
+*.pyc
+
+# Package manager debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
