@@ -204,22 +204,19 @@ from typing import (
     Tuple,
 )
 
-from google.api_core.exceptions import (
-    Aborted,
-    AlreadyExists,
-    Cancelled,
-    DeadlineExceeded,
-    InternalServerError,
-    NotFound,
-    ResourceExhausted,
-    RetryError,
-    ServiceUnavailable,
-)
+# Only the two exceptions this module names in its own logic are
+# imported. The transient family is not: it arrives as
+# ``DATASTORE_UNAVAILABLE_ERRORS`` from ``app/db/firestore.py``, which is
+# where the bounded retry policy that produces those faults also lives,
+# so the classification has exactly one home.
+from google.api_core.exceptions import AlreadyExists, NotFound
 from google.cloud import firestore
 from pydantic import ValidationError
 
 from app.core.config import settings
 from app.db.firestore import (
+    DATASTORE_CALL,
+    DATASTORE_UNAVAILABLE_ERRORS,
     create_document_with_id,
     db,
     run_in_read_only_transaction,
@@ -433,17 +430,17 @@ MODERATION_REASON_REQUIRED_STATUS = ModerationStatus.REJECTED.value
 # hides behind a log line that reads like routine deferred work.
 #
 # ABORTED is the lock-contention verdict, RetryError is the client
-# giving up after its own retries, and the rest are the standard
-# transient gRPC conditions.
-TRANSIENT_PROVIDER_ERRORS = (
-    Aborted,
-    Cancelled,
-    DeadlineExceeded,
-    InternalServerError,
-    ResourceExhausted,
-    RetryError,
-    ServiceUnavailable,
-)
+# giving up after the bounded retry policy in ``app/db/firestore.py``,
+# and the rest are the standard transient gRPC conditions.
+#
+# TAKEN FROM THE DATASTORE MODULE rather than restated here, because the
+# same classification decides two things that must not disagree: which
+# faults this module absorbs as deferred publication work, and which
+# faults the HTTP layers answer with a 503. Two literal tuples would
+# agree until somebody added a condition to one of them. The local name
+# is kept because this module's docstrings and every ``except`` clause
+# below refer to it.
+TRANSIENT_PROVIDER_ERRORS = DATASTORE_UNAVAILABLE_ERRORS
 
 
 class RatingError(Exception):
@@ -614,27 +611,63 @@ class TransactionInvariantError(Exception):
     refuses, and when this is raised from inside the submission
     transaction Firestore rolls that transaction back.
 
-    INTERNAL, and deliberately NOT a :class:`RatingError`, exactly like
-    :class:`PublicationInvariantError` above. The distinction is the
-    whole point of this class rather than a naming preference:
+    Deliberately NOT a :class:`RatingError`, exactly like
+    :class:`PublicationInvariantError` above, because it does not belong
+    to the six-refusal vocabulary those classes define: a ``RatingError``
+    is something THE CALLER CAUSED and can act on - get verified,
+    complete the transaction, stop rating a stranger - whereas this is a
+    defect in PERSISTED DATA that no caller provoked and none can repair.
 
-    * A ``RatingError`` is a refusal THE CALLER CAUSED and can act on -
-      get verified, complete the transaction, stop rating a stranger -
-      so it carries prose fit to show them and the router maps it to a
-      4xx. There are exactly six of those, and they are the complete
-      client-facing vocabulary of this feature.
-    * This is a defect in PERSISTED DATA that no caller did anything to
-      provoke and none can repair. Reporting it as a refusal would tell
-      a well-behaved user their request was at fault, and would widen the
-      documented failure contract of two endpoints with a state that only
-      an operator can clear.
+    IT IS STILL ANSWERED, AND WHY THAT CHANGED
+    ---------------------------------------------------------------
+    This class was previously left unmapped by the router so that it
+    surfaced as an unhandled 500, on the reasoning that a server-side
+    data fault should not be reported as a client error. The reasoning
+    was half right and the outcome was wrong. An unhandled exception is
+    rendered by the framework as ``text/plain`` "Internal Server Error",
+    which is outside this API's error envelope entirely - no ``detail``,
+    nothing a client can parse, and nothing the interface can show a
+    user who has done nothing wrong. It also put two endpoints outside
+    the status set their own contract publishes.
 
-    It is therefore left unmapped by the router, which catches
-    ``RatingError`` alone, so it surfaces as a 500 and is logged at the
-    point it is detected with the offending transaction named. That is
-    the honest signal: the request was fine, the stored data is not.
+    So the router now maps this to **409 Conflict**, which is the
+    accurate reading rather than a convenient one: the request is well
+    formed and the caller is authorized, and what refuses it is the
+    stored STATE of the transaction it cites - the same reason
+    :class:`TransactionNotCompleted` is a 409. The caller is told the
+    transaction cannot be rated until its record is repaired, which is
+    true, actionable as far as it goes, and free of internals.
 
+    Nothing about the operator's signal is given up. The guard logs at
+    ERROR with the offending transaction named at the point of
+    detection, and this exception's ``str()`` keeps the specific internal
+    detail - which field, which document - while :attr:`message` carries
+    the caller-facing sentence. The two audiences are served by different
+    attributes rather than by choosing between them.
+
+    Nothing is written on this path either: the guard refuses before the
+    submission transaction stages anything, and when it is raised from
+    inside that transaction Firestore rolls it back.
     """
+
+    # Caller-facing prose, declared as a class attribute for the same
+    # reason ``RatingError`` declares one: the router reads ``message``
+    # to build the response ``detail``, and the eligibility endpoint
+    # reports the identical sentence, so the two cannot drift. It names
+    # no field and no document - the internals stay in the log and in
+    # ``str(error)``.
+    message = (
+        'This transaction is missing information a rating requires, so '
+        'it cannot be rated until its record is repaired'
+    )
+
+    def __init__(self, detail: Optional[str] = None) -> None:
+        # ``detail`` is the INTERNAL description - which transaction,
+        # which field - and it becomes ``str(self)`` so a log line and a
+        # traceback carry it. It deliberately does not become
+        # ``message``: that attribute is what a caller is shown.
+        self.detail = detail or type(self).message
+        super().__init__(self.detail)
 
 
 def _rating_document_id(transaction_id: str, rater_id: str) -> str:
@@ -727,7 +760,7 @@ def _load_transaction(transaction_id: str) -> Optional[Dict[str, Any]]:
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
         .document(transaction_id)
-        .get()
+        .get(**DATASTORE_CALL)
     )
     if not snapshot.exists:
         return None
@@ -1520,7 +1553,9 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
         return False
     document_id = _rating_document_id(transaction_id, rater_id)
     snapshot = (
-        db.collection(RATINGS_COLLECTION).document(document_id).get()
+        db.collection(RATINGS_COLLECTION)
+        .document(document_id)
+        .get(**DATASTORE_CALL)
     )
     return bool(snapshot.exists)
 
@@ -1577,7 +1612,9 @@ def _reported_publication_state(
         return True
     try:
         snapshot = (
-            db.collection(RATINGS_COLLECTION).document(document_id).get()
+            db.collection(RATINGS_COLLECTION)
+            .document(document_id)
+            .get(**DATASTORE_CALL)
         )
         if not snapshot.exists:
             # The rating was committed a moment ago, so this is either a
@@ -1691,7 +1728,7 @@ def _submit_transaction_body(
     user_snapshot = (
         db.collection(USERS_COLLECTION)
         .document(rater_id)
-        .get(transaction=transaction)
+        .get(transaction=transaction, **DATASTORE_CALL)
     )
     if not user_snapshot.exists:
         # The caller authenticated against a document that has since
@@ -1741,7 +1778,7 @@ def _submit_transaction_body(
         transaction_snapshot = (
             db.collection(TRANSACTIONS_COLLECTION)
             .document(transaction_id)
-            .get(transaction=transaction)
+            .get(transaction=transaction, **DATASTORE_CALL)
         )
         transaction_body = (
             (transaction_snapshot.to_dict() or {})
@@ -1764,7 +1801,9 @@ def _submit_transaction_body(
 
     # --- read 3: the target key, for the duplicate report ---
     rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
-    existing = rating_ref.get(transaction=transaction)
+    existing = rating_ref.get(
+        transaction=transaction, **DATASTORE_CALL
+    )
     if existing.exists:
         raise DuplicateRating()
 
@@ -1849,7 +1888,10 @@ def evaluate_eligibility(
         An :class:`EligibilityDecision`. ``ratee_id`` and ``direction``
         are populated only once the caller is confirmed a participant of
         a transaction that names both parties, so a rejected caller
-        learns nothing about the counterparty.
+        learns nothing about the counterparty. EVERY outcome is reported
+        as a decision, including the malformed-transaction case that the
+        guard sequence raises - see the conversion below - so this
+        function raises nothing a caller has to classify.
     """
     caller_id = getattr(caller, 'id', None) or ''
 
@@ -1872,7 +1914,31 @@ def evaluate_eligibility(
     # for a more fundamental reason - an unverified caller, or one who is
     # not a party to the transaction - and whose ``already_rated`` value
     # nobody can act on anyway.
-    outcome = _assess(transaction_id, caller, transaction=transaction)
+    #
+    # Guard 6 RAISES rather than reporting, because a malformed
+    # transaction document is a data defect and not a refusal the caller
+    # caused. This function's contract is nonetheless to REPORT every
+    # outcome - it is the answer an interface renders to decide whether
+    # the submission control is available - so the raise is converted
+    # here into the decision it implies: not eligible, with the same
+    # sentence the write path answers 409 with. Letting it propagate
+    # instead is what previously took this endpoint outside its own
+    # published status set, and left the interface with no reason to
+    # show. ``ratee_id`` and ``direction`` stay ``None``: nothing can be
+    # rated against this transaction until an operator repairs it, so
+    # there is no counterparty for the interface to prepare a rating
+    # for. The write path is untouched by this - it still raises, which
+    # is what makes the refusal a status code there.
+    try:
+        outcome = _assess(transaction_id, caller, transaction=transaction)
+    except TransactionInvariantError as invariant:
+        return EligibilityDecision(
+            eligible=False,
+            reason=invariant.message,
+            ratee_id=None,
+            direction=None,
+            already_rated=False,
+        )
     error = outcome['error']
     if error is not None:
         return EligibilityDecision(
@@ -2225,7 +2291,7 @@ def _locked_transaction(
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
         .document(transaction_id)
-        .get(transaction=transaction)
+        .get(transaction=transaction, **DATASTORE_CALL)
     )
     if not snapshot.exists:
         raise PublicationInvariantError(
@@ -2373,7 +2439,9 @@ def _locked_user_state(
             'Ratee {0!r} is not a usable user document ID'.format(user_id)
         )
     user_ref = db.collection(USERS_COLLECTION).document(user_id)
-    snapshot = user_ref.get(transaction=transaction)
+    snapshot = user_ref.get(
+        transaction=transaction, **DATASTORE_CALL
+    )
     if not snapshot.exists:
         raise PublicationInvariantError(
             'Ratee {0} has no user document to credit'.format(user_id)
@@ -2419,7 +2487,9 @@ def _locked_rating(
         idempotent, so no score can be counted twice.
     """
     rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
-    snapshot = rating_ref.get(transaction=transaction)
+    snapshot = rating_ref.get(
+        transaction=transaction, **DATASTORE_CALL
+    )
     if not snapshot.exists:
         return None
     body = snapshot.to_dict() or {}
@@ -2482,7 +2552,9 @@ def _reciprocal_publication_body(
         rating_ref = db.collection(RATINGS_COLLECTION).document(
             document_id
         )
-        snapshot = rating_ref.get(transaction=transaction)
+        snapshot = rating_ref.get(
+            transaction=transaction, **DATASTORE_CALL
+        )
         if not snapshot.exists:
             # The counterparty has not rated yet - the ordinary case,
             # and not an error.
@@ -2740,7 +2812,7 @@ def _transaction_rating_snapshots(transaction_id: str) -> List[Any]:
         .order_by('rater_id')
         .limit(DEFAULT_RATINGS_PAGE_SIZE)
     )
-    return list(query.stream())
+    return list(query.stream(**DATASTORE_CALL))
 
 
 def _reciprocal_possible(snapshots: Iterable[Any]) -> bool:
@@ -3475,7 +3547,11 @@ def _paginate(
         page_query = query.limit(window)
         if cursor is not None:
             page_query = page_query.start_after(cursor)
-        page = list(page_query.stream(transaction=transaction))
+        page = list(
+            page_query.stream(
+                transaction=transaction, **DATASTORE_CALL
+            )
+        )
         if not page:
             return
         for snapshot in page:
@@ -3709,7 +3785,7 @@ def _reputation_snapshot_body(
     snapshot = (
         db.collection(USERS_COLLECTION)
         .document(user_id)
-        .get(transaction=transaction)
+        .get(transaction=transaction, **DATASTORE_CALL)
     )
     if not snapshot.exists:
         return None
@@ -4156,7 +4232,11 @@ def _get_rating(rating_id: str) -> Optional[Rating]:
     # bound rather than the component one.
     if not _is_valid_rating_id(rating_id):
         return None
-    snapshot = db.collection(RATINGS_COLLECTION).document(rating_id).get()
+    snapshot = (
+        db.collection(RATINGS_COLLECTION)
+        .document(rating_id)
+        .get(**DATASTORE_CALL)
+    )
     if not snapshot.exists:
         return None
     return _rating_from_dict(_body_with_document_id(snapshot))
@@ -4206,7 +4286,9 @@ def _moderation_transaction_body(
         abandoned rather than committed.
     """
     rating_ref = db.collection(RATINGS_COLLECTION).document(rating_id)
-    snapshot = rating_ref.get(transaction=transaction)
+    snapshot = rating_ref.get(
+        transaction=transaction, **DATASTORE_CALL
+    )
     if not snapshot.exists:
         return None
 
@@ -4336,10 +4418,16 @@ def _moderate_rating(
             'violation and cannot be a reason.'
         )
     if not withholding and recorded_reason is not None:
+        # The wording says WITHHOLD rather than "displays the review",
+        # because only ``approved`` displays it: a ``pending`` rating is
+        # returned with its review blanked until a moderator approves the
+        # text. What both non-rejection states have in common is that
+        # neither withholds the RATING, which is what makes a recorded
+        # policy violation against them self-contradictory.
         raise ValueError(
             'A moderation reason may only accompany a rejection. State '
-            '{0!r} displays the review, so recording a policy violation '
-            'against it would leave a record that contradicts '
+            '{0!r} does not withhold a rating, so recording a policy '
+            'violation against it would leave a record that contradicts '
             'itself.'.format(status_value)
         )
 

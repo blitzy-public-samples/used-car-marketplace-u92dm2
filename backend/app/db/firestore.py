@@ -1,27 +1,147 @@
-from typing import Optional
-from google.api_core.exceptions import Aborted
+from typing import Any, Dict, Optional
+from google.api_core.exceptions import (
+    Aborted,
+    Cancelled,
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    RetryError,
+    ServiceUnavailable,
+)
+from google.api_core.retry import Retry, if_exception_type
 from google.cloud.firestore import Client, Transaction, transactional
 from google.cloud.exceptions import NotFound
 from app.core.config import settings
 
 db = Client(project=settings.GOOGLE_CLOUD_PROJECT)
 
+# How long any single datastore operation may take before it is abandoned.
+#
+# This is a REQUEST DEADLINE, not a performance target. The target is the
+# 200 ms budget for 95% of API responses in
+# ``documentation/Software Requirements Specifications (SRS).md``, which a
+# healthy get-by-ID meets by two orders of magnitude; this number is the
+# ceiling that decides how a datastore the process CANNOT REACH degrades.
+# Without one the answer was "not at all": every handler in this
+# application is synchronous, so it runs on Starlette's bounded
+# threadpool, and a request that never returns holds one of those threads
+# for the duration. Enough of them and an outage confined to the datastore
+# becomes an outage of every endpoint, including the ones that would
+# otherwise still work.
+#
+# Ten seconds is deliberately generous relative to the budget: it leaves
+# room for the retry policy below to ride out a brief blip rather than
+# turning a recoverable hiccup into a 503, while still bounding the
+# blocked thread to something the pool recovers from.
+DATASTORE_TIMEOUT_SECONDS = 10.0
+
+# The retry policy that makes the timeout ABOVE actually bind.
+#
+# This is the non-obvious half, and it was measured rather than assumed.
+# Passing ``timeout=`` alone does NOT bound a call: google-api-core
+# applies the retry decorator OUTSIDE the timeout decorator, so the
+# timeout becomes the per-ATTEMPT deadline while the retry keeps going
+# until its OWN deadline - and the client's default for
+# ``BatchGetDocuments`` is 300 seconds. Against a datastore that was not
+# listening, ``document().get(timeout=3)`` was still retrying after three
+# minutes. Supplying this policy together with the timeout bounds the
+# whole operation, and exhaustion arrives as ``RetryError``.
+#
+# The predicate is the client's own transient set for reads, unchanged:
+# these are the conditions that mean "this did not happen, try again".
+# ``Aborted`` is deliberately NOT in it - lock contention is resolved by
+# rerunning a whole transaction, which is the transaction runner's job,
+# not by retrying one read inside it.
+DATASTORE_RETRY = Retry(
+    predicate=if_exception_type(
+        DeadlineExceeded,
+        InternalServerError,
+        ResourceExhausted,
+        ServiceUnavailable,
+    ),
+    initial=0.1,
+    maximum=1.0,
+    multiplier=1.3,
+    timeout=DATASTORE_TIMEOUT_SECONDS,
+)
+
+# The two keyword arguments every datastore call in this application
+# passes, kept as one mapping so a call site cannot pick up the deadline
+# and miss the policy that enforces it. Splat it: ``ref.get(**CALL)``.
+#
+# Every method this codebase uses accepts both - ``DocumentReference``
+# ``get``/``create``/``set``/``update``/``delete``, ``Query``
+# ``get``/``stream`` and ``Transaction.get`` - on the pinned client
+# (``google-cloud-firestore==2.13.1``).
+#
+# THE ONE GAP, stated rather than glossed: ``BeginTransaction`` and
+# ``Commit`` are issued by the client's own transaction machinery
+# (``Transaction._begin``/``_commit``), which accepts no timeout on this
+# release, so those two RPCs fall back to the client's GAPIC defaults -
+# measured at roughly 45 seconds to fail against an unreachable
+# datastore. Every path in this application touches a BOUNDED call before
+# it opens a transaction (the per-request user read on an authenticated
+# route, the settle query on the public read), so an outage is reported
+# from that call and no transaction is begun. A datastore that dies
+# mid-request, after a read has already succeeded, can still wait out
+# those defaults.
+DATASTORE_CALL: Dict[str, Any] = {
+    'retry': DATASTORE_RETRY,
+    'timeout': DATASTORE_TIMEOUT_SECONDS,
+}
+
+# Provider faults that mean the datastore did not do the work and might
+# do it if asked again, as opposed to a fault in what it was asked to do.
+# ``AlreadyExists`` and ``NotFound`` are answers and are absent here on
+# purpose; a ``ValueError`` or a ``TypeError`` from this codebase is a
+# defect and is absent for the same reason.
+#
+# The HTTP layers translate exactly this tuple into a 503 - the auth
+# dependency for the per-request user read, and the ratings router for
+# every handler - so an unreachable datastore produces the same JSON
+# envelope as every other failure instead of a bare "Internal Server
+# Error". ``RetryError`` is the exhaustion verdict of the policy above,
+# and ``Aborted`` belongs here even though it is not retried per call:
+# contention that survives a transaction's own reruns is also "try
+# again".
+DATASTORE_UNAVAILABLE_ERRORS = (
+    Aborted,
+    Cancelled,
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    RetryError,
+    ServiceUnavailable,
+)
+
+# What a caller is told when the datastore cannot be reached, and how
+# long to wait. Declared here, beside the classification, so the auth
+# dependency and the ratings router answer with one sentence rather than
+# two that drift. It describes the condition without naming the provider,
+# the host or the operation - an outage is not an invitation to publish
+# infrastructure detail.
+DATASTORE_UNAVAILABLE_DETAIL = (
+    'The service could not reach its datastore. This is temporary - '
+    'please retry shortly.'
+)
+DATASTORE_RETRY_AFTER_SECONDS = 5
+
 def get_document(collection: str, document_id: str) -> dict:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc = doc_ref.get()
+        doc = doc_ref.get(**DATASTORE_CALL)
         return doc.to_dict() if doc.exists else None
     except NotFound:
         return None
 
 def create_document(collection: str, data: dict) -> str:
-    doc_ref = db.collection(collection).add(data)
+    doc_ref = db.collection(collection).add(data, **DATASTORE_CALL)
     return doc_ref[1].id
 
 def update_document(collection: str, document_id: str, data: dict) -> bool:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc_ref.update(data)
+        doc_ref.update(data, **DATASTORE_CALL)
         return True
     except NotFound:
         return False
@@ -29,7 +149,7 @@ def update_document(collection: str, document_id: str, data: dict) -> bool:
 def delete_document(collection: str, document_id: str) -> bool:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc_ref.delete()
+        doc_ref.delete(**DATASTORE_CALL)
         return True
     except NotFound:
         return False
@@ -40,7 +160,7 @@ def query_documents(collection: str, filters: dict) -> list:
     query = db.collection(collection)
     for field, value in filters.items():
         query = query.where(field, '==', value)
-    docs = query.stream()
+    docs = query.stream(**DATASTORE_CALL)
     return [doc.to_dict() for doc in docs]
 
 
@@ -107,7 +227,11 @@ def create_document_with_id(
     """
     doc_ref = db.collection(collection).document(document_id)
     if transaction is None:
-        doc_ref.create(data)
+        # Bounded like every other call this application makes: see
+        # ``DATASTORE_CALL``. The transactional branch takes no such
+        # arguments because it does not issue an RPC - the create is
+        # STAGED and travels with the transaction's commit.
+        doc_ref.create(data, **DATASTORE_CALL)
     else:
         transaction.create(doc_ref, data)
     return document_id

@@ -165,6 +165,7 @@ caller sees is decided in one place rather than at each handler.
 Pydantic v1 semantics apply throughout, matching the pin in
 ``backend/requirements.txt``.
 """
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -176,6 +177,16 @@ from app.api.auth import get_current_user
 # Firestore read of its own: authorization evidence and result sets alike
 # come from app/services/rating.py, so that neither can be taken at a
 # different instant from the data it governs.
+#
+# The two names taken from that module are not a datastore handle and
+# open no connection: they are the sentence and the backoff hint used
+# when the datastore cannot be reached, declared beside the call policy
+# that produces that condition so this router and the auth dependency
+# answer an outage identically instead of with two literals that drift.
+from app.db.firestore import (
+    DATASTORE_RETRY_AFTER_SECONDS,
+    DATASTORE_UNAVAILABLE_DETAIL,
+)
 from app.schema.rating import (
     MODERATION_REASON_MAX_LENGTH,
     DocumentId,
@@ -210,10 +221,12 @@ from app.schema.user import User
 # HTTP layer would be a second source of truth for a policy the FTC
 # review-suppression rule constrains.
 from app.services.rating import (
+    TRANSIENT_PROVIDER_ERRORS,
     DuplicateRating,
     NotATransactionParticipant,
     RaterNotVerified,
     SelfRatingNotAllowed,
+    TransactionInvariantError,
     TransactionNotCompleted,
     TransactionNotFound,
     get_user_reputation,
@@ -224,6 +237,8 @@ from app.services.rating import (
     submit_rating,
 )
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -241,24 +256,17 @@ ADMIN_ONLY_DETAIL = 'Only administrators can moderate ratings'
 USER_NOT_FOUND_DETAIL = 'User not found'
 RATING_NOT_FOUND_DETAIL = 'Rating not found'
 
-# The router's error contract: EXACTLY the six domain exceptions the plan
-# specifies, and nothing else. Every entry maps one typed exception raised
-# by ``app/services/rating.py`` on to its status code, and the exception's
-# own ``message`` becomes the response ``detail`` - which is what keeps an
-# HTTP failure and the reason reported by the eligibility endpoint
-# identical by construction instead of by two literals agreeing today.
+# The router's error contract: an EXPLICIT, closed list of the typed
+# failures this API answers, and nothing else. Every entry maps one
+# exception raised by ``app/services/rating.py`` on to its status code,
+# and the exception's own ``message`` becomes the response ``detail`` -
+# which is what keeps an HTTP failure and the reason reported by the
+# eligibility endpoint identical by construction instead of by two
+# literals agreeing today.
 #
-# SIX ENTRIES, matching the six domain refusals the service defines,
-# exactly. That count is a contract and not an accident: these are the
-# refusals a caller caused and can act on, and each one appears in the
-# documented failure set of the endpoint that can produce it. The
-# service's two invariant exceptions - ``PublicationInvariantError`` and
-# ``TransactionInvariantError`` - are deliberately absent, because they
-# report a defect in stored data that no caller provoked. Mapping either
-# to a 4xx would tell a well-behaved user their request was at fault and
-# would widen this router's documented contract with a state only an
-# operator can clear; unmapped, they propagate as a 500, which is the
-# honest answer. Do not add them here.
+# The first six are the service's six domain refusals, exactly: the
+# failures a caller caused and can act on, each appearing in the
+# documented failure set of the endpoint that can produce it.
 #
 # The ordering is part of the contract rather than cosmetic: the guard
 # sequence in the service reports the most actionable failure first
@@ -267,30 +275,51 @@ RATING_NOT_FOUND_DETAIL = 'Rating not found'
 # individually preserves that. Collapsing any pair would launder a
 # distinct refusal into a misleading one.
 #
+# THE SEVENTH ENTRY, AND WHY IT IS NOW HERE
+# -------------------------------------------------------------------
+# ``TransactionInvariantError`` fires when an otherwise-eligible
+# transaction - it exists, it names the caller, it is completed - is
+# missing the ``vehicle_listing_id`` every ``Transaction`` declares and
+# every rating denormalises. It was deliberately left unmapped once, on
+# the reasoning that a corrupt document in this system's own datastore is
+# a server fault and answering a 4xx would tell a caller to fix a request
+# that was already correct.
+#
+# The reasoning was half right and the result was not. An unmapped
+# exception is not answered by this API at all: the framework renders it
+# as ``text/plain`` "Internal Server Error", with no ``detail`` for a
+# client to parse and nothing for an interface to show, and it put both
+# ``POST ''`` and ``GET '/eligibility/{transaction_id}'`` outside the
+# status sets their own docstrings publish.
+#
+# 409 is the accurate answer rather than the convenient one. The request
+# is well formed and the caller is authorized; what refuses it is the
+# stored STATE of the transaction being cited - which is exactly why
+# ``TransactionNotCompleted`` is also a 409. The ``detail`` is the
+# exception's caller-facing ``message``, which names no field and no
+# document, and the service logs the specific defect at ERROR with the
+# transaction named, so the operator signal that argued for the 500 is
+# kept intact rather than traded away. The eligibility endpoint does not
+# reach this entry at all: its service function reports the same sentence
+# as ``eligible=false``, so that endpoint keeps its 200/401/404 contract.
+#
+# ``PublicationInvariantError`` remains absent, and that is not an
+# oversight. Publication is a background transition that requests happen
+# to trigger; every call site in the service absorbs that exception and
+# logs it, so it never reaches this layer and has no status code to be
+# given.
+#
 # WHY THE LIST IS CLOSED, AND WHY THERE IS NO FALLBACK
 # -------------------------------------------------------------------
-# An earlier revision added a seventh entry and, beneath it, caught the
-# BASE ``RatingError`` and answered 400 for anything unrecognised. The
-# reasoning was that every ``RatingError`` is a refusal the caller caused,
-# so reporting one as a 500 would misattribute a client error. It is the
-# wrong trade, in both halves.
-#
-# The seventh entry was ``TransactionNotRatable``, which fires when an
-# otherwise-eligible transaction is missing the ``vehicle_listing_id``
-# every ``Transaction`` declares. That is not something the caller did: it
-# is a corrupt document in this system's own datastore, and reporting it as
-# a 4xx tells the caller to fix a request that was already correct while
-# leaving the real fault - bad data the operator has to repair - invisible.
-# It propagates now, and a propagating exception is logged with a
-# traceback and answered 500, which is what a server-side data fault is.
-#
-# The catch-all was worse, because it applied to exceptions that do not
-# exist yet. Any subclass a future change adds to the service would have
-# been answered 400 with its message shown to the caller, whether or not
-# the caller could act on it and whether or not that message was fit to
-# publish - and it would have done so silently, so nothing would ever
+# An earlier revision caught the BASE ``RatingError`` beneath the table
+# and answered 400 for anything unrecognised. That catch-all applied to
+# exceptions that do not exist yet: any subclass a future change added to
+# the service would have been answered 400 with its message shown to the
+# caller, whether or not the caller could act on it and whether or not
+# that message was fit to publish - and silently, so nothing would ever
 # prompt anyone to classify it. A new failure mode must be mapped here
-# deliberately or surface as the unhandled defect it is.
+# deliberately, with its status chosen on the merits, or surface as the
+# unhandled defect it is.
 DOMAIN_FAILURE_STATUS = (
     (RaterNotVerified, 403),
     (NotATransactionParticipant, 403),
@@ -298,6 +327,7 @@ DOMAIN_FAILURE_STATUS = (
     (SelfRatingNotAllowed, 422),
     (TransactionNotCompleted, 409),
     (DuplicateRating, 409),
+    (TransactionInvariantError, 409),
 )
 
 # The catch tuple, derived FROM the mapping above rather than written out
@@ -307,6 +337,77 @@ DOMAIN_FAILURE_STATUS = (
 MAPPED_DOMAIN_FAILURES = tuple(
     failure for failure, _status in DOMAIN_FAILURE_STATUS
 )
+
+
+class ErrorDetail(BaseModel):
+    """The shape of EVERY failure this router answers with.
+
+    FastAPI documents a 200/201 body and the 422 its own validation
+    produces, and nothing else - so an endpoint's error contract exists
+    only if it is declared. Left undeclared, the statuses below were
+    invisible in ``/openapi.json``: a generated client had no type for a
+    failure, and a reader of the published contract could not see that
+    R1 answers 403, that a duplicate answers 409, or that an unreachable
+    datastore answers 503. They were reachable at runtime the whole time,
+    which is the worst version of the problem - undocumented behaviour
+    that consumers discover in production.
+
+    One field, matching what the framework actually sends: FastAPI
+    renders an ``HTTPException`` as ``{"detail": ...}``. It is typed
+    ``str`` because every failure this router raises carries a sentence -
+    the prose from a domain exception's ``message``, or one of this
+    module's own literals.
+
+    THE ONE EXCEPTION, and it is the framework's rather than ours: a 422
+    from request validation carries a LIST of per-field error objects
+    instead of a string, and FastAPI already publishes that shape as
+    ``HTTPValidationError``. So 422 is deliberately NOT re-declared with
+    this model anywhere below - overriding it would replace an accurate
+    generated schema with a wrong one.
+    """
+
+    detail: str = Field(
+        ...,
+        description=(
+            'Why the request was refused, as a sentence fit to show a '
+            'user. It never contains a stack trace, a datastore '
+            'identifier, a hostname or any other internal detail.'
+        ),
+    )
+
+
+# The per-status descriptions the five decorators below assemble their
+# ``responses`` from. Declared once, so two endpoints that answer the
+# same status describe it the same way, and so each description says what
+# the status means FOR THIS FEATURE rather than repeating the RFC.
+#
+# Each entry is spent by at least one endpoint and every endpoint
+# declares exactly the statuses its handler can actually produce -
+# verified against runtime behaviour rather than by reading the code, so
+# the published contract neither promises a failure that cannot happen
+# nor hides one that can.
+UNAUTHENTICATED_RESPONSE = {
+    401: {
+        'model': ErrorDetail,
+        'description': (
+            'No credentials, or a credential that cannot be validated - '
+            'an absent, malformed, expired or wrongly signed token, one '
+            'missing a required claim, or one naming a user that does '
+            'not exist.'
+        ),
+    },
+}
+
+DATASTORE_UNAVAILABLE_RESPONSE = {
+    503: {
+        'model': ErrorDetail,
+        'description': (
+            'The datastore could not be reached within the deadline. '
+            'Transient: a ``Retry-After`` header accompanies this '
+            'response and the request may be retried unchanged.'
+        ),
+    },
+}
 
 
 class UserRatingsResponse(BaseModel):
@@ -336,6 +437,14 @@ class UserRatingsResponse(BaseModel):
     bounded while the aggregate is not. That is the contract rather than
     a discrepancy, and a client must not present it as one.
 
+    The extreme of the first reason is worth stating rather than leaving
+    to be discovered: when every published rating a user has received was
+    rejected by moderation, ``items`` is EMPTY while ``average`` is
+    non-null and ``count`` is non-zero. An empty list therefore does not
+    mean "no ratings" - only ``average=null, count=0`` means that - and a
+    client must render the aggregate from ``aggregate`` alone rather than
+    inferring anything from the length of ``items``.
+
     A user with no ratings is a first-class state and not an error: an
     empty ``items`` beside ``average=None, count=0``. It is modelled
     explicitly so the reputation badge can render "No ratings yet"
@@ -360,8 +469,11 @@ class UserRatingsResponse(BaseModel):
             'ratings, whatever their score and whatever their '
             'moderation state - a reputation is not a property of the '
             'records a reader may be shown, so ``count`` may exceed '
-            'the number of items. ``average`` is null and ``count`` is '
-            'zero when the user has none.'
+            'the number of items, and may be non-zero beside an EMPTY '
+            'items list when every rating received was withheld by '
+            'moderation. ``average`` is null and ``count`` is zero when '
+            'the user has none, and that pair is the only signal that '
+            'means "no ratings".'
         ),
     )
 
@@ -388,8 +500,8 @@ class ModerationUpdate(BaseModel):
     as bounded plain text describing the violation in the CONTENT. It is
     optional on this model and governed by a MATRIX the service owns:
     mandatory when rejecting, and refused on any other state, because a
-    state that displays the review cannot also carry a violation recorded
-    against it. Both halves surface as a 422.
+    state that does not withhold the rating cannot also carry a violation
+    recorded against it. Both halves surface as a 422.
 
     The matrix is applied by the validator below during REQUEST
     validation, before the handler body runs - so a malformed moderation
@@ -420,8 +532,9 @@ class ModerationUpdate(BaseModel):
             'The policy basis for the transition, describing the '
             'violation in the review CONTENT - abuse, personally '
             'identifying information, profanity. Required when '
-            'rejecting and refused on any other state, which displays '
-            'the review. A low score is never itself a violation.'
+            'rejecting and refused on any other state, none of which '
+            'withholds the rating. A low score is never itself a '
+            'violation.'
         ),
     )
 
@@ -467,10 +580,11 @@ class ModerationUpdate(BaseModel):
         Raises:
             ValueError: The reason exceeds the bound, a rejection was
                 requested without one, or one was supplied for a state
-                that displays the review. Pydantic reports each as a 422
-                naming this field, before the handler runs, so a rating is
-                never withheld first and justified afterwards - and never
-                displayed with a violation recorded against it.
+                that does not withhold the rating. Pydantic reports each
+                as a 422 naming this field, before the handler runs, so a
+                rating is never withheld first and justified afterwards -
+                and never displayed with a violation recorded against
+                it.
         """
         recorded = as_plain_text(
             value,
@@ -493,10 +607,17 @@ class ModerationUpdate(BaseModel):
                 )
             return recorded
         if recorded is not None:
+            # Same sentence the service raises for the same rule, and it
+            # says WITHHOLD rather than "displays the review" on purpose:
+            # only ``approved`` displays the review text, since a
+            # ``pending`` rating is shown with its review blanked until a
+            # moderator approves it. What both non-rejection states share
+            # is that neither withholds the RATING - which is what makes a
+            # policy violation recorded against them contradict itself.
             raise ValueError(
                 'A moderation reason may only accompany a rejection. '
-                'State {0!r} displays the review, so recording a policy '
-                'violation against it would leave a record that '
+                'State {0!r} does not withhold a rating, so recording a '
+                'policy violation against it would leave a record that '
                 'contradicts itself.'.format(target.value)
             )
         return recorded
@@ -525,16 +646,60 @@ def domain_failure_detail(error: Exception) -> str:
 
     Returns:
         The exception's message, falling back to its ``str()`` when a
-        subclass was constructed with an empty one. Each of the six
-        mapped classes declares a message, so the fallback is a
-        belt-and-braces guard rather than a path anything takes.
+        subclass was constructed with an empty one. Every mapped
+        class declares a message, so the fallback is a belt-and-braces
+        guard rather than a path anything takes.
     """
     message = getattr(error, 'message', None) or str(error)
     return message.strip() or 'The rating could not be recorded'
 
 
+def datastore_unavailable(error: BaseException) -> HTTPException:
+    """Translate an unreachable datastore into a 503 with a JSON body.
+
+    The counterpart to :func:`domain_failure` for the other kind of
+    failure this router can meet. A domain failure is an answer about the
+    request; this is the absence of an answer at all, and the two must
+    not be confused - a caller told 4xx would stop retrying a request
+    that was never wrong.
+
+    It exists because the alternative is worse than it looks. Left to
+    propagate, a transport fault is rendered by the framework as
+    ``text/plain`` "Internal Server Error": no ``detail``, nothing a
+    client can parse, and nothing to distinguish "your request is
+    invalid" from "come back in five seconds". The datastore access is
+    bounded by ``app/db/firestore.py``'s call policy, so this path is
+    reached in seconds rather than after the client's own multi-minute
+    defaults.
+
+    The failure is logged here rather than in the service, because this
+    is the layer that decides the request is over. The log names the
+    exception type and its message; the RESPONSE names neither, and no
+    host, provider or query detail reaches the caller.
+
+    Args:
+        error: A fault caught through
+            :data:`app.services.rating.TRANSIENT_PROVIDER_ERRORS`.
+
+    Returns:
+        The ``HTTPException`` to raise: 503 carrying the shared detail
+        and a ``Retry-After`` header, so a well-behaved client backs off
+        instead of hammering a datastore that is already struggling.
+    """
+    logger.error(
+        'Datastore unavailable while serving a ratings request: %s: %s',
+        type(error).__name__,
+        error,
+    )
+    return HTTPException(
+        status_code=503,
+        detail=DATASTORE_UNAVAILABLE_DETAIL,
+        headers={'Retry-After': str(DATASTORE_RETRY_AFTER_SECONDS)},
+    )
+
+
 def domain_failure(error: Exception) -> HTTPException:
-    """Translate one of the six mapped domain failures into its response.
+    """Translate one mapped domain failure into its response.
 
     The single place this router maps the service's vocabulary on to
     status codes, so the mapping cannot disagree with itself across
@@ -571,6 +736,34 @@ def domain_failure(error: Exception) -> HTTPException:
     status_code=201,
     response_model=RatingView,
     summary='Submit a rating for a completed transaction',
+    responses={
+        403: {
+            'model': ErrorDetail,
+            'description': (
+                'R1 - the rater\'s account is not verified; or R2 - the '
+                'caller is not a party to the cited transaction, which '
+                'includes supplying a ``ratee_id`` that disagrees with '
+                'the counterparty the server derives. Nothing is '
+                'written on either path.'
+            ),
+        },
+        404: {
+            'model': ErrorDetail,
+            'description': 'No transaction exists at the cited ID.',
+        },
+        409: {
+            'model': ErrorDetail,
+            'description': (
+                'The transaction has not completed; or this rater has '
+                'already rated it, which the datastore refuses so the '
+                'rule holds under concurrent submission; or the '
+                'transaction record is missing data a rating requires '
+                'and cannot be rated until it is repaired.'
+            ),
+        },
+        **UNAUTHENTICATED_RESPONSE,
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
 )
 def create_rating(
     payload: RatingCreate,
@@ -618,15 +811,24 @@ def create_rating(
             dependency); 403 when the rater is unverified (R1) or is not
             a party to the transaction (R2); 404 when no such
             transaction exists; 409 when the transaction is not
-            completed or this rater has already rated it; 422 for a
-            degenerate transaction naming one user as both parties.
+            completed, when this rater has already rated it, or when the
+            transaction's stored record is too incomplete to rate; 422
+            for a degenerate transaction naming one user as both
+            parties.
 
-            A transaction that exists, names the caller and is completed
-            but is MISSING the data a rating record requires is
-            deliberately NOT translated here. It is a corrupt document in
-            this system's own datastore, so it propagates and is answered
-            500 with a logged traceback - the caller's request was
-            correct and there is nothing for them to fix.
+            The third 409 is the odd one and is stated plainly: a
+            transaction that exists, names the caller and is completed
+            but is MISSING the data a rating record requires is a corrupt
+            document in this system's own datastore rather than a mistake
+            the caller made. It is answered as a conflict with the stored
+            state - which is what it is - and the specific defect is
+            logged at ERROR with the transaction named so an operator can
+            repair it. Nothing is written on that path.
+
+            503 when the datastore cannot be reached within its
+            deadline, carrying ``Retry-After``. Every status here is
+            declared on the decorator, so the published contract and
+            this docstring say the same thing.
 
     """
     # SYNCHRONOUS on purpose. The Firestore client this feature uses is
@@ -641,12 +843,25 @@ def create_rating(
         return to_rating_view(submit_rating(payload, current_user))
     except MAPPED_DOMAIN_FAILURES as error:
         raise domain_failure(error) from error
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
 
 
 @router.get(
     '/user/{user_id}',
     response_model=UserRatingsResponse,
     summary='Read the published ratings a user has received',
+    responses={
+        404: {
+            'model': ErrorDetail,
+            'description': (
+                'No such user. Distinct from a user who exists and has '
+                'no ratings, which is a 200 carrying an empty list '
+                'beside ``average=null, count=0``.'
+            ),
+        },
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
 )
 def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
     """Report one user's reputation. F010-3.
@@ -708,14 +923,19 @@ def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
         HTTPException: 404 when no such user exists. The distinction
             matters to the caller: "this user has no ratings" and "there
             is no such user" are different answers, and only the first
-            is a 200.
+            is a 200. 503 when the datastore cannot be reached within
+            its deadline, carrying ``Retry-After``. Both are declared on
+            the decorator.
     """
     # No Firestore read happens in this handler. Existence, the
     # aggregate and the listing all come out of ONE pinned snapshot in
     # the service, taken after it has settled anything due. A ``None``
     # means there is no such user, and turning that into a status code is
     # this layer's whole job here.
-    reputation = get_user_reputation(user_id)
+    try:
+        reputation = get_user_reputation(user_id)
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
     if reputation is None:
         raise HTTPException(
             status_code=404,
@@ -731,6 +951,21 @@ def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
     '/transaction/{transaction_id}',
     response_model=List[RatingView],
     summary='Read the ratings attached to one transaction',
+    responses={
+        403: {
+            'model': ErrorDetail,
+            'description': (
+                'The caller is neither the buyer nor the seller of this '
+                'transaction.'
+            ),
+        },
+        404: {
+            'model': ErrorDetail,
+            'description': 'No transaction exists at the cited ID.',
+        },
+        **UNAUTHENTICATED_RESPONSE,
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
 )
 def get_transaction_ratings(
     transaction_id: DocumentId,
@@ -771,9 +1006,9 @@ def get_transaction_ratings(
     cannot run inside a read-only snapshot.
 
     What crosses this boundary is the typed refusal, mapped by the same
-    six-exception table every other handler here uses - so the statuses
-    are unchanged: 404 for an unknown transaction, 403 for a caller who
-    is not a party on EITHER check.
+    failure table every other handler here uses - so the statuses are
+    unchanged: 404 for an unknown transaction, 403 for a caller who is
+    not a party on EITHER check.
 
     Being a participant does not lift the double-blind model. A caller
     always sees their OWN rating in full - including its review text even
@@ -801,7 +1036,9 @@ def get_transaction_ratings(
     Raises:
         HTTPException: 401 when unauthenticated (raised by the
             dependency); 404 when no such transaction exists; 403 when
-            the caller is neither its buyer nor its seller.
+            the caller is neither its buyer nor its seller; 503 when the
+            datastore cannot be reached within its deadline, carrying
+            ``Retry-After``. All four are declared on the decorator.
     """
     try:
         return to_rating_views(
@@ -809,12 +1046,29 @@ def get_transaction_ratings(
         )
     except MAPPED_DOMAIN_FAILURES as error:
         raise domain_failure(error) from error
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
 
 
 @router.get(
     '/eligibility/{transaction_id}',
     response_model=EligibilityDecision,
     summary='Report whether the caller may rate their counterparty',
+    responses={
+        404: {
+            'model': ErrorDetail,
+            'description': (
+                'No transaction exists at the cited ID. Every OTHER '
+                'refusal - unverified caller, non-participant, '
+                'incomplete transaction, already rated, a record too '
+                'incomplete to rate - is reported as a 200 decision '
+                'with a reason, which is the whole purpose of this '
+                'endpoint.'
+            ),
+        },
+        **UNAUTHENTICATED_RESPONSE,
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
 )
 def get_rating_eligibility(
     transaction_id: DocumentId,
@@ -858,12 +1112,19 @@ def get_rating_eligibility(
 
     Raises:
         HTTPException: 401 when unauthenticated (raised by the
-            dependency); 404 when no such transaction exists.
+            dependency); 404 when no such transaction exists; 503 when
+            the datastore cannot be reached within its deadline,
+            carrying ``Retry-After``. Every other outcome is a 200
+            decision, and all three statuses are declared on the
+            decorator.
     """
     # ``require_eligibility`` RAISES ``TransactionNotFound`` for the one
     # decision this endpoint's contract turns into a 404, and it is
-    # translated through the same six-exception mapping every other
-    # endpoint uses.
+    # translated through the same failure mapping every other endpoint
+    # uses. Every other outcome - including a transaction whose stored
+    # record is too incomplete to rate - comes back as a decision this
+    # endpoint reports with 200, which is what keeps its published
+    # contract to 200/401/404.
     #
     # An earlier revision instead compared ``decision.reason`` against
     # ``TransactionNotFound.message``, which made an HTTP status code
@@ -877,12 +1138,33 @@ def get_rating_eligibility(
         return require_eligibility(transaction_id, current_user)
     except MAPPED_DOMAIN_FAILURES as error:
         raise domain_failure(error) from error
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
 
 
 @router.patch(
     '/{rating_id}/moderation',
     response_model=ModeratedRatingView,
     summary='Transition a rating between moderation states',
+    responses={
+        403: {
+            'model': ErrorDetail,
+            'description': (
+                'The caller is not an administrator. The role is read '
+                'from the caller\'s stored user document, never from a '
+                'request header.'
+            ),
+        },
+        404: {
+            'model': ErrorDetail,
+            'description': (
+                'No rating exists at that ID, or its stored body cannot '
+                'be interpreted. Nothing is written on either path.'
+            ),
+        },
+        **UNAUTHENTICATED_RESPONSE,
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
 )
 def set_rating_moderation(
     rating_id: RatingDocumentId,
@@ -907,12 +1189,30 @@ def set_rating_moderation(
     withholding one because it is unflattering is precisely what the FTC
     Rule on the Use of Consumer Reviews and Testimonials (16 CFR Part
     465) prohibits. Accordingly there is no score threshold and no
-    score-correlated behaviour anywhere in this handler, the aggregate
-    is not adjusted here at all - the service is its only writer, and it
-    counts every published rating whatever its value - and a rejection
-    withholds the review TEXT while the rating and its score continue to
-    appear, so the ratings a reader can see still account for the
-    average they are shown.
+    score-correlated behaviour anywhere in this handler, and the
+    aggregate is not adjusted here at all - the service is its only
+    writer, and it counts every published rating whatever its value.
+
+    WHAT A REJECTION ACTUALLY DOES TO A READER'S VIEW
+    -------------------------------------------------------------------
+    A rejection withholds the WHOLE RECORD from the public list, not
+    merely its review text: a moderator has ruled the rating a policy
+    violation, and a reader cannot tell a stripped review from a rating
+    whose author wrote nothing, so it is removed rather than shown
+    hollowed out. The service's visibility projection is the single
+    statement of that rule.
+
+    The aggregate keeps counting it, because a moderation decision is
+    about CONTENT and letting it move a score would make moderation
+    sentiment-relevant - exactly what must never happen. So the two
+    halves of a reputation answer different questions, and the visible
+    consequence has to be designed for rather than discovered:
+    ``aggregate.count`` can exceed the number of items returned, and in
+    the limit a user whose only rating was rejected is reported as an
+    average over one rating beside an EMPTY list. That is disclosed on
+    :class:`UserRatingsResponse` so no client renders it as a
+    discrepancy, and the rating's own author still sees their withheld
+    words through the per-transaction read.
 
     The administrator gate is compared inline before anything is
     written, mirroring how ``app/api/listings.py`` authorizes a
@@ -944,8 +1244,11 @@ def set_rating_moderation(
             404 when no rating exists at that ID, or its stored body
             cannot be interpreted - nothing is written on either path;
             422 when a rejection is requested without a policy reason,
-            when a reason accompanies a state that displays the review, or
-            when the reason exceeds the bound applied to it.
+            when a reason accompanies a state that does not withhold the
+            rating, or when the reason exceeds the bound applied to it;
+            503 when the datastore cannot be reached within its
+            deadline, carrying ``Retry-After``. Every status is declared
+            on the decorator.
 
     """
     if current_user.role != ADMIN_ROLE:
@@ -959,10 +1262,12 @@ def set_rating_moderation(
             payload.moderation_status,
             payload.moderation_reason,
         )
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
     except ValueError as error:
         # The service refuses to withhold a rating without a recorded
-        # policy basis, refuses to record one beside a state that displays
-        # the review, and bounds the text it stores. All three are
+        # policy basis, refuses to record one beside a state that does
+        # not withhold the rating, and bounds the text it stores. All are
         # reported as a 422 carrying the service's own explanation,
         # because the request is well formed and the caller can act on it.
         # The rules are enforced there and not duplicated here, so there

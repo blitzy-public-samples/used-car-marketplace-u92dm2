@@ -7,8 +7,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel, ValidationError
 from app.core.config import settings
-from app.db.firestore import db
-from app.schema.user import User
+from app.db.firestore import (
+    DATASTORE_CALL,
+    DATASTORE_RETRY_AFTER_SECONDS,
+    DATASTORE_UNAVAILABLE_DETAIL,
+    DATASTORE_UNAVAILABLE_ERRORS,
+    db,
+)
+from app.schema.user import User, is_valid_document_id
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +53,15 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 def authenticate_user(email: str, password: str) -> User:
-    user_doc = db.collection('users').where('email', '==', email).limit(1).get()
+    # Bounded by the shared datastore policy, like every other call in
+    # this application: an unreachable datastore must fail in seconds
+    # rather than occupy a worker until the client's own defaults expire.
+    user_doc = (
+        db.collection('users')
+        .where('email', '==', email)
+        .limit(1)
+        .get(**DATASTORE_CALL)
+    )
     if not user_doc:
         return False
     # ``.where(...).limit(1).get()`` returns a LIST of snapshots, so the
@@ -109,18 +123,78 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            # Both claims are REQUIRED, not merely verified when
+            # present. python-jose defaults ``require_exp`` and
+            # ``require_sub`` to False, so a token carrying no ``exp``
+            # was accepted indefinitely: a credential with no expiry
+            # cannot be revoked by time, and this application has no
+            # deny-list to revoke it any other way. ``create_access_token``
+            # above always sets ``exp``, so nothing this service issues is
+            # affected - the requirement is what stops a legacy or
+            # mis-issued token from outliving its intent. ``require_sub``
+            # is stated here for the same reason and keeps the identity
+            # claim's absence a decode failure rather than a later None.
+            options={'require_exp': True, 'require_sub': True},
+        )
+        user_id = payload.get("sub")
     except JWTError:
+        # Covers a bad signature, an unaccepted algorithm, an expired
+        # token, a missing required claim, and a ``sub`` that is not a
+        # string. Every one of them is a credential that cannot be
+        # validated, so they share the one 401.
+        raise credentials_exception
+    # The claim is held to the Firestore document-ID grammar BEFORE it is
+    # used to compose a path. Firestore reads a slash as a path separator
+    # and refuses a dot segment outright, so ``users/someone``, ``..`` or
+    # ``../users/someone`` each failed inside the client or at the
+    # datastore - producing a 500 on every protected endpoint for a
+    # credential that simply does not name a user. The grammar lives in
+    # ``app/schema/user.py`` beside the ``User.id`` constraint it also
+    # backs, and is applied through the predicate rather than restated,
+    # so this check and the model can never disagree about what a
+    # document ID is.
+    if not is_valid_document_id(user_id):
         raise credentials_exception
     # This read is load-bearing and runs on every request by design.
     # The token carries only ``sub`` and ``exp``, so authorization state
     # such as ``is_verified`` is resolved from the datastore each time -
     # revoking it takes effect on the caller's very next request, with
     # no token rotation. Never cache or memoise this lookup.
-    user_doc = db.collection('users').document(user_id).get()
+    #
+    # Because it runs on every request it is also the FIRST datastore
+    # touch of every authenticated route, which makes it the place an
+    # unreachable datastore is noticed. It is bounded by the shared
+    # ``DATASTORE_CALL`` policy and its exhaustion is answered as a 503
+    # rather than left to propagate: unbounded, this call held a
+    # threadpool thread for minutes and the caller received a bare
+    # "Internal Server Error" with no envelope, so an outage of the
+    # datastore became an outage of every endpoint. A 503 with
+    # ``Retry-After`` says what is true - the service is temporarily
+    # unable to answer - and says it in the same JSON shape as every
+    # other failure.
+    try:
+        user_doc = (
+            db.collection('users')
+            .document(user_id)
+            .get(**DATASTORE_CALL)
+        )
+    except DATASTORE_UNAVAILABLE_ERRORS as error:
+        logger.error(
+            'Datastore unavailable while resolving the caller: %s: %s',
+            type(error).__name__,
+            error,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=DATASTORE_UNAVAILABLE_DETAIL,
+            headers={
+                'Retry-After': str(DATASTORE_RETRY_AFTER_SECONDS),
+            },
+        ) from error
     if not user_doc.exists:
         raise credentials_exception
     # Pydantic v1 offers no ``from_dict``. ``User.id`` is required but

@@ -1,5 +1,6 @@
+import re
 from pydantic import BaseModel, StrictBool, constr
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime
 
 # The Firestore document-ID grammar, applied to ``User.id`` below.
@@ -36,16 +37,72 @@ from datetime import datetime
 # reaching a handler that would compose a path out of it.
 DOCUMENT_ID_MAX_LENGTH = 128
 
+# The grammar itself, stated ONCE and shared by the two ways it is
+# applied: through Pydantic, as the ``DocumentId`` type below, and
+# directly, through ``is_valid_document_id`` further down. Restating the
+# pattern beside the predicate would give this module two grammars that
+# agree only until one of them is edited.
+DOCUMENT_ID_REGEX = (
+    r'^(?!\.\.?\Z)'          # not "." and not ".."
+    r'(?!__.*__\Z)'          # not Firestore's reserved __.*__ namespace
+    r'[^/\x00-\x1F\x7F]+\Z'  # no slash, no ASCII control characters
+)
+
 DocumentId = constr(
     strict=True,
     min_length=1,
     max_length=DOCUMENT_ID_MAX_LENGTH,
-    regex=(
-        r'^(?!\.\.?\Z)'          # not "." and not ".."
-        r'(?!__.*__\Z)'          # not Firestore's reserved __.*__ namespace
-        r'[^/\x00-\x1F\x7F]+\Z'  # no slash, no ASCII control characters
-    ),
+    regex=DOCUMENT_ID_REGEX,
 )
+
+# Compiled once at import. ``get_current_user`` consults the predicate
+# below on EVERY authenticated request, so the pattern is not recompiled
+# per call - and ``re``'s internal cache is not something to rely on for
+# a hot path.
+_DOCUMENT_ID_PATTERN = re.compile(DOCUMENT_ID_REGEX)
+
+
+def is_valid_document_id(value: Any) -> bool:
+    """Report whether a bare value may be used as a Firestore document ID.
+
+    ``DocumentId`` above covers every value that arrives through a model.
+    This predicate covers the values that do NOT, and there is one that
+    matters: the JWT ``sub`` claim, which ``app/api/auth.py`` reads
+    straight out of a decoded token and hands to ``document()`` in order
+    to find the caller's user record.
+
+    That path had to be closed rather than left to the model. Firestore
+    reads a forward slash in a document ID as a PATH SEPARATOR, so a
+    claim of ``users/someone`` addresses a nested collection instead of a
+    document, and the client rejects the resulting odd-length path with a
+    ``ValueError`` - before ``User`` is ever constructed, so the grammar
+    on ``User.id`` never gets to refuse it. A dot segment (``.`` or
+    ``..``) travels further and is refused by the datastore itself as an
+    ``InvalidArgument``. Both surfaced as a 500 on every protected
+    endpoint, which told a caller holding an unusable credential that the
+    server was broken; the honest answer is that the credential does not
+    identify anybody, which is a 401.
+
+    The rules applied are exactly ``DocumentId``'s, from the same
+    ``DOCUMENT_ID_REGEX``, plus its type and length bounds - so a value
+    this predicate accepts is a value the model would also accept, and a
+    caller cannot be admitted here only to be refused a moment later.
+
+    Args:
+        value: Candidate identifier, of any type. A non-string is not a
+            document ID: this mirrors ``constr(strict=True)``, which
+            refuses to coerce, so an integer or ``None`` claim is
+            rejected rather than stringified into a path component.
+
+    Returns:
+        ``True`` only when the value is a string that satisfies the
+        grammar and both length bounds.
+    """
+    if not isinstance(value, str):
+        return False
+    if not 1 <= len(value) <= DOCUMENT_ID_MAX_LENGTH:
+        return False
+    return _DOCUMENT_ID_PATTERN.match(value) is not None
 
 
 class User(BaseModel):

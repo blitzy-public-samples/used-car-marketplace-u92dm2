@@ -1338,6 +1338,16 @@ class FakeDocumentReference:
     ``update``, ``delete`` - and every one of them routes through the
     client's single atomic apply step, so a standalone write and a
     transactional one cannot diverge in their precondition handling.
+
+    ``retry`` and ``timeout`` ARE ACCEPTED AND IGNORED, here and on the
+    query, collection and transaction doubles. Every datastore call in
+    the application passes them - ``app/db/firestore.py`` supplies the
+    pair as ``DATASTORE_CALL`` so an unreachable datastore fails in
+    seconds instead of holding a worker for minutes - and a double that
+    refused the arguments would make the suite reject exactly the calls
+    production makes. Ignoring the VALUES is correct rather than lazy:
+    this double performs no I/O, so there is no deadline to enforce and
+    no transient fault to retry. What must be mirrored is the SIGNATURE.
     """
 
     def __init__(self, client, collection_id, document_id):
@@ -1377,7 +1387,7 @@ class FakeDocumentReference:
         """Return a reference to the collection holding this document."""
         return FakeCollectionReference(self._client, self._collection_id)
 
-    def get(self, transaction=None):
+    def get(self, transaction=None, retry=None, timeout=None):
         """Read the document, optionally through a transaction.
 
         A read-write transactional read sees COMMITTED state, not the
@@ -1411,7 +1421,8 @@ class FakeDocumentReference:
             body = self._client.peek(self._collection_id, self.id)
         return FakeDocumentSnapshot(self, body)
 
-    def set(self, document_data, merge=False):
+    def set(self, document_data, merge=False, retry=None,
+            timeout=None):
         """Create or overwrite the document.
 
         Args:
@@ -1423,7 +1434,7 @@ class FakeDocumentReference:
         """
         return self._write('set', document_data, merge=merge)
 
-    def create(self, document_data):
+    def create(self, document_data, retry=None, timeout=None):
         """Create the document, refusing to overwrite an existing one.
 
         This is the primitive the whole one-vote-per-transaction rule
@@ -1443,7 +1454,7 @@ class FakeDocumentReference:
         """
         return self._write('create', document_data)
 
-    def update(self, field_updates):
+    def update(self, field_updates, retry=None, timeout=None):
         """Merge field updates into an existing document.
 
         Args:
@@ -1698,7 +1709,7 @@ class FakeQuery:
             cursor=self._cursor_spec(document_fields_or_snapshot, True)
         )
 
-    def get(self, transaction=None):
+    def get(self, transaction=None, retry=None, timeout=None):
         """Evaluate the query and return an INDEXABLE list.
 
         The list shape is load-bearing:
@@ -1717,7 +1728,8 @@ class FakeQuery:
             return transaction.read_query(self)
         return self._evaluate()
 
-    def stream(self, transaction=None):
+    def stream(self, transaction=None, retry=None,
+               timeout=None):
         """Evaluate the query and return an iterator of snapshots.
 
         Args:
@@ -1989,7 +2001,8 @@ class FakeCollectionReference(FakeQuery):
             self._client, self._collection_id, document_id
         )
 
-    def add(self, document_data, document_id=None):
+    def add(self, document_data, document_id=None, retry=None,
+            timeout=None):
         """Create a document, allocating an ID when none is given.
 
         Args:
@@ -2326,7 +2339,7 @@ class FakeTransaction:
         )
         return results
 
-    def get(self, ref_or_query):
+    def get(self, ref_or_query, retry=None, timeout=None):
         """Read a document or a query through this transaction.
 
         Returns an ITERABLE in both cases, which is what the real
