@@ -1560,90 +1560,135 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
     return bool(snapshot.exists)
 
 
-def _reported_publication_state(
+class CommittedRatingState(NamedTuple):
+    """What the datastore says about a rating that has just committed.
+
+    Three facts, read together because they come from one document and
+    one read. ``is_published`` gates visibility;  ``created_at`` and
+    ``updated_at`` are the timestamps the SERVER assigned, which is the
+    only place they exist - the write sends
+    ``firestore.SERVER_TIMESTAMP``, a sentinel that resolves at commit
+    and is never handed back to the writer.
+
+    Either timestamp is ``None`` when it could not be established, and
+    the caller is expected to substitute something serialisable rather
+    than propagate the gap: see :func:`submit_rating`.
+    """
+
+    is_published: bool
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+
+def _committed_rating_state(
     document_id: str,
     published_ids: Iterable[str],
-) -> bool:
-    """Report a just-created rating's TRUE visibility to its author.
+) -> CommittedRatingState:
+    """Read back a just-created rating, so the response describes IT.
 
-    "Did this call publish it?" and "is it published?" are different
-    questions, and answering the first while appearing to answer the
-    second is wrong in exactly one situation - the one that matters
-    here. When both counterparties submit at the same instant, one call
-    performs the reveal and the other finds the work already done, so
-    :func:`publish_if_reciprocal` returns nothing to it. Reading that
-    empty result as "unpublished" tells the second author their rating
-    is still hidden while the datastore says otherwise, and the two
-    submissions - identical in every respect that matters - would be
-    answered differently purely on timing.
+    The response to a create should state what was recorded, and two
+    parts of that are knowable only from the committed document.
 
-    So the list is consulted first, because when this call did the
-    publishing no read can add anything, and only otherwise is the
-    stored flag read. That read costs one get-by-ID on a write path,
-    which is the price of the response describing the record rather
-    than describing this call's part in producing it.
+    VISIBILITY. "Did this call publish it?" and "is it published?" are
+    different questions, and answering the first while appearing to
+    answer the second is wrong in exactly one situation - the one that
+    matters here. When both counterparties submit at the same instant,
+    one call performs the reveal and the other finds the work already
+    done, so :func:`publish_if_reciprocal` returns nothing to it.
+    Reading that empty result as "unpublished" tells the second author
+    their rating is still hidden while the datastore says otherwise, and
+    the two submissions - identical in every respect that matters -
+    would be answered differently purely on timing. So the list is
+    consulted first and wins: when this call did the publishing, no read
+    can contradict it, and publication never reverses.
 
-    What it reports is the state at the instant it reads, which is the
-    most any response can honestly claim: two exactly simultaneous
-    submissions do not share an instant, so a caller whose reciprocal
-    check ran before the counterparty's rating was visible has nothing
-    to reveal and nothing revealed to find, and ``False`` is correct for
-    it. Publication never reverses, so a ``True`` here stays true.
+    TIMESTAMPS. ``firestore.SERVER_TIMESTAMP`` is a sentinel, not a
+    time. It resolves during the commit and the resolved value is not
+    returned to the writer, so the only way to state when a rating was
+    created is to read the stored document. Substituting a local clock
+    reading instead - which is what this function replaced - produced a
+    response whose ``created_at`` disagreed with the record by however
+    long the round trip took, and whose ``updated_at`` claimed to equal
+    ``created_at`` even when the publication transition had rewritten it
+    milliseconds later. Both are answerable from the read that is
+    happening anyway.
 
-    NOTHING escapes this function. It runs after the rating has already
+    THE COST, STATED PLAINLY. This read now happens on every create,
+    including the reciprocal case that previously short-circuited on the
+    published-ids list alone. That is one get-by-ID on a write path, and
+    it buys a response that describes the record rather than this call's
+    part in producing it. A get-by-ID is strongly consistent
+    immediately after its own commit, so what it reports is the state
+    the caller's write produced.
+
+    NOTHING ESCAPES THIS FUNCTION. It runs after the rating has already
     committed, and the whole point of the deferred publication design is
     that a failure to REVEAL a rating is never reported as a failure to
     RECORD it - see :func:`submit_rating`. Raising here would undo that
     at the last step: the caller would see an error for work that
     succeeded, retry, and be answered with a duplicate conflict. Every
-    failure therefore degrades to ``False``, which is the safe direction
-    - it under-reports visibility for one response, and the very next
-    read of the rating or of the eligibility decision reports the truth.
+    failure therefore degrades - visibility to ``False``, which
+    under-reports for one response and is corrected by the very next
+    read, and each timestamp to ``None``, which the caller answers with
+    the local stamp this function exists to improve upon. Degraded is
+    the pre-existing behaviour, so no failure mode is worse than before.
 
     Args:
         document_id: The rating's deterministic document ID.
         published_ids: IDs published by this call's reciprocal check.
 
     Returns:
-        ``True`` when the rating is published, ``False`` when it is not
-        or when its state could not be established.
+        A :class:`CommittedRatingState`. ``is_published`` is ``True``
+        only when publication is established; the timestamps are the
+        stored server values, or ``None`` where they are unavailable.
     """
-    if document_id in set(published_ids or ()):
-        return True
+    # Authoritative on its own: this call performed the reveal, so the
+    # rating IS published whatever the read below manages to establish.
+    published = document_id in set(published_ids or ())
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
     try:
         snapshot = (
             db.collection(RATINGS_COLLECTION)
             .document(document_id)
             .get(**DATASTORE_CALL)
         )
-        if not snapshot.exists:
-            # The rating was committed a moment ago, so this is either a
-            # read served before the write was visible or a foreign
-            # deletion. Neither is a reason to fail the response.
-            return False
-        return _locked_publication_flag(
-            document_id,
-            snapshot.to_dict() or {},
-        )
+        if snapshot.exists:
+            body = snapshot.to_dict() or {}
+            # Harvested BEFORE the flag is interpreted, because
+            # ``_locked_publication_flag`` raises on a stored
+            # ``is_published`` that is not a boolean. A corrupt flag is
+            # no reason to also discard two perfectly good timestamps,
+            # and ``_as_aware_datetime`` already reduces anything that
+            # is not a usable point in time to ``None``.
+            created_at = _as_aware_datetime(body.get('created_at'))
+            updated_at = _as_aware_datetime(body.get('updated_at'))
+            if not published:
+                published = _locked_publication_flag(document_id, body)
+        # A missing document means the rating was committed a moment ago
+        # and this is either a read served before the write was visible
+        # or a foreign deletion. Neither is a reason to fail the
+        # response, so the defaults above stand.
     except DEFERRABLE_PUBLICATION_ERRORS as error:
         # A transient fault, or a stored flag that is not a boolean and
         # must never be guessed at. Reported at the severity its cause
         # deserves by the shared helper, exactly as the publication
         # paths report it.
         _log_publication_failure(document_id, error)
-        return False
     except Exception:
         # Not transient and not a data invariant, so it is a defect in
         # this module. Recorded with a stack trace and an explicit
         # marker so it cannot pass for routine deferred work - but still
         # not raised, because the rating itself is safely recorded.
         logger.exception(
-            'BUG: unexpected failure while reading the publication '
-            'state of rating %s. The rating is recorded; reporting it '
-            'as unpublished.',
+            'BUG: unexpected failure while reading back rating %s. The '
+            'rating is recorded; reporting its stored state as far as '
+            'it could be established.',
             document_id,
         )
-        return False
+
+    return CommittedRatingState(published, created_at, updated_at)
 
 
 def _submit_transaction_body(
@@ -2015,8 +2060,14 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
     Returns:
         The persisted rating. Its ``created_at``/``updated_at`` carry a
         real UTC timestamp rather than the server-side sentinel that was
-        written, because the sentinel is not a serialisable value; the
-        authoritative times are whatever the server stamped.
+        written, because the sentinel is not a serialisable value, and
+        they are READ BACK from the committed document so they are the
+        times the server actually assigned - ``updated_at`` therefore
+        reflects the publication transition when this call revealed the
+        pair. Only if that read-back cannot establish them does the
+        response fall back to a local clock reading taken just after the
+        commit, which is close to the stored value rather than equal to
+        it.
         ``is_published`` reports the rating's STORED visibility, so it
         is ``True`` both when this call revealed the pair and when the
         counterparty's simultaneous call got there first. It degrades to
@@ -2124,19 +2175,32 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
             document_id,
         )
 
-    stamped = datetime.now(timezone.utc)
-    result = dict(body)
-    # The STORED state, not this call's contribution to it. Under an
+    # The STORED record, not this call's contribution to it. Under an
     # exact reciprocal race the counterparty's call performs the reveal
     # and this one is handed an empty list, so the list alone would
-    # report a published rating as hidden; see
-    # :func:`_reported_publication_state`, which never raises.
-    result['is_published'] = _reported_publication_state(
-        document_id,
-        published_ids,
-    )
-    result['created_at'] = stamped
-    result['updated_at'] = stamped
+    # report a published rating as hidden; and the timestamps exist
+    # nowhere but the committed document, because what was written was
+    # the ``SERVER_TIMESTAMP`` sentinel. One read answers both. It never
+    # raises - see :func:`_committed_rating_state`.
+    state = _committed_rating_state(document_id, published_ids)
+
+    # The fallback, and the reason one is required at all: ``body`` still
+    # carries the sentinel this payload was written with, and
+    # ``RatingView`` demands real datetimes - so a rating whose read-back
+    # failed must still be serialisable rather than 500 on a create that
+    # succeeded. This local reading is a few milliseconds after the
+    # commit rather than the commit itself, which is exactly the
+    # imprecision the read above removes in the normal case; it is
+    # correct to the extent it can be and never absent.
+    stamped = datetime.now(timezone.utc)
+
+    result = dict(body)
+    result['is_published'] = state.is_published
+    result['created_at'] = state.created_at or stamped
+    # Falls back to the created value before the local stamp, because a
+    # record that has never been updated since it was written should
+    # report the two as equal rather than as milliseconds apart.
+    result['updated_at'] = state.updated_at or state.created_at or stamped
     return Rating(**result)
 
 

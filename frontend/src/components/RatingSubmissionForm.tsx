@@ -124,6 +124,21 @@ import type { EligibilityDecision, Rating } from '../schema/rating';
  * confirmation states it in plain language whenever `isPublished` is false. This
  * is a product requirement, not decoration.
  *
+ * NO OUTCOME MAY LEAVE THE KEYBOARD WITH NOWHERE TO STAND
+ * -----------------------------------------------------------------------------
+ * Every request this form issues is started from a control that it then disables,
+ * and every one of the four outcomes takes that control away: success unmounts it,
+ * failure disables and re-enables it. In both cases the browser drops focus to
+ * `document.body`, and the failure case is the quieter defect, because the control
+ * comes back looking pressable while the keyboard has silently lost its place.
+ *
+ * So all four outcomes place focus deliberately — see `pendingFocus`. A success
+ * moves it to what replaced the control; a failure restores it to the control
+ * itself, and only when focus was genuinely dropped, so a user who moved on during
+ * the request is never yanked back. Nothing here relies on a live region alone:
+ * announcing an outcome and leaving the reader on the body are not alternatives to
+ * each other (WCAG 2.4.3 Focus Order, 2.4.7 Focus Visible).
+ *
  * STYLING
  * -----------------------------------------------------------------------------
  * Tailwind utilities from the default scale only. `../../tailwind.config.js`
@@ -415,6 +430,39 @@ const describeCounterparty = (
 };
 
 /**
+ * Report whether the browser currently has focus on NOTHING.
+ *
+ * This is the test that separates restoring a keyboard user's place from stealing
+ * it, and it is a question about the document rather than about this component.
+ * Disabling the element that holds focus — which is what every in-flight state
+ * here does to the control that started the request — makes the browser blur it
+ * with a `relatedTarget` of `null` and fall back to `document.body`. So "focus is
+ * on the body" is the observable signature of a position that was taken away, and
+ * it is the only condition under which a failure path may put focus back.
+ *
+ * `documentElement` is included because that is the fallback in some engines, and
+ * a disconnected element because a removed node can remain `activeElement` for the
+ * moment between the removal and the browser's own reset — focusing something else
+ * then is a rescue, not an interruption.
+ *
+ * Anything else means a real, attached element has focus: the user has moved on,
+ * possibly to the review field or to another part of the page entirely, and the
+ * correct behaviour is to leave them exactly where they are.
+ *
+ * @returns `true` when there is no focused element to preserve.
+ */
+const focusWasDropped = (): boolean => {
+  const active = document.activeElement;
+
+  return (
+    active === null ||
+    active === document.body ||
+    active === document.documentElement ||
+    !active.isConnected
+  );
+};
+
+/**
  * Classes for the review textarea.
  *
  * `border-gray-500` rather than a lighter step: the boundary of an input is a
@@ -592,18 +640,50 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   const scoreGroupRef = useRef<StarRatingInputHandle | null>(null);
 
   /**
+   * The two controls a request can be started FROM, so focus can be put back on
+   * whichever one the failure left inert.
+   *
+   * Neither is removed by a failure — they are re-enabled in place — so unlike the
+   * success destinations these are not "somewhere else to go". They are the place
+   * the user already was, which is why restoring them is the whole fix: see
+   * `pendingFocus`.
+   */
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null);
+  const submitButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  /**
+   * The assertive region, as the fallback destination for a failure.
+   *
+   * Used only when the control the user activated cannot take focus back — it has
+   * been unmounted, or the same commit left it disabled for an unrelated reason.
+   * The reason this region rather than the polite one: on a failure it is the
+   * region that HOLDS THE TEXT. The polite `role="status"` paragraph carries
+   * loading, ineligibility and confirmation copy, and on a failed request it is
+   * empty, so focusing it would land the user on nothing at all.
+   */
+  const alertRef = useRef<HTMLParagraphElement | null>(null);
+
+  /**
    * Where focus must go once the DOM reflects the change that removed it.
    *
-   * WHY THIS EXISTS. Two transitions in this component delete the element the user
-   * was standing on:
+   * WHY THIS EXISTS. Four transitions in this component take away the element the
+   * user was standing on. Two REMOVE it:
    *
    *   - a successful SUBMIT unmounts the whole form, taking the submit button with
    *     it, because a recorded rating is terminal and nothing offers to change it;
    *   - a successful RETRY unmounts the "Check again" button, because there is no
    *     longer anything to retry.
    *
-   * When focus is inside an element that is removed, the browser moves it to
-   * `document.body`. For a keyboard or screen-reader user that is not a small
+   * and two DISABLE it for the duration of a request that then fails:
+   *
+   *   - a refused SUBMIT — 403, 409, 422, a dropped connection — disables the
+   *     submit button while it is in flight and re-enables it afterwards;
+   *   - a failed RETRY does the same to "Check again".
+   *
+   * All four end in the same place. When focus is inside an element that is
+   * removed OR disabled, the browser moves it to `document.body`: measured here as
+   * `blur` on the button with `relatedTarget: null` at the instant `disabled`
+   * commits. For a keyboard or screen-reader user that is not a small
    * inconvenience: their position in the document is gone, nothing is announced
    * where they now are, and the next Tab starts again from the top of the page —
    * WCAG 2.4.3 Focus Order, and the reason a live region alone is not sufficient
@@ -611,17 +691,27 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * the user nowhere, with no way to reach the sentence saying so except by
    * re-traversing the page.
    *
-   * WHY IT IS STATE AND NOT A CALL IN THE HANDLER. The destination does not exist
-   * yet at the moment the decision is made. `setSubmittedRating(created)` schedules
-   * a render; the confirmation is only focusable after that render commits. So the
-   * handler records an INTENT and the effect below acts on it once React has
-   * flushed, which is also what makes the behaviour correct under batching and
-   * under React 18's double-invoked development renders.
+   * The failure pair is the worse of the two, because nothing about it is visible:
+   * the control comes back looking exactly as it did before it was pressed, minus
+   * the focus ring, so the interface presents a ready button that the keyboard has
+   * to go and find again. Measured cost before this was handled: 1-2 Tab presses
+   * back to "Check again", 3-4 back to "Submit rating", the first of them
+   * frequently leaving the document altogether because the sequential-focus
+   * starting point sat on the control that had just been disabled.
+   *
+   * WHY IT IS STATE AND NOT A CALL IN THE HANDLER. The destination is not
+   * focusable yet at the moment the decision is made. `setSubmittedRating(created)`
+   * schedules a render and the confirmation is only focusable after that render
+   * commits; `setIsSubmitting(false)` schedules a render and the submit button is
+   * only focusable after THAT one. So the handler records an INTENT and the effect
+   * below acts on it once React has flushed, which is also what makes the
+   * behaviour correct under batching and under React 18's double-invoked
+   * development renders.
    *
    * `null` means "nothing to move", which is the normal state.
    */
   const [pendingFocus, setPendingFocus] = useState<
-    'confirmation' | 'controls' | null
+    'confirmation' | 'controls' | 'retry' | 'submit' | null
   >(null);
 
   /**
@@ -700,6 +790,31 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       if (isCurrent()) {
         setEligibilityFailed(true);
         setErrorMessage(extractDetail(error, ELIGIBILITY_FAILURE_MESSAGE));
+
+        if (isRetry) {
+          /*
+           * A FAILED retry has to rescue focus for the same reason a successful
+           * one does, and it is the harder case. The successful one removes the
+           * button, so the loss is at least visible; this one puts the button
+           * back exactly as it was, so the interface shows a ready control while
+           * the keyboard has been left on `document.body` with no indicator
+           * anywhere. Only a retry queues this — the initial load reaches here
+           * too and the user is not standing on anything then, so moving focus
+           * would be theft rather than rescue, which is the same reason the
+           * success branch above tests `isRetry`.
+           *
+           * The loading flag is cleared HERE, ahead of the `finally` that also
+           * clears it, because the destination has to be focusable in the commit
+           * the effect observes: `disabled={isLoadingEligibility}` is what took
+           * focus away, and `focus()` on a still-disabled button is a silent
+           * no-op. React 18 batches these two updates into one commit, and where
+           * it does not the order is what makes the button enabled before the
+           * intent is acted on. The `finally` then sets the same value again and
+           * React bails out, so this costs nothing.
+           */
+          setIsLoadingEligibility(false);
+          setPendingFocus('retry');
+        }
       }
     } finally {
       // In `finally` so the controls leave their loading state on both paths.
@@ -743,26 +858,35 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   }, [transactionId, loadEligibility]);
 
   /**
-   * Move focus once the render that removed its previous home has committed.
+   * Move focus once the render that took away its previous home has committed.
    *
-   * This runs AFTER the DOM is updated, which is the only point at which the
-   * destination exists: the confirmation is focusable only once
-   * `submittedRating` has rendered, and the star group is enabled only once an
-   * eligible decision has. Doing it in the handler would focus an element that was
-   * still disabled, or one React was about to replace.
+   * This runs AFTER the DOM is updated, which is the only point at which any of
+   * the four destinations is focusable: the confirmation exists only once
+   * `submittedRating` has rendered, the star group is enabled only once an eligible
+   * decision has, and each of the two controls is re-enabled only once its
+   * in-flight flag has cleared. Doing it in the handler would focus an element that
+   * was still disabled, or one React was about to replace.
    *
-   * `tabIndex={-1}` on the status paragraph is what makes it focusable at all
-   * without adding it to the tab sequence — it is not a control, so Tab must not
-   * stop on it, but focus may be placed there programmatically. Focusing it is also
-   * what guarantees the confirmation is READ: a live region announces a change, and
-   * a region the user is standing on is announced again on demand and is where
-   * their next Tab starts from.
+   * TWO KINDS OF DESTINATION, AND THEY ARE NOT SYMMETRICAL. `'confirmation'` and
+   * `'controls'` follow a SUCCESS that removed the element the user was on, so they
+   * move focus somewhere new and do so unconditionally — there is nothing left to
+   * preserve. `'retry'` and `'submit'` follow a FAILURE that merely disabled that
+   * element and then put it back, so they RESTORE rather than move, and only when
+   * `focusWasDropped()` confirms the browser is pointing at nothing.
+   *
+   * `tabIndex={-1}` on the status and alert paragraphs is what makes them focusable
+   * at all without adding them to the tab sequence — neither is a control, so Tab
+   * must not stop on them, but focus may be placed there programmatically. Focusing
+   * one is also what guarantees its sentence is READ: a live region announces a
+   * change, and a region the user is standing on is announced again on demand and is
+   * where their next Tab starts from.
    *
    * The intent is cleared immediately, so a later unrelated re-render cannot move
    * focus a second time and drag it away from wherever the user has since gone.
    * `focus()` on the star group is a no-op while it is disabled, so a decision that
    * arrived eligible and was disabled again in the same commit cannot leave focus
-   * on an inert control.
+   * on an inert control; the failure branch makes the equivalent check explicitly,
+   * because a `<button>` does not refuse focus as politely.
    */
   useEffect(() => {
     if (pendingFocus === null) {
@@ -771,8 +895,39 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
 
     if (pendingFocus === 'controls') {
       scoreGroupRef.current?.focus();
-    } else {
+    } else if (pendingFocus === 'confirmation') {
       statusRef.current?.focus();
+    } else if (focusWasDropped()) {
+      /*
+       * A FAILURE destination, and the guard above is the whole difference
+       * between restoring a place and stealing one. The two success intents move
+       * focus to somewhere new because the old home no longer exists. These two
+       * put it back where it already was, so they must only act when it was in
+       * fact taken away: `focusWasDropped()` is true exactly when the browser
+       * has nowhere to point, which is what disabling the focused control
+       * produces. If the user spent the request Tabbing into the review field —
+       * or anywhere else on the page — focus stays with them, because being
+       * yanked back to a button you deliberately left is worse than the loss
+       * this is fixing.
+       */
+      const control =
+        pendingFocus === 'retry'
+          ? retryButtonRef.current
+          : submitButtonRef.current;
+
+      if (control !== null && !control.disabled) {
+        control.focus();
+      } else {
+        /*
+         * The control cannot take focus back: it has been unmounted, or this
+         * commit left it disabled for a reason of its own. The assertive region
+         * is the fallback because on a failure it is the element carrying the
+         * explanation, and `tabIndex={-1}` makes it a programmatic target
+         * without putting a paragraph in the tab sequence. Landing there is
+         * still a place in the document next to the reason, which is the point.
+         */
+        alertRef.current?.focus();
+      }
     }
 
     setPendingFocus(null);
@@ -1030,6 +1185,30 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
 
       setErrorMessage(describeSubmissionFailure(error));
 
+      /*
+       * The submission was refused, so the form is still here and the user still
+       * has something to do — but the button they pressed was disabled while the
+       * request was in flight, which handed focus to `document.body`, and
+       * re-enabling it does not hand it back. Without this the interface reads as
+       * ready while the keyboard is nowhere: the refusal is announced by the
+       * assertive region, the button looks pressable, and reaching it again costs
+       * three or four Tab presses past the star group and the textarea.
+       *
+       * `setIsSubmitting(false)` is called here as well as in the `finally`
+       * because the destination must be focusable in the commit the effect
+       * observes — `disabled={!canSubmit}` includes `isSubmitting`, and
+       * `focus()` on a disabled button is a silent no-op. React 18 batches the
+       * two into one commit; where it does not, this ordering is what makes the
+       * button enabled before the intent is acted on. The `finally` then writes
+       * the same value and React bails out.
+       *
+       * The intent is queued unconditionally and the EFFECT decides whether to
+       * act, because whether focus was actually dropped is a fact about the DOM
+       * after the commit, not about this handler.
+       */
+      setIsSubmitting(false);
+      setPendingFocus('submit');
+
       return;
     } finally {
       // In `finally` so a failure re-enables the button for another attempt.
@@ -1216,7 +1395,19 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
         while "your submission was refused" interrupts. Sharing one region would
         force every refusal to wait behind whatever was being announced.
       */}
-      <p role="alert" className="mt-1 text-sm font-semibold text-red-700">
+      <p
+        ref={alertRef}
+        role="alert"
+        /*
+          `-1` for the same reason the status paragraph carries it: this is a
+          message rather than a control, so Tab must not stop here, but focus may
+          be placed here programmatically. It is the fallback destination when a
+          failure re-enables nothing to go back to — and on a failure this is the
+          region holding the explanation, which the polite one is not.
+        */
+        tabIndex={-1}
+        className="mt-1 text-sm font-semibold text-red-700"
+      >
         {alertMessage}
       </p>
 
@@ -1241,6 +1432,7 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       */}
       {eligibilityFailed && !hasSubmitted ? (
         <button
+          ref={retryButtonRef}
           type="button"
           onClick={handleRetry}
           disabled={isLoadingEligibility}
@@ -1359,6 +1551,7 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
             about why.
           */}
           <button
+            ref={submitButtonRef}
             type="submit"
             disabled={!canSubmit}
             aria-describedby={statusId}
