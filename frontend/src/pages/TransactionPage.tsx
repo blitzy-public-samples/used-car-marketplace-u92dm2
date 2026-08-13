@@ -5,7 +5,8 @@ import PaymentStatus from '@/components/PaymentStatus';
 // RELATIVE path deliberately, NOT the `@/…` prefix the two lines above use.
 // `tsconfig.json` declares six aliases — `@components/*`, `@pages/*`,
 // `@utils/*`, `@styles/*`, `@hooks/*`, `@context/*` — and no bare `@/*`, and
-// `vite.config.ts` mirrors exactly those six. That prefix therefore resolves in
+// `vite.config.ts` mirrors the four of those with a real target directory. That
+// prefix therefore resolves in
 // neither the type-checker nor the bundler, which is why the lines above sit in
 // this project's pre-existing TS2307 baseline. Do not "fix" this line to match
 // them for consistency; repairing them is a separate, out-of-scope change.

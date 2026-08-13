@@ -8,12 +8,17 @@
  * src/styles/index.css and that stylesheet's import from the application
  * entry point, this file is what makes styling work.
  *
- * STATUS: that last link is NOT YET IN PLACE. `src/index.tsx` has no CSS import,
- * so nothing pulls the stylesheet into the bundle and no rule is emitted for any
- * class name yet. The tokens below are correct and will take effect the moment
- * the entry point imports src/styles/index.css; describing styling as already
- * active would be reporting a milestone that has not been reached.
- *
+ * STATUS: the chain is COMPLETE and the tokens below are live. All four links
+ * are in place - this file supplies the tokens, postcss.config.js registers the
+ * `tailwindcss` and `autoprefixer` plugins, src/styles/index.css holds the
+ * `@tailwind base/components/utilities` directives, and `src/index.tsx` imports
+ * './styles/index.css', so the stylesheet reaches the bundle, PostCSS runs the
+ * `tailwindcss` plugin over its `@tailwind` directives, and the tokens below
+ * decide what is emitted. Verified by compiling src/styles/index.css through
+ * postcss with this configuration and confirming the output contains the
+ * accessibility-critical `ring-2`, `ring-offset-2` and `outline-none` rules
+ * named below - not by inspecting the import statement, which is necessary for
+ * styling to work but not sufficient. *
  * No component library is installed, so Tailwind's utilities are the whole
  * design system. Accessibility-critical utilities — the visible focus
  * indicator `focus:outline-none focus:ring-2 focus:ring-offset-2` required by

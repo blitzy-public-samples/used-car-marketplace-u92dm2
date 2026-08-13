@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -8,10 +8,10 @@ from typing import Optional
 from pydantic import BaseModel, ValidationError
 from app.core.config import settings
 from app.db.firestore import (
-    DATASTORE_CALL,
     DATASTORE_RETRY_AFTER_SECONDS,
     DATASTORE_UNAVAILABLE_DETAIL,
     DATASTORE_UNAVAILABLE_ERRORS,
+    datastore_call,
     db,
 )
 from app.schema.user import User, is_valid_document_id
@@ -46,11 +46,14 @@ CREDENTIAL_FIELDS = ('password_hash', 'hashed_password')
 # import raises and the whole application fails to start.
 auth_router = APIRouter()
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
+
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
+
 
 def authenticate_user(email: str, password: str) -> User:
     # Bounded by the shared datastore policy, like every other call in
@@ -60,7 +63,7 @@ def authenticate_user(email: str, password: str) -> User:
         db.collection('users')
         .where('email', '==', email)
         .limit(1)
-        .get(**DATASTORE_CALL)
+        .get(**datastore_call())
     )
     if not user_doc:
         return False
@@ -104,15 +107,34 @@ def authenticate_user(email: str, password: str) -> User:
         )
         return False
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+
+def create_access_token(
+    data: dict,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        # ``ACCESS_TOKEN_EXPIRE_MINUTES`` is a REQUIRED setting - every
+        # environment must supply it - and this is the only place it can
+        # take effect. A hardcoded fifteen minutes stood here instead,
+        # so the setting was required, documented, and ignored: an
+        # operator who shortened the lifetime after an incident, or
+        # lengthened it deliberately, changed nothing at all and had no
+        # way to tell. Reading it here is what makes the configuration
+        # contract true.
+        expire = datetime.utcnow() + timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
+        )
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    encoded_jwt = jwt.encode(
+        to_encode,
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
     return encoded_jwt
+
 
 # HUMAN ASSISTANCE NEEDED
 # This function might need additional error handling and security checks
@@ -168,7 +190,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     # Because it runs on every request it is also the FIRST datastore
     # touch of every authenticated route, which makes it the place an
     # unreachable datastore is noticed. It is bounded by the shared
-    # ``DATASTORE_CALL`` policy and its exhaustion is answered as a 503
+    # ``datastore_call`` policy and its exhaustion is answered as a 503
     # rather than left to propagate: unbounded, this call held a
     # threadpool thread for minutes and the caller received a bare
     # "Internal Server Error" with no envelope, so an outage of the
@@ -180,7 +202,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         user_doc = (
             db.collection('users')
             .document(user_id)
-            .get(**DATASTORE_CALL)
+            .get(**datastore_call())
         )
     except DATASTORE_UNAVAILABLE_ERRORS as error:
         logger.error(
@@ -212,6 +234,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         # expose the stored shape. Narrowed to ValidationError on
         # purpose: any other failure still surfaces.
         raise credentials_exception
+
 
 class Token(BaseModel):
     access_token: str

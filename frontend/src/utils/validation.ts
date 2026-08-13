@@ -1,7 +1,9 @@
 import { VehicleListingSchema } from '../schema/listing';
 import {
+  DOCUMENT_ID_MAX_LENGTH,
   RatingCreateSchema,
   REVIEW_MAX_LENGTH,
+  REVIEW_RAW_MAX_LENGTH,
   normalizeReviewText,
   textLength,
   type RatingCreate,
@@ -143,10 +145,44 @@ export interface PreparedReview {
  * passing `value` to it is idempotent and the guarantee that no unsanitised text
  * can reach the wire stays structural rather than a matter of call order.
  *
+ * A RAW CEILING IS APPLIED BEFORE ANY OF IT. See the guard's own note: step 1
+ * parses its input as HTML, and this function runs on every keystroke and on every
+ * paste, so it must never be handed an unbounded string.
+ *
  * @param raw Review text exactly as typed, including the empty string.
  * @returns The prepared value, its code-point length, and whether it is too long.
  */
 export const prepareReviewText = (raw: string): PreparedReview => {
+  /*
+   * REFUSE BEFORE PARSING. `sanitizeUserInput` builds a DOM fragment from its
+   * argument, which is proportional in cost to the input and can be far worse than
+   * linear for pathological markup — and this function is called on every render
+   * of the review field, including the render that follows a paste. Handing it a
+   * multi-megabyte clipboard payload freezes the tab, on the main thread, with no
+   * ceiling of any kind. The cheap check therefore comes first and the expensive
+   * work is never reached for input that could not be accepted anyway.
+   *
+   * THE MEASURE IS `String.length` DELIBERATELY, and it is compared against
+   * `REVIEW_RAW_MAX_LENGTH`, because that is exactly the measure and the bound
+   * `RatingCreateSchema.review` applies with `.max(REVIEW_RAW_MAX_LENGTH)` before
+   * its own transform runs. So this refuses precisely what the authority refuses —
+   * it is not a stricter client-side rule — and `String.length` costs nothing to
+   * read, where a code-point count would mean scanning the whole hostile payload
+   * to refine a number that is already an order of magnitude past the bound.
+   *
+   * The reported `length` is that same code-unit figure, so the counter's number
+   * and the reason it is refused agree with each other. It is the one input for
+   * which `length` is not a code-point count, and it is the one input for which
+   * counting them would be the defect.
+   */
+  if (raw.length > REVIEW_RAW_MAX_LENGTH) {
+    return {
+      value: undefined,
+      length: raw.length,
+      isOverLimit: true,
+    };
+  }
+
   const prepared = normalizeReviewText(sanitizeUserInput(raw));
   const length = textLength(prepared);
 
@@ -216,6 +252,84 @@ export const validateRatingInput = (input: unknown): RatingCreate =>
   RatingCreateSchema.parse(withSanitizedReview(input));
 
 /**
+ * Read the seller's user ID off a loaded vehicle listing. F010-3.
+ *
+ * The reputation badge on the vehicle details page needs to know WHOSE
+ * reputation to fetch, and the only place that is stated is the listing payload
+ * the page has already loaded. This function is that read, extracted so it can be
+ * tested directly: the page itself cannot be rendered in a test, because five of
+ * its imports use an `@/…` specifier that resolves in neither the type-checker
+ * nor the bundler — a pre-existing, out-of-scope defect it shares with some
+ * thirty other files.
+ *
+ * `seller_id` IS THE FIELD, AND IT IS SNAKE_CASE
+ * -----------------------------------------------------------------------------
+ * The authority is the server: `backend/app/schema/listing.py` declares
+ * `VehicleListing.seller_id`, and `GET /api/listings/{id}` returns that model
+ * verbatim with no camelCase mapper anywhere on the path. The page previously
+ * read `sellerId`, which is `undefined` on every real response — so its own
+ * "no seller id, no request" guard was taken every time and the badge was
+ * permanently empty on a screen whose entire purpose is to inform a buyer about
+ * the person they are about to transact with. The camelCase spelling exists only
+ * in `frontend/src/schema/listing.ts`, which nothing on this path parses through.
+ *
+ * `sellerId` is still accepted, second, and deliberately not first: a caller that
+ * has already normalised the payload should not be broken by this, but the wire
+ * spelling has to win so that a normaliser introduced later cannot silently
+ * shadow the authoritative field with a stale copy of it.
+ *
+ * WHY THE VALUE IS CHECKED AND NOT JUST READ
+ * -----------------------------------------------------------------------------
+ * The result is fed to `/api/ratings/user/{userId}/aggregate`, whose path
+ * parameter the server validates against the Firestore document-ID grammar. An
+ * empty or whitespace-only string, or a value carrying a `/`, would spend a round
+ * trip to be answered 404 or 422 — and `/ratings/user//aggregate` would not even
+ * address the intended route. Those are reported here as "no seller id" instead,
+ * which is the state the page already handles by leaving the badge in its empty
+ * state. Anything longer than the grammar permits is refused for the same reason.
+ *
+ * Nothing about a listing is asserted beyond this one field. The payload is
+ * `unknown` because that is what it is: this page's listing fetch is untyped, and
+ * narrowing one field is all this function claims to do.
+ *
+ * @param listing The loaded listing payload, of unestablished shape — typically
+ *   still `null` while the fetch is in flight.
+ * @returns The seller's user ID, or `undefined` when the payload carries no
+ *   usable one. `undefined` is a legitimate, non-error state: it holds while the
+ *   listing is loading and it can persist afterwards, since the listing endpoint
+ *   is owned elsewhere and cannot be assumed to include the field.
+ */
+export const readListingSellerId = (
+  listing: unknown
+): string | undefined => {
+  if (typeof listing !== 'object' || listing === null) {
+    return undefined;
+  }
+
+  const candidate = listing as { seller_id?: unknown; sellerId?: unknown };
+  const value =
+    typeof candidate.seller_id === 'string'
+      ? candidate.seller_id
+      : candidate.sellerId;
+
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > DOCUMENT_ID_MAX_LENGTH ||
+    trimmed.includes('/')
+  ) {
+    return undefined;
+  }
+
+  return trimmed;
+};
+
+/**
  * Replace a candidate's `review` with its plain-text form, leaving everything
  * else exactly as supplied.
  *
@@ -242,6 +356,24 @@ const withSanitizedReview = (input: unknown): unknown => {
   const candidate = input as { review?: unknown };
 
   if (typeof candidate.review !== 'string' || candidate.review.length === 0) {
+    return input;
+  }
+
+  /*
+   * PAST THE RAW CEILING, HAND IT ON UNSANITISED AND LET THE SCHEMA REFUSE IT.
+   *
+   * Sanitising means parsing, and parsing an unbounded string is the cost this
+   * guard exists to avoid — a caller that reaches `validateRatingInput` directly,
+   * without going through `prepareReviewText`, would otherwise pay it here
+   * instead. Returning the input untouched is safe rather than a bypass: the very
+   * next thing that happens is `RatingCreateSchema.parse`, whose `review` field
+   * applies `.max(REVIEW_RAW_MAX_LENGTH)` to the string BEFORE its transform, so
+   * an oversized review is rejected with a `ZodError` and no such value can reach
+   * the wire. The comparison here uses `String.length` precisely because that is
+   * the measure `.max` uses, so the two cannot disagree about which side of the
+   * ceiling a string falls on.
+   */
+  if (candidate.review.length > REVIEW_RAW_MAX_LENGTH) {
     return input;
   }
 

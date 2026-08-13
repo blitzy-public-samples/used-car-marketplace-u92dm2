@@ -65,6 +65,16 @@ const REQUIRED_API_BASE_URL = 'REACT_APP_API_BASE_URL';
 const MODES_REQUIRING_API_BASE_URL = ['development', 'production'];
 
 /**
+ * The Stripe publishable key the entry point asserts is present.
+ *
+ * Required in the same modes as the API base URL and for the same reason:
+ * both are read at module scope by code that runs in the browser, so an
+ * absent value is a runtime failure in a shipped bundle rather than a
+ * build-time one. See `assertStripePublicKey`.
+ */
+const REQUIRED_STRIPE_PUBLIC_KEY = 'REACT_APP_STRIPE_PUBLIC_KEY';
+
+/**
  * Reject a missing or malformed public API base URL at config-load time.
  *
  * Throwing here is the point. This is the earliest moment the value is knowable
@@ -112,12 +122,93 @@ const assertApiBaseUrl = (mode: string, env: Record<string, string>): void => {
     );
   }
 
+  // Credentials in a URL are a leak, not a convenience. This value is
+  // INLINED INTO THE BUNDLE by the `define` block below, so a `user:pass@`
+  // prefix here publishes those credentials to every visitor who opens the
+  // JavaScript, and browsers strip userinfo from fetch requests anyway, so it
+  // could not have authenticated anything. Refuse it where the mistake is
+  // still recoverable.
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(
+      `${REQUIRED_API_BASE_URL} must not contain credentials: a ` +
+        'user:pass@host value would be published in the client bundle and ' +
+        'is ignored by the browser in any case. Use an absolute origin ' +
+        'plus /api and authenticate with the bearer token.'
+    );
+  }
+
+  // A query or fragment is not part of a base URL. axios appends each request
+  // path to this value, so `?debug=1` or `#x` lands in the MIDDLE of the
+  // resulting URL ("…/api?debug=1/listings"), producing 404s from a server
+  // that is working perfectly.
+  if (parsed.search !== '' || parsed.hash !== '') {
+    throw new Error(
+      `${REQUIRED_API_BASE_URL} must be an origin plus path only, with no ` +
+        `query string and no fragment, got ${JSON.stringify(raw)}. Every ` +
+        'request path is appended to this value.'
+    );
+  }
+
   const pathname = parsed.pathname.replace(/\/+$/, '');
   if (!pathname.endsWith('/api')) {
     throw new Error(
       `${REQUIRED_API_BASE_URL} must include the /api path the backend ` +
         `mounts its routers under, got ${JSON.stringify(raw)}. Example: ` +
         'http://localhost:8000/api'
+    );
+  }
+};
+
+/**
+ * Reject a missing or malformed Stripe publishable key at config-load time.
+ *
+ * `src/index.tsx` reads this variable at module scope and hands it to
+ * `loadStripe(STRIPE_PUBLIC_KEY!)` — a non-null assertion on a value nothing
+ * had ever checked. That file is do-not-touch for this change, so the assertion
+ * stays; what changes is that it becomes TRUE by construction. A build or a dev
+ * server that reaches the browser now cannot exist without the key, so the
+ * assertion is backed by this gate rather than by hope, and the failure moves
+ * from a runtime `IntegrationError` inside Stripe's SDK — after the bundle has
+ * shipped — to a build that stops with the variable named.
+ *
+ * Only the publishable key belongs in a bundle. It is designed to be public
+ * (that is the difference between `pk_` and `sk_`), so it is required here; a
+ * SECRET key would be a serious leak, and one that starts `sk_` is refused
+ * outright rather than quietly inlined.
+ *
+ * @param mode The Vite mode being configured.
+ * @param env The variables `loadEnv` resolved for that mode.
+ * @throws {Error} The variable is unset or blank in a browser-facing mode, or
+ *   it is a secret key.
+ */
+const assertStripePublicKey = (
+  mode: string,
+  env: Record<string, string>
+): void => {
+  const raw = (env[REQUIRED_STRIPE_PUBLIC_KEY] ?? '').trim();
+
+  // A secret key is refused in EVERY mode, including test: a value that starts
+  // `sk_` is wrong wherever it appears, and saying so early is the only cheap
+  // moment to catch it.
+  if (raw.startsWith('sk_') || raw.startsWith('rk_')) {
+    throw new Error(
+      `${REQUIRED_STRIPE_PUBLIC_KEY} looks like a SECRET key. Only the ` +
+        'publishable key (pk_test_… or pk_live_…) may be built into a ' +
+        'client bundle; a secret key there is readable by every visitor.'
+    );
+  }
+
+  if (!MODES_REQUIRING_API_BASE_URL.includes(mode)) {
+    return;
+  }
+
+  if (raw === '') {
+    throw new Error(
+      `${REQUIRED_STRIPE_PUBLIC_KEY} is required to build or serve the ` +
+        `frontend, and no value was found for mode "${mode}". ` +
+        'src/index.tsx passes it straight to loadStripe(), so a bundle ' +
+        'built without it fails in the browser rather than here. Set it in ' +
+        'frontend/.env or in the environment - see frontend/.env.example.'
     );
   }
 };
@@ -204,22 +295,56 @@ const KNOWN_ENV_KEYS = [
 ] as const;
 
 /**
- * Build the `define` map: one entry per known-or-loaded variable, always.
+ * Build the `define` map: one entry per KNOWN variable, and nothing else.
+ *
+ * The key list is `KNOWN_ENV_KEYS` alone — an explicit allow-list of what this
+ * application actually reads — rather than the union of that list with whatever
+ * `loadEnv` happened to return. The difference is a disclosure boundary, not a
+ * tidiness preference: `define` substitutes values into the bundle as literals,
+ * where anybody can read them, so unioning in every loaded key means any
+ * `REACT_APP_`-prefixed variable that exists in the shell or in a `.env` file is
+ * published to every visitor. That is a live hazard, because the prefix is the
+ * Create React App convention and an operator who sets, say,
+ * `REACT_APP_ADMIN_TOKEN` for a script would be publishing it here without
+ * touching this file or being told. An allow-list cannot do that: adding a
+ * reader means adding its key, deliberately, in the same commit.
+ *
+ * Anything loaded but not listed is reported once, so the boundary is visible
+ * rather than silent - a genuinely new reader shows up as a message telling you
+ * to add it, instead of as a variable that is mysteriously `undefined`.
+ *
+ * Every listed key is defined whether or not it is set. An unset variable maps
+ * to the literal `undefined`, which is exactly what a Create React App build
+ * produced for one, so a missing value degrades to "no value" instead of
+ * surviving as a bare `process` access that throws
+ * `ReferenceError: process is not defined` at import time and takes the whole
+ * entry graph down with it.
  *
  * @param loaded Variables `loadEnv` found for the current mode, which may be —
  *   and in a fresh checkout is — empty.
- * @returns A `process.env.<KEY>` → source-text map covering every key in
- *   `KNOWN_ENV_KEYS` plus every key that was actually loaded. An unset variable
- *   maps to the literal `undefined` rather than being omitted, so the read is
- *   still replaced and can never reach the browser as a bare `process` access.
+ * @returns A `process.env.<KEY>` → source-text map, one entry per known key.
  */
 const buildProcessEnvReplacements = (
   loaded: Record<string, string>,
 ): Record<string, string> => {
-  const keys = new Set<string>([...KNOWN_ENV_KEYS, ...Object.keys(loaded)]);
+  const known = new Set<string>(KNOWN_ENV_KEYS);
+  const unlisted = Object.keys(loaded).filter((key) => !known.has(key));
+
+  if (unlisted.length > 0) {
+    // Written to stderr rather than thrown: an unlisted variable is very often
+    // a leftover from another project in the same shell, which is not a reason
+    // to refuse to build. It is, however, a reason to say something, because
+    // the alternative is a variable that is silently `undefined` at the point
+    // it is read.
+    console.warn(
+      `[vite.config] ignoring ${unlisted.join(', ')}: only the variables ` +
+        'listed in KNOWN_ENV_KEYS are inlined into the bundle. Add a key ' +
+        'there in the same change that adds its process.env reader.'
+    );
+  }
 
   return Object.fromEntries(
-    Array.from(keys, (key) => [
+    KNOWN_ENV_KEYS.map((key) => [
       `process.env.${key}`,
       // `JSON.stringify` of a string yields the quoted literal Vite needs;
       // `undefined` has no JSON form, so the token is written out directly.
@@ -238,6 +363,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, 'REACT_APP_');
 
   assertApiBaseUrl(mode, env);
+  assertStripePublicKey(mode, env);
 
   return {
     /**
@@ -252,7 +378,9 @@ export default defineConfig(({ mode }) => {
       /**
        * A byte-for-byte mirror of `compilerOptions.paths` in tsconfig.json
        * (`baseUrl: "src"`), so that the bundler and the type-checker agree on
-       * every module specifier. Six entries there, six entries here.
+       * every module specifier - for every alias that resolves to a real
+       * directory. Six entries there, four here; the two omitted are named
+       * below.
        *
        * Absolute targets are required. Vite resolves an alias replacement as
        * written, so a relative value would be interpreted against the importing
@@ -262,17 +390,20 @@ export default defineConfig(({ mode }) => {
        * and the extension is `.ts`, not `.mts`. This was verified by loading the
        * config and inspecting the resolved values, not assumed.
        *
-       * Two of the six targets, `src/hooks` and `src/context`, do not exist:
-       * tsconfig.json declares aliases for directories that were never created.
-       * They are mirrored anyway, because parity with the type-checker is the
-       * whole point of this block and an alias to a missing directory is inert
-       * until something imports through it — at which point the resolver fails
-       * loudly, exactly as the type-checker already does. The directories are
-       * deliberately not created here; a directory with no module in it would be
-       * noise, and nothing in this feature imports through either alias.
+       * FOUR ENTRIES, NOT SIX. tsconfig.json also declares `@hooks/*` and
+       * `@context/*`, and both point at directories — `src/hooks`, `src/context`
+       * — that do not exist and that nothing imports through. Mirroring them
+       * here would map a specifier onto an absolute path that resolves to
+       * nothing, which is not parity with the type-checker so much as a
+       * duplicated dead end, and it would suggest a place to put a module that
+       * has never been agreed. They are omitted deliberately, and the omission is
+       * the whole of the difference from tsconfig.json: create the directory and
+       * add the entry in the same change that adds the first real module, and the
+       * two files line up again. tsconfig.json is reference-only for this work,
+       * so the stale declarations there are left as found.
        *
-       * SIX ENTRIES AND NO SEVENTH. An `'@'` → `src` alias was tried here and has
-       * been removed, because it made the bundler resolve specifiers the
+       * AND NO `'@'` ENTRY. An `'@'` → `src` alias was tried here and has been
+       * removed, because it made the bundler resolve specifiers the
        * type-checker rejects, and a resolver that disagrees with the type-checker
        * is worse than one that is merely incomplete: it lets code run that cannot
        * be verified, and it moves the point of failure from `tsc` to whoever next
@@ -288,15 +419,14 @@ export default defineConfig(({ mode }) => {
        * repair is explicitly out of scope here; bridging it from the bundler side
        * only hid it from the one gate that reports it, since `build` is
        * `tsc && vite build` and `tsc` never reads this file. tsconfig.json is the
-       * single alias authority, and this block mirrors it exactly.
+       * single alias authority, and this block mirrors every one of its entries
+       * that resolves.
        */
       alias: {
         '@components': path.resolve(__dirname, 'src/components'),
         '@pages': path.resolve(__dirname, 'src/pages'),
         '@utils': path.resolve(__dirname, 'src/utils'),
         '@styles': path.resolve(__dirname, 'src/styles'),
-        '@hooks': path.resolve(__dirname, 'src/hooks'),
-        '@context': path.resolve(__dirname, 'src/context'),
       },
 
 
@@ -459,6 +589,98 @@ export default defineConfig(({ mode }) => {
        * `src/` and is named `*.test.ts(x)` or `*.spec.ts(x)`.
        */
       include: ['src/**/*.{test,spec}.{ts,tsx}'],
+
+      /**
+       * Resolution overrides that apply ONLY while Vitest is running.
+       *
+       * READ THE `resolve.alias` NOTE ABOVE BEFORE CHANGING THIS. That block
+       * explains why an `'@'` → `src` alias was removed from it: bridging the
+       * pre-existing `@/…` specifiers from the bundler side made the resolver
+       * disagree with the type-checker and hid a real defect from the one gate
+       * that reports it. Nothing here weakens that. `test.alias` is read by
+       * Vitest alone — `vite build` does not consult it, `tsc` never reads this
+       * file, and `npm run build` is `tsc && vite build` — so every specifier
+       * bridged below stays broken, and stays REPORTED, everywhere outside a test
+       * run. The 94 type errors and the failing production build are unchanged by
+       * this block, which was verified by measuring both with and without it.
+       *
+       * WHY IT IS NEEDED AT ALL. Vite fails at TRANSFORM time on an unresolvable
+       * import, before any module code executes, so `vi.mock` cannot substitute
+       * for these: the mock registry is consulted during execution and execution
+       * never begins. Resolution is therefore the only layer at which the three
+       * rating page integrations can be loaded by a test, and without them the
+       * rating surfaces on those pages — where the feature is actually reached —
+       * would be the only part of it with no test at all.
+       *
+       * The array form is used rather than the object form because order matters
+       * and objects do not guarantee it: the nine exact specifiers must be
+       * matched before the trailing pattern, which would otherwise map them onto
+       * files that are absent or unloadable.
+       *
+       * Two kinds of entry, and each stand-in documents its own reason:
+       *
+       *   NINE COMPONENT AND SERVICE SPECIFIERS the pages import and the test
+       *   runtime cannot load — seven files that do not exist anywhere, plus
+       *   `MessageBox` and `PaymentForm`, which exist but are imported by name
+       *   while exporting only defaults, and `PaymentForm` additionally needs an
+       *   undeclared Stripe package. `@/services/payment` is in the same
+       *   position. All are pre-existing and all are out of scope for this
+       *   feature, which is why they are stood in for rather than repaired.
+       *
+       *   ONE TRAILING PATTERN mapping every remaining `@/…` specifier onto
+       *   `src/…`, which is what tsconfig.json's `baseUrl: "src"` already means
+       *   for the six aliases it does declare. It covers the modules that DO load
+       *   — `@/services/api`, `@/store/userSlice` — so a test can then replace
+       *   them with `vi.mock` and state their behaviour explicitly, which is the
+       *   right layer for a collaborator that resolves but whose behaviour the
+       *   test needs to control.
+       */
+      alias: [
+        {
+          find: '@/components/TransactionDetails',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/PaymentStatus',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/ProfileForm',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/ListingManagement',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/PhotoGallery',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/VehicleSpecs',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/MaintenanceHistory',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/MessageBox',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/components/PaymentForm',
+          replacement: path.resolve(__dirname, 'src/testing/legacyChildDouble'),
+        },
+        {
+          find: '@/services/payment',
+          replacement: path.resolve(__dirname, 'src/testing/legacyPaymentDouble'),
+        },
+        {
+          find: /^@\/(.*)$/,
+          replacement: `${path.resolve(__dirname, 'src')}/$1`,
+        },
+      ],
 
       /**
        * Coverage via the V8 provider, matching the `@vitest/coverage-v8` package

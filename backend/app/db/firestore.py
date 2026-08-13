@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, Optional
 from google.api_core.exceptions import (
     Aborted,
@@ -33,62 +34,123 @@ db = Client(project=settings.GOOGLE_CLOUD_PROJECT)
 # room for the retry policy below to ride out a brief blip rather than
 # turning a recoverable hiccup into a 503, while still bounding the
 # blocked thread to something the pool recovers from.
+#
+# It bounds the whole of ONE operation, retries and stream resumptions
+# included, because :func:`datastore_call` anchors an absolute deadline
+# per call rather than sharing one policy - and the transaction's own
+# Begin, Commit and Rollback are inside that guarantee too, through
+# :class:`_BoundedTransaction`. Nothing in this module now falls back to
+# the generated client's own unbounded loops.
 DATASTORE_TIMEOUT_SECONDS = 10.0
 
-# The retry policy that makes the timeout ABOVE actually bind.
+# The conditions that mean "the datastore did not do this, and might if
+# asked again", as opposed to a fault in what it was asked to do. Stated
+# once, here, because two things consult the same classification: the
+# retry policy below, and the resume decision the client's own query
+# iterator makes.
 #
-# This is the non-obvious half, and it was measured rather than assumed.
-# Passing ``timeout=`` alone does NOT bound a call: google-api-core
-# applies the retry decorator OUTSIDE the timeout decorator, so the
-# timeout becomes the per-ATTEMPT deadline while the retry keeps going
-# until its OWN deadline - and the client's default for
-# ``BatchGetDocuments`` is 300 seconds. Against a datastore that was not
-# listening, ``document().get(timeout=3)`` was still retrying after three
-# minutes. Supplying this policy together with the timeout bounds the
-# whole operation, and exhaustion arrives as ``RetryError``.
-#
-# The predicate is the client's own transient set for reads, unchanged:
-# these are the conditions that mean "this did not happen, try again".
-# ``Aborted`` is deliberately NOT in it - lock contention is resolved by
+# ``Aborted`` is deliberately absent - lock contention is resolved by
 # rerunning a whole transaction, which is the transaction runner's job,
 # not by retrying one read inside it.
-DATASTORE_RETRY = Retry(
-    predicate=if_exception_type(
-        DeadlineExceeded,
-        InternalServerError,
-        ResourceExhausted,
-        ServiceUnavailable,
-    ),
-    initial=0.1,
-    maximum=1.0,
-    multiplier=1.3,
-    timeout=DATASTORE_TIMEOUT_SECONDS,
+DATASTORE_TRANSIENT_ERRORS = (
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
 )
 
-# The two keyword arguments every datastore call in this application
-# passes, kept as one mapping so a call site cannot pick up the deadline
-# and miss the policy that enforces it. Splat it: ``ref.get(**CALL)``.
-#
-# Every method this codebase uses accepts both - ``DocumentReference``
-# ``get``/``create``/``set``/``update``/``delete``, ``Query``
-# ``get``/``stream`` and ``Transaction.get`` - on the pinned client
-# (``google-cloud-firestore==2.13.1``).
-#
-# THE ONE GAP, stated rather than glossed: ``BeginTransaction`` and
-# ``Commit`` are issued by the client's own transaction machinery
-# (``Transaction._begin``/``_commit``), which accepts no timeout on this
-# release, so those two RPCs fall back to the client's GAPIC defaults -
-# measured at roughly 45 seconds to fail against an unreachable
-# datastore. Every path in this application touches a BOUNDED call before
-# it opens a transaction (the per-request user read on an authenticated
-# route, the settle query on the public read), so an outage is reported
-# from that call and no transaction is begun. A datastore that dies
-# mid-request, after a read has already succeeded, can still wait out
-# those defaults.
-DATASTORE_CALL: Dict[str, Any] = {
-    'retry': DATASTORE_RETRY,
-    'timeout': DATASTORE_TIMEOUT_SECONDS,
-}
+_IS_TRANSIENT = if_exception_type(*DATASTORE_TRANSIENT_ERRORS)
+
+
+def _expiring_predicate(deadline: float):
+    """Build a retry predicate that stops agreeing once time is up.
+
+    A retry predicate normally answers one question - "is this fault
+    transient?" - and that answer is what two SEPARATE loops in the
+    pinned client (``google-cloud-firestore==2.13.1``) use to decide
+    whether to go round again. This predicate answers a second question
+    at the same time: "and is there any budget left?". Once the deadline
+    passes it reports every fault as final, which is what turns both
+    loops into bounded ones.
+
+    The loop that makes this necessary is in ``Query.stream``. It wraps
+    iteration in ``while True`` and, on a transient fault mid-stream,
+    RESUMES with ``start_after(last_snapshot)`` and a FRESH request -
+    which means a fresh per-attempt deadline every time. Bounding the
+    attempt therefore bounds nothing overall: a datastore that fails
+    each stream after one document can hold a worker thread for as long
+    as it keeps failing that way. The resume is gated on
+    ``retry._predicate(exc)``, so an expiring predicate is what ends it.
+
+    Args:
+        deadline: ``time.monotonic()`` value after which no fault is
+            retried, whatever its class.
+
+    Returns:
+        A predicate taking one exception and returning whether to retry.
+    """
+    def should_retry(error: BaseException) -> bool:
+        """Report whether ``error`` is transient and time remains."""
+        return _IS_TRANSIENT(error) and time.monotonic() < deadline
+
+    return should_retry
+
+
+def datastore_call(budget: Optional[float] = None) -> Dict[str, Any]:
+    """Build the keyword arguments every datastore call must pass.
+
+    Splat it at the call site: ``ref.get(**datastore_call())``. Every
+    method this codebase uses accepts both keys -
+    ``DocumentReference.get``/``create``/``set``/``update``/``delete``,
+    ``Query.get``/``stream``, ``Transaction.get`` and the GAPIC
+    ``begin_transaction``/``commit``/``rollback`` the bounded
+    transaction below issues.
+
+    A FUNCTION RATHER THAN A CONSTANT, AND THAT IS THE WHOLE POINT
+    -------------------------------------------------------------------
+    This was one shared mapping holding one shared ``Retry``. Sharing is
+    what made the deadline unenforceable, because a policy object has no
+    idea when the operation using it started: ``timeout=`` bounds the
+    api-core retry loop measured from the moment that loop begins, so
+    every RESTART of an operation got the full budget again. A fresh
+    policy per call closes that, by anchoring an absolute deadline in
+    the predicate itself - see :func:`_expiring_predicate` for the
+    ``Query.stream`` resume loop this exists to bound.
+
+    So one call to this function corresponds to ONE datastore operation,
+    and the returned pair bounds that operation as a whole rather than
+    each of its attempts. Do not hoist the result into a module-level
+    constant or reuse it across operations; a stale deadline would
+    refuse the first fault of the next call.
+
+    Args:
+        budget: Seconds this one operation may take in total, for the
+            rare call that is worth less than the standard allowance -
+            see :data:`DATASTORE_ROLLBACK_TIMEOUT_SECONDS`. Defaults to
+            :data:`DATASTORE_TIMEOUT_SECONDS`, which is what every
+            ordinary read and write uses.
+
+    Returns:
+        ``{'retry': Retry, 'timeout': float}`` - the per-attempt
+        deadline and the policy that bounds the operation containing it.
+        Exhaustion of the policy arrives as
+        ``google.api_core.exceptions.RetryError``, which
+        :data:`DATASTORE_UNAVAILABLE_ERRORS` classifies as transient.
+    """
+    if budget is None:
+        budget = DATASTORE_TIMEOUT_SECONDS
+    budget = float(budget)
+    return {
+        'retry': Retry(
+            predicate=_expiring_predicate(time.monotonic() + budget),
+            initial=0.1,
+            maximum=1.0,
+            multiplier=1.3,
+            timeout=budget,
+        ),
+        'timeout': budget,
+    }
+
 
 # Provider faults that mean the datastore did not do the work and might
 # do it if asked again, as opposed to a fault in what it was asked to do.
@@ -100,18 +162,19 @@ DATASTORE_CALL: Dict[str, Any] = {
 # dependency for the per-request user read, and the ratings router for
 # every handler - so an unreachable datastore produces the same JSON
 # envelope as every other failure instead of a bare "Internal Server
-# Error". ``RetryError`` is the exhaustion verdict of the policy above,
-# and ``Aborted`` belongs here even though it is not retried per call:
-# contention that survives a transaction's own reruns is also "try
-# again".
-DATASTORE_UNAVAILABLE_ERRORS = (
+# Error".
+#
+# Built FROM the retryable set rather than restating it, so the two
+# cannot drift: everything worth retrying is worth reporting as
+# temporary. Three conditions are reportable without being retryable per
+# call - ``RetryError`` is the exhaustion verdict of the policy itself,
+# ``Aborted`` is contention that survived a transaction's own reruns, and
+# ``Cancelled`` is a call the transport gave up on. All three still mean
+# "try again" to a caller.
+DATASTORE_UNAVAILABLE_ERRORS = DATASTORE_TRANSIENT_ERRORS + (
     Aborted,
     Cancelled,
-    DeadlineExceeded,
-    InternalServerError,
-    ResourceExhausted,
     RetryError,
-    ServiceUnavailable,
 )
 
 # What a caller is told when the datastore cannot be reached, and how
@@ -126,41 +189,248 @@ DATASTORE_UNAVAILABLE_DETAIL = (
 )
 DATASTORE_RETRY_AFTER_SECONDS = 5
 
+# How long abandoning a transaction may take, which is deliberately much
+# less than an operation that does something.
+#
+# A ``Rollback`` is issued only on a path that has ALREADY failed, and
+# the transaction runner issues one after every failure - so a rollback
+# that spent the full allowance would double the time an outage holds a
+# worker thread, to abandon work that is being abandoned anyway. It is
+# also the one call whose failure costs nothing durable: Firestore
+# releases a transaction's locks when it times out server-side, so an
+# unacknowledged rollback resolves itself. Trying briefly and moving on
+# is therefore the right trade, and it keeps the worst case for a
+# completely unreachable datastore at one operation's budget plus this.
+DATASTORE_ROLLBACK_TIMEOUT_SECONDS = 2.0
+
+
+class _BoundedTransaction(Transaction):
+    """A ``Transaction`` whose own three RPCs are bounded.
+
+    The pinned client (``google-cloud-firestore==2.13.1``) bounds the
+    reads and writes a caller issues, because those take ``retry`` and
+    ``timeout``. It does NOT bound the three RPCs it issues itself, and
+    the gap is not a slow path - it is an unbounded one:
+
+    * ``Commit`` goes through the module-level ``_commit_with_retry``,
+      whose body is ``while True: try: commit(); except
+      ServiceUnavailable: pass`` followed by a sleep. There is no attempt
+      ceiling and no deadline. Against a datastore returning
+      ``UNAVAILABLE`` it retries forever.
+    * ``BeginTransaction`` and ``Rollback`` are issued with no ``retry``
+      and no ``timeout`` at all, so they fall back to the generated
+      client's defaults - measured at roughly 45 seconds each to fail
+      against an unreachable datastore.
+
+    Every handler in this application is synchronous, so it runs on
+    Starlette's bounded threadpool. A request that never returns holds
+    one of those threads for as long as it hangs, and enough of them turn
+    an outage confined to the datastore into an outage of every endpoint
+    - including the ones that would otherwise still work. That is the
+    availability failure this class exists to prevent.
+
+    The three overrides below reissue exactly the same requests through
+    exactly the same generated client, adding nothing but
+    :func:`datastore_call`'s policy and deadline. Behaviour against a
+    HEALTHY datastore is therefore unchanged; what changes is that an
+    unreachable one produces a transient exception in seconds rather than
+    a thread that never comes back. Contention retries stay the
+    transaction runner's business and stay bounded by its own
+    ``max_attempts``, which this class does not touch.
+
+    Private attributes of the base class are used deliberately and are
+    the reason this is a subclass rather than a wrapper: ``_id``,
+    ``_write_pbs``, ``_options_protobuf`` and ``_clean_up`` are the
+    transaction's own lifecycle state, and the runner
+    (``_Transactional.__call__``) drives that lifecycle through
+    ``_begin``/``_commit``/``_rollback``. Overriding those three methods
+    is the only place a project-owned deadline can be inserted without
+    reimplementing the runner.
+    """
+
+    def _begin(self, retry_id: Optional[bytes] = None) -> None:
+        """Open the transaction, bounding ``BeginTransaction``.
+
+        Args:
+            retry_id: ID of a transaction being retried, which preserves
+                its place in line under contention. Forwarded to the
+                request exactly as the base class forwards it.
+
+        Raises:
+            ValueError: This transaction has already begun.
+            google.api_core.exceptions.GoogleAPICallError: The call
+                failed, or the deadline passed with it still failing.
+        """
+        if self.in_progress:
+            raise ValueError(
+                'This transaction has already begun with ID '
+                '{0!r}.'.format(self._id)
+            )
+        response = self._client._firestore_api.begin_transaction(
+            request={
+                'database': self._client._database_string,
+                'options': self._options_protobuf(retry_id),
+            },
+            metadata=self._client._rpc_metadata,
+            **datastore_call(),
+        )
+        self._id = response.transaction
+
+    def _rollback(self) -> None:
+        """Abandon the transaction, bounding ``Rollback``.
+
+        The runner calls this on ANY error, including the error that a
+        bounded commit raises, so an unbounded rollback would give back
+        the hang the bounded commit just prevented. It gets the shorter
+        :data:`DATASTORE_ROLLBACK_TIMEOUT_SECONDS` allowance, for the
+        reason recorded beside that constant.
+
+        NOTHING IN PROGRESS IS NOT AN ERROR HERE, AND THAT IS A FIX
+        ---------------------------------------------------------------
+        The base class raises ``ValueError`` when asked to roll back a
+        transaction that never began. That reads as strictness and
+        behaves as data loss of a different kind: the runner rolls back
+        inside ``except BaseException``, so when it is the BEGIN that
+        failed, the ``ValueError`` raised here REPLACES the transient
+        fault that brought us here. Measured against an unreachable
+        emulator, a datastore outage surfaced as a bare ``ValueError``
+        with no cause - so the HTTP layers, which classify transient
+        provider faults into a 503 with ``Retry-After``, saw an
+        unclassifiable defect and answered 500 instead.
+
+        There is genuinely nothing to abandon in that state, so this
+        returns quietly and lets the original exception propagate with
+        its class intact. No RPC is issued, and the object is already
+        clean.
+
+        Raises:
+            google.api_core.exceptions.GoogleAPICallError: The rollback
+                failed for the whole of its (short) deadline. Local
+                state is cleaned up regardless, exactly as the base
+                class does, so the object cannot be left claiming to
+                hold a transaction that is gone.
+        """
+        if not self.in_progress:
+            return
+        try:
+            self._client._firestore_api.rollback(
+                request={
+                    'database': self._client._database_string,
+                    'transaction': self._id,
+                },
+                metadata=self._client._rpc_metadata,
+                **datastore_call(DATASTORE_ROLLBACK_TIMEOUT_SECONDS),
+            )
+        finally:
+            self._clean_up()
+
+    def _commit(self) -> list:
+        """Commit the staged writes, bounding ``Commit``.
+
+        Replaces the base class's unbounded ``_commit_with_retry`` loop
+        with one bounded policy. Retrying ``Commit`` is safe here for the
+        same reason it was safe there - the request carries a transaction
+        ID, so a retry commits the same transaction rather than applying
+        the writes twice - and the policy in :func:`datastore_call`
+        retries the same ``UNAVAILABLE`` condition that loop did, plus
+        the other transient conditions, up to a deadline.
+
+        Returns:
+            The write results, in the order the writes were staged.
+
+        Raises:
+            ValueError: No transaction is in progress.
+            google.api_core.exceptions.GoogleAPICallError: The commit
+                failed, or the deadline passed with it still failing.
+                ``Aborted`` reaches the runner, which reruns the whole
+                callable; ``RetryError`` and the rest reach the caller as
+                the transient faults they are.
+        """
+        if not self.in_progress:
+            raise ValueError(
+                'No transaction is in progress, so there is nothing to '
+                'commit.'
+            )
+        response = self._client._firestore_api.commit(
+            request={
+                'database': self._client._database_string,
+                'writes': self._write_pbs,
+                'transaction': self._id,
+            },
+            metadata=self._client._rpc_metadata,
+            **datastore_call(),
+        )
+        self._clean_up()
+        return list(response.write_results)
+
+
+def _new_transaction(read_only: bool = False):
+    """Open the transaction object the runners below drive.
+
+    Asks the client for its own transaction first and substitutes
+    :class:`_BoundedTransaction` only when what came back is the pinned
+    client's real ``Transaction``. That order matters for one specific
+    reason: the test suite installs an in-memory Firestore double by
+    replacing the ``Client`` symbol with a FACTORY FUNCTION, so a type
+    test against ``Client`` is not even legal there, while a double's own
+    transaction object carries its own commit, rollback and conflict
+    semantics that must not be replaced by RPC-issuing overrides. Asking
+    the client, then checking what it produced, is correct for both.
+
+    Args:
+        read_only: Open a read-only transaction, which takes no locks
+            and refuses writes.
+
+    Returns:
+        A transaction object bound to :data:`db`.
+    """
+    transaction = db.transaction(read_only=read_only)
+    if not isinstance(transaction, Transaction):
+        # A double, which supplies its own transaction semantics.
+        return transaction
+    return _BoundedTransaction(db, read_only=read_only)
+
+
 def get_document(collection: str, document_id: str) -> dict:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc = doc_ref.get(**DATASTORE_CALL)
+        doc = doc_ref.get(**datastore_call())
         return doc.to_dict() if doc.exists else None
     except NotFound:
         return None
 
+
 def create_document(collection: str, data: dict) -> str:
-    doc_ref = db.collection(collection).add(data, **DATASTORE_CALL)
+    doc_ref = db.collection(collection).add(data, **datastore_call())
     return doc_ref[1].id
+
 
 def update_document(collection: str, document_id: str, data: dict) -> bool:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc_ref.update(data, **DATASTORE_CALL)
+        doc_ref.update(data, **datastore_call())
         return True
     except NotFound:
         return False
+
 
 def delete_document(collection: str, document_id: str) -> bool:
     try:
         doc_ref = db.collection(collection).document(document_id)
-        doc_ref.delete(**DATASTORE_CALL)
+        doc_ref.delete(**datastore_call())
         return True
     except NotFound:
         return False
 
+
 # HUMAN ASSISTANCE NEEDED
-# The following function might need additional error handling and optimization for production use
+# The following function might need additional error handling and
+# optimization for production use
 def query_documents(collection: str, filters: dict) -> list:
     query = db.collection(collection)
     for field, value in filters.items():
         query = query.where(field, '==', value)
-    docs = query.stream(**DATASTORE_CALL)
+    docs = query.stream(**datastore_call())
     return [doc.to_dict() for doc in docs]
 
 
@@ -228,10 +498,11 @@ def create_document_with_id(
     doc_ref = db.collection(collection).document(document_id)
     if transaction is None:
         # Bounded like every other call this application makes: see
-        # ``DATASTORE_CALL``. The transactional branch takes no such
+        # :func:`datastore_call`. The transactional branch takes no such
         # arguments because it does not issue an RPC - the create is
-        # STAGED and travels with the transaction's commit.
-        doc_ref.create(data, **DATASTORE_CALL)
+        # STAGED and travels with the transaction's commit, which
+        # :class:`_BoundedTransaction` bounds instead.
+        doc_ref.create(data, **datastore_call())
     else:
         transaction.create(doc_ref, data)
     return document_id
@@ -262,8 +533,8 @@ def run_in_transaction(fn, *args, **kwargs):
     2. Every read must go through the transaction to be locked, using
        either ``ref.get(transaction=transaction)`` or
        ``transaction.get(ref_or_query)``. On the pinned client
-       (``google-cloud-firestore==2.13.1``) ``Transaction.get`` accepts a
-       ``Query`` as well as a ``DocumentReference``, so a transactional
+       (``google-cloud-firestore==2.13.1``) ``Transaction.get`` is typed
+       ``ref_or_query: DocumentReference | Query``, so a transactional
        read is NOT restricted to get-by-ID.
        Aggregates in this codebase are nonetheless denormalized onto the
        document they describe and read by ID, and that is a deliberate
@@ -321,11 +592,16 @@ def run_in_transaction(fn, *args, **kwargs):
     Raises:
         google.api_core.exceptions.Aborted: Contention persisted through
             every retry the client allows.
+        google.api_core.exceptions.GoogleAPICallError: The transaction's
+            own ``BeginTransaction``, ``Commit`` or ``Rollback`` failed
+            for the whole of its deadline. Bounded rather than endless -
+            see :class:`_BoundedTransaction`, which the transaction
+            object comes from.
         Exception: Anything ``fn`` raises propagates unchanged, after
             the transaction has been rolled back.
     """
     try:
-        return transactional(fn)(db.transaction(), *args, **kwargs)
+        return transactional(fn)(_new_transaction(), *args, **kwargs)
     except ValueError as error:
         cause = error.__cause__
         if isinstance(cause, Aborted):
@@ -380,9 +656,17 @@ def run_in_read_only_transaction(fn, *args, **kwargs):
     Raises:
         ValueError: ``fn`` attempted a write. The transaction is read-only
             and the client refuses it.
+        google.api_core.exceptions.GoogleAPICallError: ``BeginTransaction``
+            or ``Commit`` failed for the whole of its deadline. Bounded
+            by :class:`_BoundedTransaction`, which matters as much here as
+            on the write path: this runs on a PUBLIC read.
         Exception: Anything ``fn`` raises propagates unchanged.
     """
-    return transactional(fn)(db.transaction(read_only=True), *args, **kwargs)
+    return transactional(fn)(
+        _new_transaction(read_only=True),
+        *args,
+        **kwargs
+    )
 
 
 async def initialize_db() -> None:

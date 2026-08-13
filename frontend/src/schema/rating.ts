@@ -112,16 +112,17 @@ import { z } from 'zod';
  * rating from both buyers and sellers" — and is shared with the five options of
  * the star control.
  *
- * "Mirrors" is a guarantee here, not an aspiration. `RATING_MIN`, `RATING_MAX`
- * and `RATING_REVIEW_MAX_LENGTH` are declared `const=True` on the server, so the
- * value below is the ONLY value its counterpart can hold and an environment that
- * tries to override one fails at import with the conflict named. That matters
- * because this file is compiled into a separate artefact that cannot read a
- * server environment variable: were the server side genuinely tunable, an
- * operator lowering it would leave this control offering a star the server
- * answers with 422, and no amount of care here could detect it. Changing the
- * scale is a code change on both sides, committed together — which is what a
- * shared contract should cost.
+ * "Mirrors" IS A DISCIPLINE, NOT A GUARANTEE, and the difference is worth being
+ * precise about. `settings.RATING_MIN` and `settings.RATING_MAX` are ordinary
+ * defaulted settings — `1` and `5`, overridable from the environment, with only
+ * a coherence check that refuses an inverted pair. Nothing on the server refuses
+ * a different scale, and nothing here can detect one: this file is compiled into
+ * a separate artefact that cannot read a server environment variable. So an
+ * operator who sets `RATING_MAX=4` without editing the line below leaves this
+ * control offering a fifth star that the server answers with `422`, and one who
+ * widens it to `6` leaves a score no rater can choose. Change the scale on both
+ * sides, in the same commit; the value below is the client half of that pair and
+ * has no other way to learn about the first.
  *
  * Exported because `../components/StarRatingInput` renders the range and
  * `../components/RatingSubmissionForm` validates against it; one shared constant
@@ -416,14 +417,29 @@ const boundedText = (maxLength: number, message: string) =>
 const MODERATION_REASON_MAX_LENGTH = 500;
 
 /**
- * Maximum length of a transaction reference accepted for submission.
+ * Maximum length of any single Firestore document ID this feature handles.
  *
  * Mirrors `DOCUMENT_ID_MAX_LENGTH` in `backend/app/schema/rating.py`, which
  * holds a document ID well inside Firestore's own limit because two IDs are
  * joined to form a rating's key, so each half must leave room for the other. A
  * Firestore auto-ID occupies twenty characters, so this is generous.
+ *
+ * Exported because it bounds more than one identifier: a transaction reference
+ * on the way to submission, and the seller ID `../utils/validation` reads off a
+ * listing before spending a request on it. Both are document IDs and both are
+ * bounded by the server's single constant, so they mirror it once here rather
+ * than twice.
  */
-const TRANSACTION_ID_MAX_LENGTH = 128;
+export const DOCUMENT_ID_MAX_LENGTH = 128;
+
+/**
+ * Maximum length of a transaction reference accepted for submission.
+ *
+ * A transaction reference IS a document ID, so this is that bound under the name
+ * the submission schema reads it by. Two names for one number would be two
+ * things to keep in step with the server.
+ */
+const TRANSACTION_ID_MAX_LENGTH = DOCUMENT_ID_MAX_LENGTH;
 
 /**
  * Path-safety grammar for a transaction reference supplied by a client.

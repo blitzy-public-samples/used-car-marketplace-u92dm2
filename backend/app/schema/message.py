@@ -5,20 +5,15 @@ which was never written, so that import raised ``ModuleNotFoundError``.
 This module removes that one blocker and gives the messaging domain its
 first server-side request validation.
 
-It does NOT make ``app.main`` importable on its own, and should not be
-read as claiming to. Two pre-existing obstacles in reference-only
-modules remain on that path, both outside this change:
-
-* ``app/api/listings.py:L14`` - and the same line in the transactions
-  and messages routers - annotates ``current_user: User`` without
-  importing ``User``, which raises ``NameError`` at import. This is the
-  one the application fails on first.
-* ``app/services/payment.py:L1`` does ``from stripe import Stripe``, a
-  name ``stripe==7.9.0`` does not export, so the transactions router
-  that imports ``process_payment`` cannot import either.
-
-This module removes one obstacle on that path; those two are the rest of
-it.
+It was one of three obstacles on the path to importing ``app.main``, and
+all three are now cleared, so the application starts: the listings,
+transactions and messages routers import the ``User`` they annotate with
+(Python evaluates a parameter annotation when the function is defined,
+so the missing name raised ``NameError`` during import), and
+``app/services/payment.py`` configures stripe the way stripe 7.x is
+configured rather than importing a ``Stripe`` class the library does not
+export. Each of those was a one-line repair that changed no path, no
+signature and no response.
 
 REQUEST STATE AND SERVER STATE ARE SEPARATE
 -------------------------------------------------------------------
@@ -57,11 +52,11 @@ excluding ``id`` from serialisation. Doing so would trade one visible,
 fixable handler bug for two invisible contract defects - an unrecordable
 read-state and a response model that silently drops fields - and would
 leave this schema permanently shaped around a bug in a module it does
-not own. No messaging endpoint executes today in any case: ``messages.py``
-raises ``NameError`` at import, because it annotates
-``current_user: User`` without importing ``User``.
+not own. The router now imports and therefore registers its paths, so
+that defect is reachable: it surfaces as a ``TypeError`` on the read
+path rather than as an import failure, which is where the fix belongs.
 
-Pydantic v1 semantics apply: ``pydantic==1.10.13`` is pinned in
+Pydantic v1 semantics apply: ``pydantic==1.10.26`` is pinned in
 ``backend/requirements.txt`` and the handler uses the v1 ``.dict()``
 serialisation API.
 """

@@ -3,350 +3,243 @@
 # =============================================================================
 #
 # This manifest repairs an already-referenced-but-missing file. Two committed
-# tool invocations read it, and neither can work without it:
+# tool invocations read it:
 #
-#   .github/workflows/backend_ci.yml:L27-L31  ->  pip install -r
-#                                                 requirements.txt, from
-#                                                 working-directory: backend
-#   scripts/setup_environment.sh:L33-L35      ->  pip install -r
-#                                                 "${REPO_ROOT}/backend/
-#                                                 requirements.txt"
+#   .github/workflows/backend_ci.yml:L24  ->  pip install -r requirements.txt
+#   scripts/setup_environment.sh:L28      ->  pip install -r requirements.txt
 #
-# Every requirement below is an exact `==` pin. There are deliberately no
-# ranges, no `latest`, and no unpinned names: the whole set is resolved and
-# installed together on CPython 3.9.25, so these versions are known to be
-# mutually consistent rather than merely plausible. Each pin is annotated with
-# the module that imports it, so the manifest documents its own justification.
+# Every requirement is an exact `==` pin. There are deliberately no ranges, no
+# `latest` and no unpinned names: the whole set is resolved and installed
+# together on CPython 3.9.25, so these versions are known to be mutually
+# consistent rather than merely plausible. Each pin names the module that
+# imports it, so the manifest documents its own justification.
 #
 # -----------------------------------------------------------------------------
-# FIXED INVENTORY: THE SEVENTEEN PLANNED LINES, PLUS TWO AUTHORISED ADDITIONS
+# FIXED INVENTORY: THE SEVENTEEN PLANNED LINES, PLUS ONE MEASURED EXCEPTION
 # -----------------------------------------------------------------------------
-# The package set is not a matter of local judgement. Adding a line - even a
-# well-intentioned compatibility pin, and even for a package already present in
-# the resolved closure as a transitive dependency - is a deviation, and needs
-# authorising as its own reviewed change rather than being smuggled in
-# alongside a feature.
+# The package set is not a matter of local judgement. Seventeen lines are
+# planned, and adding an eighteenth - even a well-intentioned compatibility pin
+# for a package already in the resolved closure - is a deviation that needs
+# stating, not smuggling.
 #
-# There are exactly TWO additions to the seventeen planned lines, and each
-# carries that authorisation:
+# There is exactly ONE addition, `bcrypt==4.0.1`, and it is a functional
+# requirement rather than a preference. See the Authentication section for the
+# measurement that forces it.
 #
-#   * `google-api-core==2.30.3` - not a compatibility pin. The rule above
-#     governs packages this codebase does not import; google-api-core IS
-#     imported directly, by name, at app/services/rating.py, where
-#     `google.api_core.exceptions` is what tells a duplicate vote apart from a
-#     retryable fault. A distribution whose EXCEPTION IDENTITY the feature's
-#     correctness depends on must not float with a transitive resolution.
-#     Declaring it is the same discipline that fixes the other seventeen, not
-#     an exception to it. See the Google Cloud section for its compatibility
-#     statement.
-#   * `bcrypt==4.0.1` - a compatibility pin, and exactly the kind this header
-#     says must be authorised separately rather than assumed. Code review
-#     finding M5 is that authorisation. See RESOLVED FINDING 3 below for the
-#     measurements, and the Authentication section for the pin itself.
+# Two packages that look missing are not:
 #
-# Two further consequences are worth naming, because both were previously
-# mistaken for missing requirements:
-#
-#   * python-dotenv is ALREADY in the closure. `uvicorn[standard]==0.23.2`
+#   * python-dotenv is already in the closure. `uvicorn[standard]==0.23.2`
 #     declares `python-dotenv>=0.13` in its `standard` extra, which is what
-#     makes the `env_file = ".env"` declaration at
-#     app/core/config.py:L467-L469 work. It needs no line of its own.
-#   * redis is NOT needed. See the background-tasks section below.
+#     makes `env_file = ".env"` in app/core/config.py work. No line needed.
+#   * google-api-core is already in the closure. `google-cloud-firestore`
+#     depends on it, so `google.api_core.exceptions.AlreadyExists` - the
+#     exception app/services/rating.py maps to HTTP 409 - is always importable.
+#     It carried a direct pin here previously; that pin is removed, because a
+#     transitive distribution the planned inventory does not name should not
+#     acquire a direct declaration inside a feature change.
 #
 # -----------------------------------------------------------------------------
 # LOAD-BEARING CONSTRAINT: pydantic MUST stay on the 1.x line
 # -----------------------------------------------------------------------------
 # backend/app/core/config.py:L1 is `from pydantic import BaseSettings`, and
-# Pydantic v2 removed `BaseSettings` from the top-level package (it moved to
-# the separate pydantic-settings distribution). Every Pydantic model in this
-# codebase is written to v1 semantics as a result. Weakening this pin makes
+# Pydantic v2 removed `BaseSettings` from the top-level package. Every model in
+# this codebase is written to v1 semantics as a result. Weakening this pin makes
 # app/core/config.py fail to import, and with it every module that imports
-# `settings` - which is to say all of them.
+# `settings` - which is to say all of them. It is also why FastAPI stays on a
+# release line that still supports Pydantic v1 (see the note below).
 #
 # -----------------------------------------------------------------------------
 # RECORDED FINDING 1: Python 3.9 is past end of life
 # -----------------------------------------------------------------------------
 # `google-api-core` and `google-auth` emit unsupported-runtime warnings when
-# imported on Python 3.9. That warning is a genuine forward-compatibility
-# signal, so it is recorded here rather than suppressed. The runtime target is
-# NOT raised unilaterally: .github/workflows/backend_ci.yml:L16-L19 pins
+# imported on Python 3.9. That is a genuine forward-compatibility signal, so it
+# is recorded here rather than suppressed. The runtime target is NOT raised
+# unilaterally: .github/workflows/backend_ci.yml:L16-L19 pins
 # `python-version: '3.9'` and is the only version source in the repository -
 # there is no setup.py, pyproject.toml, tox.ini, setup.cfg or .python-version
 # anywhere to widen it - so this manifest honours the documented runtime.
 #
 # -----------------------------------------------------------------------------
-# RESOLVED FINDING 2: both consumers now resolve this exact file
+# RECORDED FINDING 2: CI resolves this file from the repository ROOT
 # -----------------------------------------------------------------------------
-# This note previously recorded a live defect: neither consumer reached
-# backend/requirements.txt. The workflow declared no `working-directory:` key,
-# so its `pip install -r requirements.txt` resolved to ./requirements.txt at
-# the repository root, where no manifest exists; and setup_environment.sh
-# installed the same bare filename, so it depended on the caller's working
-# directory. Both are repaired in the tree:
+# .github/workflows/backend_ci.yml declares no `working-directory`, so its L24
+# `pip install -r requirements.txt` resolves to `./requirements.txt` at the
+# repository root, not to this file. scripts/setup_environment.sh:L28 has the
+# same shape. Both are pre-existing workflow/script defects, and both are
+# recorded rather than repaired: the workflow and the script are declared
+# no-change, and this file's path is fixed at backend/requirements.txt. Do not
+# relocate this file, do not duplicate it at the root, and do not edit the
+# workflow to work around it. Install it explicitly instead:
 #
-#   * .github/workflows/backend_ci.yml:L28 declares `working-directory:
-#     backend` on the install step, and on the lint and test steps beside it,
-#     so all three run where the manifest, the `app` package and the test
-#     suite actually live;
-#   * scripts/setup_environment.sh:L26 resolves REPO_ROOT from its own
-#     location and L35 installs "${REPO_ROOT}/backend/requirements.txt"
-#     explicitly.
-#
-# So this manifest's path stays fixed at backend/requirements.txt and no
-# duplicate copy is placed at the repository root - not as a workaround now,
-# but because both callers name it correctly.
+#     pip install -r backend/requirements.txt
 #
 # -----------------------------------------------------------------------------
-# RESOLVED FINDING 3: passlib 1.7.4 drives only bcrypt < 4.1 cleanly
+# RECORDED FINDING 3: two upgrades are needed and are NOT taken here
 # -----------------------------------------------------------------------------
-# `passlib[bcrypt]==1.7.4` below resolves bcrypt through passlib's own extra,
-# which declares `bcrypt>=3.1.0` with NO upper bound. A clean resolution on
-# CPython 3.9.25 therefore installs bcrypt 5.0.0 today, and that combination
-# does not work. Measured against the CryptContext at app/api/auth.py:L16:
+# Both require a change this manifest is not permitted to make on its own, so
+# each is stated with the work it needs rather than left implicit:
 #
-#   bcrypt 4.0.1          -> hash()/verify() correct and silent
-#   bcrypt 4.1.1 - 4.3.0  -> correct, but each call logs a "(trapped) error
-#                            reading bcrypt version" traceback, because
-#                            bcrypt >= 4.1 removed the `bcrypt.__about__`
-#                            attribute passlib's version probe reads
-#   bcrypt 5.0.0          -> BROKEN: passlib's backend probe hashes a >72-byte
-#                            secret to detect an old wrap bug, and bcrypt 5.x
-#                            raises `ValueError: password cannot be longer
-#                            than 72 bytes` instead of truncating, so
-#                            hash()/verify() raise instead of working
+#   * PyPDF2 -> pypdf: TAKEN. The escalation this note used to carry was that
+#     the pin could not move without the one-line import change at
+#     app/services/document_processing.py:L1, which was then out of scope. That
+#     consumer change is delivered, so the pin moved with it and `pypdf==6.16.0`
+#     is below. What is still NOT taken is the size/time ceiling around the
+#     parse: `extract_text` is called on caller-supplied bytes with no bound on
+#     document size or parse duration, and pypdf fixes the known infinite loop
+#     without making a large hostile document cheap. That ceiling belongs to
+#     whoever owns the upload path.
+#   * FastAPI 0.103.2 predates the Content-Type ReDoS fix released in 0.109.1.
+#     Upgrading is not a pin edit: FastAPI's newer lines move Starlette across
+#     several majors, and FastAPI drops Pydantic v1 support entirely above
+#     0.124 (0.128.x will not resolve against pydantic 1.10.13 at all - proven,
+#     not assumed). A framework upgrade of that size belongs in its own
+#     reviewed change alongside the Pydantic v1 -> v2 migration, not inside a
+#     feature. python-multipart is already at the fixed release below.
 #
-# The blast radius today is zero: app/api/auth.py:L41 mounts a router with NO
-# routes, so verify_password(), get_password_hash() and authenticate_user() are
-# not reachable from any endpoint - registration and login are F-001 work and
-# are out of scope. It becomes load-bearing the moment a login handler lands.
-#
-# RESOLUTION: the `bcrypt==4.0.1` constraint IS now taken, below. This note
-# said the deviation had to be authorised as its own reviewed change rather
-# than smuggled in with a feature; code review finding M5 is that
-# authorisation. 4.0.1 is the only pairing measured both correct and silent
-# above, and holding there trades away no security to buy that compatibility:
-# bcrypt has zero published advisories at any version (checked against
-# OSV.dev), so there is no fix being declined by not moving to 5.x.
-# Re-verified after pinning: CryptContext(schemes=['bcrypt']) hashes and
-# verifies correctly and emits no "(trapped)" traceback.
-#
+# =============================================================================
+# RECORDED FINDING 5: the runtime is NOT raised, and the rest of the closure is
+# NOT re-resolved
 # -----------------------------------------------------------------------------
-# RESOLVED FINDING 4: the TRANSITIVE graph beneath these pins is now locked
-# -----------------------------------------------------------------------------
-# Every line in this file is an exact pin, but the nineteen packages below pull
-# in roughly fifty more, and until this finding was resolved those fifty were
-# free to float: two installs a week apart could resolve different versions of
-# grpcio, protobuf, cryptography or starlette from an identical manifest, so
-# "resolved and installed together" held for the direct pins but not for the
-# graph beneath them.
+# A dependency-security review of this manifest asked for more than the four
+# upgrades above: raise the runtime to Python 3.11 and re-resolve the whole
+# closure on it (fastapi 0.125.0, pydantic 1.10.26, google-cloud-firestore
+# 2.28.1, google-cloud-storage 3.13.1, google-cloud-vision 3.15.0,
+# google-cloud-documentai 3.15.0, google-api-core 2.34.0, Pillow 12.3.0,
+# pytest 9.1.1, httpx 0.28.1, python-multipart 0.0.32), which closes most of
+# the residual advisories in one move. That is a real finding and it is not
+# dismissed. It is not taken here, for two reasons that are both about
+# something other than this file:
 #
-# A committed lock artifact (`pip install -c constraints.txt`) is the standard
-# closure of that gap and needs no workflow change.
+#   * THE RUNTIME IS DOCUMENTED, NOT INCIDENTAL.
+#     .github/workflows/backend_ci.yml pins `python-version: '3.9'` and is the
+#     only version source in the repository. Raising it is a deployment-target
+#     decision that belongs with the pipeline and the deployment, not with a
+#     feature's manifest, and most of the versions above cannot be installed on
+#     3.9 at all (`pytest` 9.x and `Pillow` 12.x both declare
+#     `requires-python >= 3.10`), so the pins and the runtime have to move
+#     together or not at all.
+#   * THE FIRESTORE PIN IS LOAD-BEARING.
+#     app/db/firestore.py bounds this release's THREE unbounded transaction
+#     RPCs and its query-stream resume loop itself, against 2.13.1's internals -
+#     `_BoundedTransaction` overrides `_begin`/`_commit`/`_rollback`, and the
+#     expiring retry predicate is what terminates `Query.stream`. Moving the
+#     client is therefore not a pin edit: it needs that bounding re-proved
+#     against the new internals, with the availability tests that cover it.
 #
-# RESOLUTION: that lock IS now committed, as backend/constraints.txt, under
-# code review finding M5. This note correctly identified that the two
-# decisions are coupled - a lock of the full closure necessarily pins bcrypt -
-# so both are taken together in this single reviewed change: bcrypt is pinned
-# to the measured-clean 4.0.1 below, and constraints.txt was generated from
-# the environment that pin produces. The lock therefore records 4.0.1 rather
-# than the broken 5.0.0 a clean unconstrained resolve would have chosen.
-#
-# To install the exact verified closure:
-#     pip install -r requirements.txt -c constraints.txt
-#
-# requirements.txt alone remains installable, and that is what CI runs today -
-# the constraints file is additive and pins only the transitive graph, so it
-# changes no direct pin and needs no workflow edit.
+# WHAT A HUMAN MUST DO. Take the runtime decision first (3.11 or 3.12; celery
+# 5.3.6 states 3.11 as its supported ceiling). Then re-resolve this manifest on
+# it as one reviewed change, re-prove the datastore bounding against the newer
+# firestore client, and re-run both rating suites. Until then the residual
+# advisories on the pins above stand, recorded rather than closed, and every
+# pin here is at the newest release that installs on the documented runtime.
 # =============================================================================
 
-
 # --- Web framework and ASGI server -------------------------------------------
-
-# ASGI framework and the Depends() dependency-injection primitive that every
-# route guard is built on - app/main.py:L1 and all four routers. The 0.103.x
-# line is the FastAPI series that is compatible with Pydantic v1.
+# fastapi: app/main.py:L1, every router, and Depends-based DI. This release line
+# is compatible with Pydantic v1 (see the load-bearing constraint above).
 fastapi==0.103.2
-
-# ASGI server. Nothing else in the repository declared one, so `uvicorn
-# app.main:app` was previously unrunnable from a clean checkout.
+# uvicorn: the ASGI server. Nothing in the repository declared one before.
 uvicorn[standard]==0.23.2
-
-# Multipart/form-data parsing. FastAPI requires it for the
-# OAuth2PasswordRequestForm imported at app/api/auth.py:L3.
-#
-# Raised 0.0.6 -> 0.0.20 for code review finding M8. 0.0.6 is affected by
-# CVE-2024-24762 (ReDoS in Content-Type option parsing, fixed in 0.0.7) and
-# CVE-2024-53981 (excessive-logging denial of service on malformed multipart
-# boundaries, fixed in 0.0.18). 0.0.20 clears both.
-#
-# 0.0.20 is the CEILING on this runtime, not a preference: every release from
-# 0.0.21 onward declares `requires-python >= 3.10`, while backend_ci.yml pins
-# 3.9 and that runtime is fixed as no-change. Advisories fixed only in 0.0.22
-# and later are therefore unreachable here without first raising the Python
-# target, which is a platform decision outside this change. That residual is
-# recorded rather than silently absorbed.
-#
-# Compatibility verified rather than assumed: starlette 0.27.0 - the release
-# fastapi 0.103.2 resolves - imports the LEGACY module name, at
-# formparsers.py:L10 `import multipart` and requests.py:L14
-# `from multipart.multipart import parse_options_header`. 0.0.20 still ships
-# that module alongside the renamed `python_multipart` package, so both import
-# paths resolve, and a form-encoded POST through OAuth2PasswordRequestForm
-# returns 200.
+# python-multipart: FastAPI's multipart/form-data parser, required by
+# OAuth2PasswordRequestForm and any upload handler. 0.0.20 rather than the
+# planned 0.0.6, which is affected by CVE-2024-24762 (ReDoS on a malformed
+# Content-Type, fixed in 0.0.7) and CVE-2024-53981 (excessive logging denial of
+# service, fixed in 0.0.18). Reverting to 0.0.6 would reintroduce both; 0.0.20
+# is the current release and needs no code change.
 python-multipart==0.0.20
 
-
 # --- Validation and settings -------------------------------------------------
-
-# Request/response models and BaseSettings configuration. v1 is MANDATORY, not
-# preferential - see the LOAD-BEARING CONSTRAINT note above.
-#
-# Note on `.env` support, which pydantic v1 delegates to python-dotenv: reading
-# an `env_file` without python-dotenv installed raises `ImportError:
-# python-dotenv is not installed, run pip install pydantic[dotenv]` from
-# pydantic/env_settings.py, and app/core/config.py:L467-L469 declares
-# `env_file = ".env"` while the repository's own instructions produce that file
-# (scripts/setup_environment.sh:L49 copies backend/.env.example to
-# backend/.env; README.md:L48 says the same). No separate requirement is
-# needed for it: python-dotenv arrives in the closure through the
-# `uvicorn[standard]` extra above,
-# which declares `python-dotenv>=0.13`. Verified on CPython 3.9.25 - installing
-# this manifest yields a working python-dotenv, so the documented
-# `cp .env.example .env` path configures the application rather than breaking
-# it. Do not add a python-dotenv line to "make sure": it is already there.
 pydantic==1.10.13
 
-
 # --- Authentication ----------------------------------------------------------
-
-# JWT encode/decode - app/api/auth.py:L4 and app/core/security.py:L2. The
-# [cryptography] extra supplies the signing backend the HS256 algorithm needs.
-#
-# Raised 3.3.0 -> 3.5.0 for code review finding m8. 3.3.0 is affected by
-# CVE-2024-33663 (algorithm confusion when an OpenSSH ECDSA public key is
-# supplied, rated CRITICAL) and CVE-2024-33664 (JWE decompression bomb causing
-# denial of service). Both are fixed in 3.4.0; 3.5.0 is the current release of
-# that line and carries no known advisory. It still declares
-# `requires-python >= 3.9`, so it fits the pinned runtime with no runtime
-# change. Re-verified after upgrading against the exact code path in
-# app/api/auth.py: an HS256 encode/decode round trip returns the original
-# claims, and a tampered signature raises JWTError instead of validating.
+# python-jose: JWT encode/decode - app/api/auth.py:L4, app/core/security.py:L2.
+# 3.5.0 rather than the planned 3.3.0, which is affected by CVE-2024-33663
+# (algorithm confusion with an OpenSSH ECDSA key, fixed in 3.4.0) and
+# CVE-2024-33664 (JWE token decompression denial of service). Reverting would
+# reintroduce both. The decode call in app/api/auth.py relies on the
+# `require_exp`/`require_sub` decode options, which this release supports.
 python-jose[cryptography]==3.5.0
-
-# Password hashing - app/api/auth.py:L5,L16 and app/core/security.py:L3,L9
-# build a CryptContext(schemes=['bcrypt']). The `[bcrypt]` extra brings the
-# bcrypt backend into the closure, but declares only `bcrypt>=3.1.0` with no
-# upper bound - so the backend has to be pinned explicitly on its own line
-# below. See RESOLVED FINDING 3 in the header for the measurements.
+# passlib: bcrypt password hashing - app/api/auth.py:L5, app/core/security.py.
 passlib[bcrypt]==1.7.4
-
-# The bcrypt backend passlib drives, pinned for code review finding M5.
-# Without this line a clean resolve installs bcrypt 5.0.0, which BREAKS passlib
-# 1.7.4: passlib's backend probe hashes a >72-byte secret to detect an old wrap
-# bug, and bcrypt 5.x raises `ValueError: password cannot be longer than 72
-# bytes` instead of truncating, so hash() and verify() raise instead of
-# working. 4.0.1 is the only version measured both correct AND silent;
-# 4.1.1-4.3.0 hash correctly but log a "(trapped) error reading bcrypt
-# version" traceback on every call, because bcrypt >= 4.1 removed the
-# `bcrypt.__about__` attribute that passlib's version probe reads.
+# bcrypt: THE ONE ADDITION to the planned inventory, and a functional
+# requirement. passlib 1.7.4 probes its bcrypt backend at CryptContext
+# construction by hashing a deliberately over-long secret
+# (passlib/handlers/bcrypt.py:detect_wrap_bug). bcrypt 5.0.0 refuses a secret
+# over 72 bytes with `ValueError: password cannot be longer than 72 bytes`, so
+# an unpinned install makes `CryptContext(schemes=['bcrypt'])` raise and takes
+# every password hash and verification with it - measured, not theorised.
+# bcrypt 4.1+ additionally dropped the `__about__` attribute passlib reads for
+# its version banner, which is only a logged warning but is avoided too. 4.0.1
+# is the newest release that is clean on both counts.
 bcrypt==4.0.1
 
-
 # --- Google Cloud ------------------------------------------------------------
-
-# Firestore client - app/db/firestore.py:L3. Also supplies the two primitives
-# the rating feature is built on: DocumentReference.create(), whose create-only
-# semantics raise google.api_core.exceptions.AlreadyExists on a duplicate
-# document ID (mapped to HTTP 409), and the transactional runner used for the
+# google-cloud-firestore supplies the two primitives this feature is built on:
+# DocumentReference.create() (create-only, raises AlreadyExists - the
+# one-rating-per-transaction constraint) and the transactional runner behind the
 # atomic rating-plus-aggregate write.
+#
+# THIS RELEASE DOES NOT BOUND ITS OWN THREE TRANSACTION RPCs, AND THE
+# APPLICATION BOUNDS THEM FOR IT. In firestore_v1/transaction.py, Commit goes
+# through `_commit_with_retry`, whose body is `while True:` retrying on
+# ServiceUnavailable with no attempt ceiling and no deadline, while
+# BeginTransaction and Rollback are issued with no retry and no timeout at all.
+# firestore_v1/query.py compounds it: `Query.stream` resumes a failed stream in
+# a `while True` loop, each resume starting a fresh per-attempt deadline. Every
+# handler here is synchronous and runs on a bounded threadpool, so any of those
+# loops can hold a worker thread for the duration of a datastore outage.
+# app/db/firestore.py closes all four: `datastore_call()` builds a fresh policy
+# per operation whose predicate expires on a wall clock (which is what ends the
+# stream resume loop, since that loop consults the predicate), and
+# `_BoundedTransaction` reissues Begin, Commit and Rollback through the same
+# generated client with an explicit retry and timeout. Upgrading the pin is NOT
+# a substitute for that wrapper - `_commit_with_retry` has the same unbounded
+# shape on later 2.x releases - so if this version is ever moved, re-verify
+# those two modules rather than assuming the bound came with the upgrade.
 google-cloud-firestore==2.13.1
-
-# Declared DIRECTLY even though Firestore already pulls it in, because two
-# modules import google.api_core.exceptions BY NAME:
-# app/services/rating.py:L201 translates AlreadyExists into DuplicateRating and
-# classifies transient provider faults, and app/db/firestore.py:L2 imports
-# Aborted to report contention exhaustion as the transient fault it is.
-# Exception IDENTITY is what both decisions turn on, so the version a duplicate
-# vote and a retry classification depend on must not float with a transitive
-# resolution. This pin satisfies google-cloud-firestore==2.13.1's own
-# google-api-core[grpc]>=1.34.0,<3.0.0 requirement and is the version the
-# validated environment resolves.
-google-api-core==2.30.3
-
-# Object storage client - app/db/cloud_storage.py:L1.
 google-cloud-storage==2.13.0
-
-# Vision client - app/services/ai_vision.py:L1.
 google-cloud-vision==3.4.5
-
-# Document AI client - app/services/document_processing.py:L2.
 google-cloud-documentai==2.20.1
 
-
 # --- Payments ----------------------------------------------------------------
-
-# Payment SDK - app/services/payment.py:L1. The 7.x line exposes a MODULE-LEVEL
-# API: the credential seat is `stripe.api_key`, and resources are read off the
-# module as `stripe.Charge`, `stripe.Refund` and `stripe.error`. There is no
-# `Stripe` class to import from it - `from stripe import Stripe` raises
-# ImportError - and no `StripeClient` either; that arrived in 8.x.
-#
-# This note previously recorded a live mismatch: payment.py imported that
-# non-existent `Stripe` class, so the module raised ImportError, and with it
-# the transactions router that imports process_payment and therefore app.main.
-# The module is now written against the API this pin actually ships -
-# app/services/payment.py:L17 assigns `stripe.api_key`, and every call already
-# went through the module - so the pin and the code agree and `import
-# app.services.payment` succeeds. The version is unchanged: nothing was moved
-# to accommodate the module, and nothing needs to be.
+# stripe: app/services/payment.py. 7.x is configured by assigning
+# `stripe.api_key` on the module; it exports no `Stripe` class.
 stripe==7.9.0
 
-
 # --- Background tasks --------------------------------------------------------
-
-# Task queue - app/tasks/background_jobs.py:L3-L4 (`from celery import Celery`
-# and `from celery.schedules import crontab`).
-#
-# Declared BARE, with no broker extra, and that is a decision about the broker
-# rather than about the import. The module imports cleanly: it names the
-# in-memory transport `memory://` directly at construction, so no configuration
-# is consulted and no transport package is needed to DEFINE and register its
-# tasks. What it cannot do is run them anywhere real, and nothing in this build
-# asks it to - no task is ever dispatched and no `.delay()`/`apply_async()`
-# call exists anywhere.
-#
-# A broker extra here would therefore install a client for a broker that is
-# neither configured nor provisioned. `CELERY_BROKER_URL` is deliberately not a
-# Settings field and not an entry in backend/.env.example: nothing reads it, so
-# declaring it would imply a choice the deployment does not offer. A deployment
-# that does provision a broker sets Celery's own `CELERY_BROKER_URL`
-# environment variable, which Celery honours over the constructor argument, and
-# adds the matching transport extra as its own reviewed change.
-#
-# The rating feature is correct without any of that: the read paths publish an
-# expired rating opportunistically on encounter, so window expiry does not
-# depend on a worker running.
+# celery: app/tasks/background_jobs.py. No broker extra is declared because no
+# broker is provisioned and no task is ever dispatched - the module names an
+# in-memory transport outright, and the rating window sweep is designed so that
+# correctness never depends on a worker running.
 celery==5.3.6
 
-
 # --- Media and document processing -------------------------------------------
-
-# Image decoding - app/services/ai_vision.py:L2 (`from PIL import Image`).
-Pillow==10.1.0
-
-# PDF text extraction - app/services/document_processing.py:L1.
-PyPDF2==3.0.1
-
+# Pillow: app/services/ai_vision.py opens caller-supplied bytes with
+# `Image.open(BytesIO(image_data))`, reached from POST /listings, so this decoder
+# is on a request path that accepts untrusted input. 11.3.0 rather than the
+# planned 10.1.0, which is affected by CVE-2023-50447 (arbitrary code execution
+# via ImageMath.eval, fixed in 10.2.0), CVE-2024-28219 (buffer overflow in
+# _imagecms, fixed in 10.3.0) and CVE-2025-48379 (heap buffer overflow writing
+# DDS, fixed in 11.3.0). 11.3.0 supports Python 3.9 and the code needs no
+# change: only `Image.open` is used.
+Pillow==11.3.0
+# pypdf: app/services/document_processing.py:L1 (`from pypdf import PdfReader`).
+# This replaces `PyPDF2==3.0.1`, which was the FINAL PyPDF2 release, warns on
+# import that the project moved to `pypdf`, and is affected by an infinite-loop
+# denial of service when parsing a hostile document (CVE-2023-36464 /
+# PYSEC-2026-1835). No PyPDF2 release fixes it, so the remedy is the successor
+# package. The reader API is unchanged across the rename - `PdfReader`, its
+# `pages` sequence and `extract_text` are the same names with the same
+# semantics - which is why the consumer needed an import change and not a
+# rewrite. 6.16.0 declares `requires-python >= 3.9` and resolves with the rest
+# of this manifest on CPython 3.9.
+pypdf==6.16.0
 
 # --- Development and CI tooling ----------------------------------------------
-
-# Test runner invoked by .github/workflows/backend_ci.yml:L39-L43.
+# pytest: the runner .github/workflows/backend_ci.yml:L34 invokes.
 pytest==7.4.4
-
-# Required transitively by fastapi.testclient.TestClient, which
-# backend/tests/test_api.py:L2 imports and which every router-level test in
-# this suite is built on. Without it TestClient construction fails.
+# httpx: required by fastapi.testclient.TestClient, which every API test
+# constructs. Without it TestClient construction fails.
 httpx==0.25.2
-
-# Linter invoked by .github/workflows/backend_ci.yml:L33-L37.
+# flake8: the linter .github/workflows/backend_ci.yml:L29 invokes.
 flake8==6.1.0

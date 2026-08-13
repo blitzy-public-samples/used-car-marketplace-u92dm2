@@ -122,5 +122,17 @@ class User(BaseModel):
     # not validated, so documents written before this field existed
     # still deserialize: that is the no-migration guarantee.
     is_verified: StrictBool = False
+    # The EXACT mean of every published score this user has received,
+    # unrounded, so that ``rating_average * rating_count`` recovers their
+    # exact total. That is what the incremental fold in
+    # ``app/services/rating.py`` reconstructs, and storing a rounded
+    # value here made each fold inherit the previous one's rounding
+    # error - two users with identical ratings could end up with
+    # different averages. Presentation rounding belongs to the response
+    # projection, not to the stored field.
+    #
+    # ``None``, never 0.0, for a user nobody has rated: the scale starts
+    # at 1, so a zero would read as an earned reputation rather than as
+    # the absence of one.
     rating_average: Optional[float] = None
     rating_count: int = 0

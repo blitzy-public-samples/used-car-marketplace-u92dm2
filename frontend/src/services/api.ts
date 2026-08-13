@@ -330,20 +330,26 @@ export const fetchUserRatings = (
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * The `aggregate` half of the same `GET /api/ratings/user/{user_id}` response.
- * It is not a separate endpoint and no longer a separate mode: an
- * `aggregate_only=true` mode existed and was removed, because it answered from
- * the user document WITHOUT settling publications that were already due — and
- * this is the surface that renders beside every listing, so the most-read
- * reputation in the product was the one that could sit stale waiting on a worker
- * that will never run.
+ * `GET /api/ratings/user/{user_id}/aggregate`, which returns the two numbers and
+ * nothing else. It was previously the `aggregate` half of the full user read
+ * with the rest discarded, and this is the surface that renders beside every
+ * listing — so the most-frequent read in the product was transferring a page of
+ * reviews no caller looked at, and costing the server a ratings query to produce
+ * them.
+ *
+ * An `aggregate_only=true` FLAG existed before that and was removed for a
+ * different reason: it answered from the user document WITHOUT settling
+ * publications that were already due, which made this the one reputation figure
+ * permitted to sit stale waiting on a worker that will never run. The endpoint
+ * called now settles on every request, exactly as the full read does, so nothing
+ * about that objection is reintroduced.
  *
  * A public read, exactly as `fetchUserRatings` is: no bearer token is sent, in
  * this wrapper or in the `./rating` implementation it delegates to.
  *
- * Because both halves now come from one settled, version-pinned read, this
- * wrapper and `fetchUserRatings` can never show a reader different reputations
- * for the same user.
+ * Both endpoints settle the same due set and read the same denormalised pair off
+ * the same user document, so this wrapper and `fetchUserRatings` can never show a
+ * reader different reputations for the same user.
  *
  * Reflects published ratings only, and includes every one of them whatever the
  * score.
@@ -353,8 +359,8 @@ export const fetchUserRatings = (
  *   never been rated — never 0, which would instead claim a genuine, earned
  *   one-star reputation.
  * @throws {AxiosError} 404 when no such user exists.
- * @throws {RatingContractError} When the envelope cannot be interpreted as
- *   `UserRatingsResponseSchema`.
+ * @throws {RatingContractError} When the payload cannot be interpreted as
+ *   `RatingAggregateSchema`.
  */
 export const fetchUserReputation = (
   userId: string

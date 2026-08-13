@@ -1,7 +1,6 @@
 import logging
 from typing import List
 from celery import Celery
-from celery.schedules import crontab
 from app.db.firestore import db
 from app.services.ai_vision import analyze_vehicle_photo
 from app.services.document_processing import process_maintenance_document
@@ -14,6 +13,16 @@ from app.services.rating import publish_expired_ratings
 
 
 logger = logging.getLogger(__name__)
+
+# How many rating IDs the sweep's summary line may name.
+#
+# Small on purpose. The sweep can publish thousands of ratings in one
+# pass, and a log line naming every one of them is a liability rather
+# than a record: it can reach a megabyte, it costs time in the pass it
+# describes, and log collectors truncate or drop lines that size. A
+# handful of IDs is enough to find an affected document by hand, and the
+# count beside them is the figure that actually gets read.
+SWEEP_LOG_SAMPLE_SIZE = 5
 
 # The transport this application's tasks are DEFINED against. Celery requires
 # a broker URL at construction, and this one is stated outright rather than
@@ -46,42 +55,48 @@ celery_app = Celery('used_car_marketplace', broker=CELERY_BROKER_URL)
 @celery_app.task
 def process_new_listing_photos(listing_id: str, photo_urls: List[str]) -> None:
     # HUMAN ASSISTANCE NEEDED
-    # This function needs review for production readiness due to confidence level below 0.8
+    # This function needs review for production readiness due to
+    # confidence level below 0.8
     listing = db.collection('listings').document(listing_id).get()
-    
+
     photo_analysis_results = []
     for url in photo_urls:
         result = analyze_vehicle_photo(url)
         photo_analysis_results.append(result)
-    
+
     aggregated_info = aggregate_photo_results(photo_analysis_results)
-    
+
     db.collection('listings').document(listing_id).update({
         'photo_analysis': aggregated_info
     })
-    
+
     if check_for_discrepancies(aggregated_info, listing.to_dict()):
         db.collection('listings').document(listing_id).update({
             'manual_review_required': True
         })
 
+
 @celery_app.task
-def process_maintenance_documents(listing_id: str, document_urls: List[str]) -> None:
+def process_maintenance_documents(
+    listing_id: str,
+    document_urls: List[str],
+) -> None:
     # HUMAN ASSISTANCE NEEDED
-    # This function needs review for production readiness due to confidence level below 0.8
+    # This function needs review for production readiness due to
+    # confidence level below 0.8
     listing = db.collection('listings').document(listing_id).get()
-    
+
     document_processing_results = []
     for url in document_urls:
         result = process_maintenance_document(url)
         document_processing_results.append(result)
-    
+
     aggregated_info = aggregate_document_results(document_processing_results)
-    
+
     db.collection('listings').document(listing_id).update({
         'maintenance_info': aggregated_info
     })
-    
+
     if check_for_inconsistencies(aggregated_info, listing.to_dict()):
         db.collection('listings').document(listing_id).update({
             'manual_review_required': True
@@ -113,15 +128,19 @@ def process_maintenance_documents(listing_id: str, document_urls: List[str]) -> 
 # codebase, no task is ever dispatched, and both functions remain
 # registered Celery tasks.
 
+
 @celery_app.task
 def update_listing_status():
-    active_listings = db.collection('listings').where('status', '==', 'active').get()
-    
+    active_listings = (
+        db.collection('listings').where('status', '==', 'active').get()
+    )
+
     for listing in active_listings:
         if is_listing_expired(listing):
             db.collection('listings').document(listing.id).update({
                 'status': 'inactive'
             })
+
 
 # See the note above ``update_listing_status`` for why this task no longer
 # doubles as an ``on_after_configure`` receiver. It matters most here: this
@@ -129,9 +148,14 @@ def update_listing_status():
 @celery_app.task
 def process_scheduled_refunds():
     # HUMAN ASSISTANCE NEEDED
-    # This function needs review for production readiness due to confidence level below 0.8
-    refund_scheduled_transactions = db.collection('transactions').where('status', '==', 'refund_scheduled').get()
-    
+    # This function needs review for production readiness due to
+    # confidence level below 0.8
+    refund_scheduled_transactions = (
+        db.collection('transactions')
+        .where('status', '==', 'refund_scheduled')
+        .get()
+    )
+
     for transaction in refund_scheduled_transactions:
         # ``create_refund`` is the collaborator this module has: it takes
         # the stripe charge reference and the amount off the transaction
@@ -145,7 +169,7 @@ def process_scheduled_refunds():
             transaction_data.get('stripe_payment_intent_id'),
             transaction_data.get('amount'),
         )
-        
+
         if refund_result.get('success'):
             db.collection('transactions').document(transaction.id).update({
                 'status': 'refunded'
@@ -185,10 +209,20 @@ def publish_expired_rating_window() -> int:
     not publish - a transient datastore fault, or a body that cannot be
     proved against its transaction - aborted the whole pass, stranding
     every rating behind it indefinitely. The service's entry point is
-    bounded by a ceiling declared beside the query it walks, advances a
-    cursor so every candidate is seen once per pass rather than the same
-    first page being re-read while later records starve, and absorbs a
-    failed record at the severity its cause deserves before continuing.
+    bounded by a ceiling declared beside the query it walks, asks the
+    datastore for the DUE records only and takes them OLDEST FIRST, and
+    absorbs a failed record at the severity its cause deserves before
+    continuing.
+
+    That ordering is what makes a bounded pass make progress. Because the
+    query returns only ratings past their deadline and the oldest come
+    first, a pass spends its ceiling on the records that have waited
+    longest and publishing one removes it from the query permanently - so
+    successive passes drain a backlog from its front instead of
+    re-examining the same records. It is worth being precise about the
+    limit that remains: a backlog LARGER than the ceiling is not cleared
+    by one pass, and with nothing dispatching this task, that draining
+    falls to the read paths.
 
     Correctness does not depend on this task running, and that is
     deliberate: no task in this codebase is ever dispatched, there is no
@@ -205,33 +239,53 @@ def publish_expired_rating_window() -> int:
         How many ratings this pass published. Zero when nothing was due.
         The service reports the IDs it moved; this returns the count,
         because a task result is stored by the broker and a number is the
-        useful, bounded form of it. The IDs are logged rather than
-        returned.
+        useful, bounded form of it.
     """
     published = publish_expired_ratings()
+    # BOUNDED LOG LINE. The full list is not logged, and the difference is
+    # not cosmetic: a pass may publish up to the service's scan ceiling of
+    # 5000 ratings, and a rating ID is a composite of two document IDs, so
+    # joining them produced a single line that could approach a megabyte -
+    # enough to slow the very sweep it was reporting on, and to be
+    # truncated or dropped by whatever collects it. The count is the
+    # useful figure, and a bounded sample is enough to find one of the
+    # affected documents by hand; anyone needing all of them has the
+    # per-record lines the service emits for anything that did not go
+    # routinely.
+    sample = published[:SWEEP_LOG_SAMPLE_SIZE]
     logger.info(
-        'Scheduled rating window sweep published %d rating(s): %s',
+        'Scheduled rating window sweep published %d rating(s). '
+        'First %d: %s%s',
         len(published),
-        ', '.join(published) if published else 'none',
+        len(sample),
+        ', '.join(sample) if sample else 'none',
+        ' (...)' if len(published) > len(sample) else '',
     )
     return len(published)
 
 
 # Helper functions (to be implemented)
+
+
 def aggregate_photo_results(results):
     pass
+
 
 def check_for_discrepancies(aggregated_info, listing_data):
     pass
 
+
 def aggregate_document_results(results):
     pass
+
 
 def check_for_inconsistencies(aggregated_info, listing_data):
     pass
 
+
 def is_listing_expired(listing):
     pass
+
 
 def log_failed_refund(transaction_id, error_message):
     pass

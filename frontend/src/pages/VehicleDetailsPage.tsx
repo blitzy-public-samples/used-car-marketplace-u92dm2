@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useId, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { PhotoGallery } from '@/components/PhotoGallery';
 import { VehicleSpecs } from '@/components/VehicleSpecs';
@@ -6,6 +6,7 @@ import { MaintenanceHistory } from '@/components/MaintenanceHistory';
 import { MessageBox } from '@/components/MessageBox';
 import { PaymentForm } from '@/components/PaymentForm';
 import { fetchListingDetails } from '@/services/api';
+import { readListingSellerId } from '../utils/validation';
 
 /*
  * Seller reputation, for the bidirectional peer rating system (F010).
@@ -42,39 +43,115 @@ import type { RatingAggregate } from '../schema/rating';
 // HUMAN ASSISTANCE NEEDED
 // The following component may need additional error handling, loading states, and responsive design considerations for production readiness.
 
+/**
+ * Every distinguishable state the seller's reputation region can be in.
+ *
+ * A single `RatingAggregate | null` was ambiguous in a way that mattered on this
+ * screen: it read the same whether the request had not resolved yet, the listing
+ * carried no seller identifier at all, the request had failed, or the seller had
+ * genuinely never been rated. `ReputationBadge` renders "No ratings yet" for the
+ * first three of those, so a buyer deciding whether to transact was shown a
+ * factual claim about the seller's reputation that the page had no evidence for.
+ *
+ * `'loaded'` is the ONLY state that carries an aggregate, so the badge can only
+ * be rendered when there is a real server answer behind it, and the other three
+ * are each explained in their own words instead.
+ */
+type SellerReputation =
+  | { readonly status: 'pending' }
+  | { readonly status: 'unavailable' }
+  | { readonly status: 'failed' }
+  | { readonly status: 'loaded'; readonly aggregate: RatingAggregate };
+
+/*
+ * WHICH KEY IS AUTHORITATIVE, and why the reader lives in `utils/validation.ts`.
+ *
+ * `GET /api/listings/{listing_id}` answers with the `VehicleListing` Pydantic
+ * model, whose field is `seller_id` (`backend/app/schema/listing.py`), and
+ * FastAPI serialises Pydantic field names verbatim — so `seller_id` is what
+ * actually arrives over the wire. The client's own Zod model
+ * (`frontend/src/schema/listing.ts`) declares the camelCase `sellerId`, and no
+ * mapper exists anywhere in this repository to bridge the two for listings;
+ * `frontend/src/services/rating.ts` owns that adaptation for ratings only.
+ * Reading `sellerId` alone therefore found `undefined` on every real response,
+ * which silently skipped the request and left the badge asserting "No ratings
+ * yet" for every seller on the site.
+ *
+ * `readListingSellerId` prefers the wire key and honours the camelCase key
+ * second, because both are declared contracts here: the first is what the server
+ * sends today, the second keeps this page working unchanged once a listing
+ * mapper is introduced. It also trims, and refuses a value that is empty, longer
+ * than a document ID may be, or slash-bearing — so no round trip is spent on an
+ * identifier the ratings endpoint could not address. It is a reader, not a
+ * mapper: it narrows one field and converts nothing.
+ *
+ * It is imported rather than written inline because this page cannot be rendered
+ * in a test at all — its five `@/…` imports resolve nowhere — so the read is only
+ * testable once it is extracted. `frontend/src/utils/__tests__/validation.test.ts`
+ * is what guards the behaviour this page depends on.
+ *
+ * The reader reports absence as `undefined`; it is normalised to `null` at the
+ * single call site below, because an unidentifiable seller is a gap in a payload
+ * this page does not own and the region says so rather than describing it as an
+ * unrated seller.
+ */
+
 const VehicleDetailsPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const [listingDetails, setListingDetails] = useState<any>(null);
 
   /*
-   * The seller's aggregate reputation, or `null` while there is none to show.
-   *
-   * `null` covers two genuinely different situations, and this deliberately does
-   * not distinguish them, because `ReputationBadge` renders the same thing for
-   * both: the fetch has not resolved yet, and the seller has never been rated.
-   * What matters is that neither is ever coerced to a number. Passing `0` as a
-   * stand-in for a missing average would render an unrated seller as an earned
-   * one-star reputation, on the exact screen where a buyer decides whether to
-   * transact — see the note at the call site.
+   * The accessible name for the seller region below. `useId` rather than a
+   * literal so the value is unique even if this page is ever mounted twice, and
+   * so it matches the convention the rating components already follow.
    */
-  const [sellerRating, setSellerRating] = useState<RatingAggregate | null>(null);
+  const sellerHeadingId = useId();
+
+  /*
+   * The seller's reputation, as one of four named states rather than a nullable
+   * aggregate. `'pending'` is the initial state because that is the truth on
+   * first render: the listing has not arrived, so nothing has been asked yet.
+   *
+   * An average is never coerced to a number in any state. Passing `0` as a
+   * stand-in for a missing average would render an unrated seller as an earned
+   * one-star reputation — the scale's floor is 1, so `0` is not a low reputation,
+   * it is not a reputation at all — on the exact screen where a buyer decides
+   * whether to transact.
+   */
+  const [sellerReputation, setSellerReputation] = useState<SellerReputation>({
+    status: 'pending',
+  });
+
+  /*
+   * Invalidates in-flight reputation requests.
+   *
+   * Bumped when a request starts and again when the effect is cleaned up, so a
+   * response that arrives after the seller changed — or after this page
+   * unmounted — is discarded instead of being written into state. Two listings by
+   * different sellers viewed in quick succession is the ordinary way that
+   * happens, and without this the slower of the two responses wins and the page
+   * shows one seller's reputation under another seller's listing.
+   *
+   * A ref rather than state: it must be readable and writable without causing a
+   * render, and its value is never displayed.
+   */
+  const reputationRequestRef = useRef(0);
 
   /*
    * Whose reputation to fetch, read off the loaded listing.
    *
-   * Annotated explicitly. `listingDetails` is `any`, so the annotation is what
-   * stops that `any` from propagating into the effect below and into its
-   * dependency array, without this change introducing an `any` of its own.
+   * `readListingSellerId` consumes the authoritative wire key — see the note
+   * above for why the previously-read `sellerId` found nothing on a real
+   * response. Explicitly annotated, which is what stops `listingDetails`'s `any`
+   * from propagating into the effect below and into its dependency array.
    *
-   * `undefined` is a legitimate value, not a transient one to be waited out: it
+   * `null` is a legitimate resting value, not a transient one to be waited out: it
    * holds while the listing is still loading, and it can persist afterwards
    * because the listing endpoint is owned elsewhere and this page cannot
-   * guarantee the field is present. The effect treats it as "nothing to fetch"
-   * rather than as a failure.
+   * guarantee the field is present. The effect distinguishes the two, which is
+   * the whole point — the first is `'pending'`, the second is `'unavailable'`.
    */
-  const sellerId: string | undefined = listingDetails
-    ? listingDetails.sellerId
-    : undefined;
+  const sellerId: string | null = readListingSellerId(listingDetails) ?? null;
 
   useEffect(() => {
     const fetchDetails = async () => {
@@ -102,44 +179,103 @@ const VehicleDetailsPage: React.FC = () => {
    * Declared ABOVE the `if (!listingDetails)` return below, which is a
    * correctness requirement rather than a preference: a hook placed after a
    * conditional return is called on some renders and skipped on others, which
-   * corrupts React's hook ordering. That is exactly why the derivation above
-   * tolerates `listingDetails === null` instead of this effect being moved down
-   * past the guard where the seller id would always be available.
+   * corrupts React's hook ordering. That is exactly why `readListingSellerId`
+   * tolerates a missing payload instead of this effect being moved down past the
+   * guard where the listing would always be in hand.
    */
   useEffect(() => {
     /*
-     * No seller id, no request.
-     *
-     * `sellerRating` is already `null`, so the badge renders its own empty state
-     * and there is nothing to fetch and nothing to report — an absent field on a
-     * payload this page does not own is not an error to surface to a buyer. It
-     * also avoids spending a round trip on `/ratings/user/undefined` to be
-     * answered 404.
+     * One generation per run of this effect. Everything below writes state only
+     * while its own generation is still the current one, so a response for a
+     * previous seller — or for a page that has since unmounted — is dropped.
      */
-    if (!sellerId) {
+    const generation = (reputationRequestRef.current += 1);
+    const isCurrent = (): boolean => reputationRequestRef.current === generation;
+
+    /*
+     * No seller id, no request — but the two reasons there is no seller id are
+     * reported differently rather than both being passed over in silence.
+     *
+     * `readListingSellerId` reports absence both while the listing is still loading and
+     * when a loaded listing does not identify its seller. The second is a gap in a
+     * payload this page does not own, and saying "no ratings yet" for it would
+     * state a fact about the seller that nothing supports — so it becomes
+     * `'unavailable'`, while the first stays `'pending'`. Either way no request is
+     * made, which also avoids spending a round trip on `/ratings/user/undefined`
+     * to be answered 404.
+     */
+    if (sellerId === null) {
+      /*
+       * The same predicate the page's own `if (!listingDetails)` early return
+       * uses, so the two agree by construction: this region is only ever rendered
+       * on a truthy listing, which is exactly when `'unavailable'` is the true
+       * statement. Until then nothing has been asked, so the state is `'pending'`.
+       */
+      const idle: SellerReputation = listingDetails
+        ? { status: 'unavailable' }
+        : { status: 'pending' };
+
+      if (isCurrent()) {
+        /*
+         * Functional form, and the equality check is why: a fresh object with the
+         * same status would fail `Object.is` and cost a render that changes
+         * nothing on screen. Returning `current` lets React bail out.
+         */
+        setSellerReputation((current) =>
+          current.status === idle.status ? current : idle,
+        );
+      }
+
       return;
+    }
+
+    /*
+     * A new seller starts from "not answered yet" rather than keeping the
+     * previous seller's figures on screen while the next request is in flight.
+     */
+    if (isCurrent()) {
+      setSellerReputation((current) =>
+        current.status === 'pending' ? current : { status: 'pending' },
+      );
     }
 
     const loadSellerRating = async () => {
       try {
         const aggregate = await fetchUserReputation(sellerId);
-        setSellerRating(aggregate);
+
+        if (isCurrent()) {
+          setSellerReputation({ status: 'loaded', aggregate });
+        }
       } catch (error) {
         /*
          * Reputation is supporting information, not the subject of this page, so
-         * a failure is logged and the badge stays in its empty state instead of
-         * replacing the listing with an error. `fetchUserReputation` can reject
-         * with an `AxiosError` (404, or a transport failure) or with a
+         * a failure is logged and reported in one line instead of replacing the
+         * listing with an error. `fetchUserReputation` can reject with an
+         * `AxiosError` (404, or a transport failure) or with a
          * `RatingContractError` when the envelope cannot be interpreted; neither
          * is actionable by the buyer, and neither should cost them the listing
          * they came here to read.
+         *
+         * It is emphatically NOT reported as an unrated seller. A failed request
+         * is evidence of nothing about the seller, and the badge's "No ratings
+         * yet" is a factual claim, so the failure gets its own words.
          */
         console.error('Failed to fetch seller reputation:', error);
+
+        if (isCurrent()) {
+          setSellerReputation({ status: 'failed' });
+        }
       }
     };
 
     loadSellerRating();
-  }, [sellerId]);
+
+    return () => {
+      // Invalidates whatever is in flight, so a late response cannot write state
+      // after unmount or against a newer seller.
+      reputationRequestRef.current += 1;
+    };
+  }, [sellerId, listingDetails]);
 
   if (!listingDetails) {
     return <div>Loading...</div>; // TODO: Replace with a proper loading component
@@ -172,7 +308,12 @@ const VehicleDetailsPage: React.FC = () => {
         list rather than being findable only by eye — WCAG 2.1 Level AA is a stated
         requirement of this project. The page's only other heading is the `<h1>`
         above, so `<h2>` is the next level down: no level is skipped and no second
-        `<h1>` is emitted.
+        `<h1>` is emitted. The heading also NAMES the section, through
+        `aria-labelledby` pointing at its `id`: a `<section>` is only exposed as a
+        landmark ("region") when it has an accessible name, so without this the
+        element is announced as a plain group, is absent from the landmark list a
+        screen-reader user navigates by, and the heading beside it is the only clue
+        it exists. `useId` supplies the id so it is unique per mount.
 
         STYLING. Tailwind default-scale utilities only, which is the whole token
         source here — `theme.extend` in `tailwind.config.js` is empty and no
@@ -183,30 +324,54 @@ const VehicleDetailsPage: React.FC = () => {
         stylesheet defines; the two idioms coexist and reconciling them is a
         repository-wide restyle rather than part of this change.
       */}
-      <section className="mt-6">
-        <h2 className="text-lg font-semibold mb-4">Seller Information</h2>
+      <section className="mt-6" aria-labelledby={sellerHeadingId}>
+        <h2 id={sellerHeadingId} className="text-lg font-semibold mb-4">
+          Seller Information
+        </h2>
         {/*
-          `null` rather than `0` for a missing average, which is the whole reason
-          these props are branched instead of defaulted: `0` is not a low
-          reputation, it is not a reputation at all — the scale's floor is 1 — so
-          coercing it would state an earned one star for a seller nobody has rated.
-          `average === null` with `count === 0` is the badge's first-class "No
-          ratings yet" state, and it covers both the pre-fetch and the never-rated
-          case.
+          FOUR STATES, FOUR DIFFERENT SENTENCES. The badge is rendered only for
+          `'loaded'`, because "No ratings yet" is a factual claim about the seller
+          and only a real server answer supports it. Waiting on the request, a
+          listing that does not identify its seller, and a request that failed are
+          each said in their own words — none of them is evidence that nobody has
+          rated this person, and on the screen where a buyer decides whether to
+          transact the difference is the difference between an honest blank and a
+          made-up one.
 
-          The figures are passed through UNTOUCHED: not rounded, not clamped, not
-          recomputed. The server is the authority for the aggregate and the badge
-          owns its one-decimal presentation, so nothing is left for this call site
-          to decide. Nothing here keys on the VALUE either — no threshold, no
-          colour tier, no hiding of a low score — because the aggregate counts
-          every published rating whatever it says, and a 1.2 is rendered exactly as
-          a 4.9 is.
+          `role="status"` on the three non-loaded lines, so a reader who is already
+          past this point in the page is told politely when the answer arrives
+          rather than having to go back and look. They are not `role="alert"`:
+          supporting information that has not loaded is not an emergency, and
+          interrupting a screen reader over it would be worse than saying nothing.
+
+          The loaded figures are passed through UNTOUCHED: not rounded, not clamped,
+          not recomputed. The server is the authority for the aggregate and the
+          badge owns its one-decimal presentation and its own first-class "No
+          ratings yet" state for a genuinely unrated seller (`average === null` with
+          `count === 0`), so nothing is left for this call site to decide. Nothing
+          here keys on the VALUE either — no threshold, no colour tier, no hiding of
+          a low score — because the aggregate counts every published rating whatever
+          it says, and a 1.2 is rendered exactly as a 4.9 is.
         */}
-        <ReputationBadge
-          average={sellerRating ? sellerRating.average : null}
-          count={sellerRating ? sellerRating.count : 0}
-          label="Seller rating"
-        />
+        {sellerReputation.status === 'loaded' ? (
+          <ReputationBadge
+            average={sellerReputation.aggregate.average}
+            count={sellerReputation.aggregate.count}
+            label="Seller rating"
+          />
+        ) : sellerReputation.status === 'pending' ? (
+          <p role="status" className="text-sm text-gray-600">
+            Loading the seller&apos;s rating…
+          </p>
+        ) : sellerReputation.status === 'unavailable' ? (
+          <p role="status" className="text-sm text-gray-600">
+            Seller rating is unavailable for this listing.
+          </p>
+        ) : (
+          <p role="status" className="text-sm text-gray-600">
+            Seller rating could not be loaded right now.
+          </p>
+        )}
       </section>
       <MessageBox listingId={id} />
       <PaymentForm listingId={id} price={listingDetails.price} />

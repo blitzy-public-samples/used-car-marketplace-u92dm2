@@ -49,15 +49,16 @@ import {
  * `'/api/ratings'` — matching the existing convention in `./api`, whose methods
  * call `'/listings'` and `'/upload'` against a backend that mounts them under
  * `prefix='/api/listings'`. So `REACT_APP_API_BASE_URL` must carry the prefix,
- * for example `http://localhost:8000/api`. With that base the five paths resolve
- * to the five endpoints the router declares relative to its own
+ * for example `http://localhost:8000/api`. With that base the six paths resolve
+ * to the six endpoints the router declares relative to its own
  * `prefix='/api/ratings'`:
  *
- *   POST   /api/ratings                              submit a rating
- *   GET    /api/ratings/user/{userId}                published ratings + aggregate
- *   GET    /api/ratings/transaction/{transactionId}  a transaction's ratings
- *   GET    /api/ratings/eligibility/{transactionId}  may the caller rate?
- *   PATCH  /api/ratings/{ratingId}/moderation        admin-only state transition
+ *   POST   /api/ratings                               submit a rating
+ *   GET    /api/ratings/user/{userId}                 published ratings + aggregate
+ *   GET    /api/ratings/user/{userId}/aggregate       the aggregate alone
+ *   GET    /api/ratings/transaction/{transactionId}   a transaction's ratings
+ *   GET    /api/ratings/eligibility/{transactionId}   may the caller rate?
+ *   PATCH  /api/ratings/{ratingId}/moderation         admin-only state transition
  *
  * The ratings router declares its paths relative to its prefix on purpose,
  * avoiding the double-prefix defect the other three routers carry (their
@@ -243,7 +244,7 @@ const resolveApiBaseUrl = (): string => {
 };
 
 /**
- * Path prefix shared by all five endpoints, relative to the resolved base URL.
+ * Path prefix shared by all six endpoints, relative to the resolved base URL.
  */
 const RATINGS_PATH = '/ratings';
 
@@ -328,18 +329,25 @@ export const readAuthToken = (): string | null => {
  * carries, which is what lets an interface render the server's own words instead
  * of a locally invented table of copy keyed by status code.
  *
- * BOTH SHAPES OF `detail` ARE HANDLED, because FastAPI emits two. A refusal
- * raised by the router is a string ("Only verified users can submit ratings").
- * A request Pydantic rejected before any handler ran is an ARRAY of issue
- * objects — `[{loc, msg, type}]` — since no custom `RequestValidationError`
- * handler is registered anywhere in the backend. Reading only the string case
- * silently discards every 422: a score outside the scale or an over-long review
- * would degrade to axios's own "Request failed with status code 422", which
- * tells the user nothing about which field to fix.
+ * ONE SHAPE, AND THAT IS THE POINT. Every failure the ratings API answers —
+ * a domain refusal, the admin gate, the auth dependency, an unreachable
+ * datastore, and a request the framework itself rejected — carries
+ * `{ detail: "<sentence>", errors?: [{ loc, msg, type }] }`. So this reads
+ * `detail` and nothing else.
  *
- * Each issue contributes its `msg`, duplicates are collapsed, and the results are
- * joined. `loc` is deliberately not rendered: it is a JSON pointer written for a
- * developer ("body", "score"), and the messages read as sentences without it.
+ * It used to have to do more. 422 was the one status the backend answered with
+ * two incompatible bodies: a string `detail` when the router refused a rating,
+ * and an ARRAY of issue objects when Pydantic rejected a field, because no
+ * `RequestValidationError` handler was registered. This function had to sniff
+ * the runtime type of `detail` to tell which it had been sent — a client
+ * working around a server contract that could not be generated from. The
+ * backend now renders validation failures into the same envelope, summarising
+ * the field problems into the `detail` sentence and keeping them verbatim in
+ * `errors`, so the workaround is gone rather than merely tidied.
+ *
+ * `errors` is deliberately not read here: `detail` already names the fields at
+ * fault in prose, which is what an interface renders. A form that wants to mark
+ * individual inputs reads `errors` itself, from the typed envelope.
  *
  * @param error Any rejection value, of genuinely unknown shape.
  * @returns The server's message, or `null` when the error carries none — a
@@ -356,6 +364,23 @@ export const readServerDetail = (error: unknown): string | null => {
     return detail.length > 0 ? detail : null;
   }
 
+  /*
+   * The ARRAY shape, kept as a fallback rather than removed.
+   *
+   * Every failure the ratings API answers now carries `detail` as a single
+   * string, because the backend registers a `RequestValidationError` handler that
+   * renders framework validation into the same `{ detail, errors? }` envelope as
+   * a router-raised refusal. So this branch is not the ratings contract.
+   *
+   * It is retained because that handler is SCOPED to the ratings prefix: any
+   * other route this shared client is pointed at, and any ratings route added
+   * outside the handler's scope, still answers with FastAPI's default
+   * `HTTPValidationError`, whose `detail` is a list of `{ loc, msg }` objects.
+   * Reading only the string case left such a response degrading to axios's own
+   * "Request failed with status code 422", which tells a user nothing about what
+   * to change. Messages are de-duplicated because one mistake commonly produces
+   * the same sentence for several fields.
+   */
   if (Array.isArray(detail)) {
     const messages = detail
       .map((issue) =>
@@ -887,10 +912,12 @@ const toDate = (value: string | null | undefined, field: string): Date => {
  * one it does.
  *
  * `moderation_status` and `moderation_reason` are ABSENT.
- * Moderation state is operational: the visibility decision it drives has already
- * been applied to `is_published` and to whether `review` carries text, so a
- * public or participant reader needs none of it and is given none of it. Only
- * the admin-only moderation endpoint returns those fields, under
+ * Moderation state is operational, and the visibility decision it drives has
+ * already been applied to what arrives: a rating still awaiting moderation comes
+ * with `review` empty, and one moderation rejected is not in the response at all
+ * — the server withholds the whole record from every reader but its author. So a
+ * public or participant reader needs none of these fields and is given none of
+ * them. Only the admin-only moderation endpoint returns them, under
  * `ModeratedRatingWire` below.
  *
  * `review` is NULLABLE BUT REQUIRED: the server always returns the key, carrying
@@ -1443,50 +1470,60 @@ export const fetchUserRatings = async (
 /**
  * Read just one user's reputation summary. F010-3.
  *
- * NOT a separate endpoint and not a separate mode: it reads the same
- * `GET /api/ratings/user/{userId}` response and keeps the `aggregate` half. An
- * `aggregate_only=true` mode was requested from here and has been removed,
- * because it answered from the user document WITHOUT settling publications that
- * were already due — and this is the surface that renders beside every listing,
- * so the most-read reputation in the product was the one that could sit stale
- * while a worker that will never run was nominally responsible for revealing it.
+ * Its own endpoint, `GET /api/ratings/user/{userId}/aggregate`, which returns
+ * the two numbers and nothing else. This is the surface that renders beside
+ * every listing, and it used to be served by keeping the `aggregate` half of the
+ * full user read and discarding the rest — so the busiest read in the product
+ * transferred a page of rating documents, each with its review text, for a
+ * caller that used none of them. The server did more work still to produce them:
+ * a ratings query, and a walk of as many as ten pages past records moderation
+ * had withheld in order to fill one. Against the 200 ms budget this feature is
+ * held to, that is the difference between one document and hundreds.
  *
- * The cost of dropping it is honest and bounded: this call transfers the bounded
- * `items` array it does not use. Correct-and-settled beats cheap-and-stale for a
- * number the whole feature exists to report, and the aggregate itself is still
- * one denormalised document read on the server.
- *
- * A public read, so it sends no bearer token — it delegates to
- * `fetchUserRatings`, which attaches none. This is the surface that renders
- * beside every listing, so it is also the one where an unnecessary credential
- * would have been put on the wire most often.
- *
- * SETTLEMENT IS NEVER SKIPPED
+ * WHAT WAS NOT TRADED AWAY
  * ---------------------------------------------------------------------------
- * The server settles any rating whose window has elapsed before it answers,
- * which it must: publication has no worker behind it, so a read is the only
- * thing that ever performs one. A mode that skipped settlement would make this
- * the one reputation figure in the system permitted to be behind — on the
- * surface a buyer consults before transacting, and visibly disagreeing with the
- * same user's profile page. Reading the aggregate out of the settled envelope is
- * what guarantees this function and `fetchUserRatings` can never report
- * different reputations for the same user.
+ * An `aggregate_only=true` FLAG was requested from here once and removed,
+ * because the server answered it straight from the user document without
+ * settling publications that were already due — and being the mode the badge
+ * used, it made the most-read reputation in the product the one permitted to sit
+ * stale while a worker that will never run was nominally responsible for
+ * revealing it.
+ *
+ * That objection was about settlement, not about asking for less data, and it
+ * still holds: the endpoint this now calls settles on every request, exactly as
+ * the full read does, and only then reads the denormalised pair. Both endpoints
+ * settle the same due set and read the same two fields off the same document, so
+ * this function and `fetchUserRatings` cannot report different reputations for
+ * the same user. A distinct path rather than a flag is what keeps each response
+ * model describing one shape.
+ *
+ * A public read, so no bearer token is attached, matching the endpoint's own
+ * contract and `fetchUserRatings` above. This is the call made most often, so it
+ * is also the one where an unnecessary credential would reach the wire most
+ * often.
  *
  * Reflects published ratings only, and includes every one of them whatever the
- * score.
+ * score — a 1 counts exactly as a 5, because a moderation decision is about
+ * content and a score must never influence what is counted.
  *
  * @param userId The user whose reputation is wanted.
  * @returns The aggregate. `average` is null, with `count` 0, for a user who has
  *   never been rated — never 0, which would claim a one-star reputation.
  * @throws {AxiosError} 404 when no such user exists.
- * @throws {RatingContractError} When the envelope cannot be interpreted.
+ * @throws {RatingContractError} When the payload cannot be interpreted.
  */
 export const fetchUserReputation = async (
   userId: string
 ): Promise<RatingAggregate> => {
-  // PUBLIC: delegates to `fetchUserRatings`, which attaches no credential.
-  const response = await fetchUserRatings(userId);
-  return response.aggregate;
+  // PUBLIC: no credential is attached, matching the endpoint's own contract.
+  const api = createRatingApiInstance('public');
+  const response = await api.get<RatingAggregateWire>(
+    `${RATINGS_PATH}/user/${encodeURIComponent(userId)}/aggregate`
+  );
+
+  return decode(`GET ${RATINGS_PATH}/user/{userId}/aggregate`, () =>
+    toRatingAggregate(response.data)
+  );
 };
 
 /**

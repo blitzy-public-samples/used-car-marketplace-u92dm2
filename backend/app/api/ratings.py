@@ -1,12 +1,13 @@
 """HTTP surface for the bidirectional peer reputation system.
 
-Publishes the five endpoints of F010 "Review and Rating System" from
+Publishes the six endpoints of F010 "Review and Rating System" from
 ``documentation/Software Requirements Specifications (SRS).md``
 (L429-L441): rating submission (F010-1) and the written review it
-carries (F010-2), the aggregate a profile displays (F010-3), and the
-moderation transition (F010-4). F010-5, integration of ratings into
-search-result ranking, is deliberately out of scope - nothing in this
-module changes the semantics of ``GET /api/listings``.
+carries (F010-2), the aggregate a profile displays (F010-3) - offered
+both with the reviews behind it and, for the reputation badge, on its
+own - and the moderation transition (F010-4). F010-5, integration of
+ratings into search-result ranking, is deliberately out of scope -
+nothing in this module changes the semantics of ``GET /api/listings``.
 
 WHAT THIS MODULE DOES, AND WHAT IT DELIBERATELY DOES NOT
 -------------------------------------------------------------------
@@ -74,7 +75,8 @@ a query - it is policy:
 * what a reader may see is decided by the double-blind publication
   state, by moderation state for review CONTENT only, and by an
   authorship override that still shows a rater their own withheld
-  words together with the reason;
+  words - the moderator's policy note stays out of every response this
+  router builds except the admin-gated moderation one;
 * the aggregate is read as one get-by-ID off the user document, which
   is what holds the 200 ms budget at SRS L451, and a stored pair that
   cannot be true is quarantined rather than presented to somebody as
@@ -166,9 +168,14 @@ Pydantic v1 semantics apply throughout, matching the pin in
 ``backend/requirements.txt``.
 """
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, validator
 
 
@@ -229,6 +236,7 @@ from app.services.rating import (
     TransactionInvariantError,
     TransactionNotCompleted,
     TransactionNotFound,
+    get_user_aggregate,
     get_user_reputation,
     list_transaction_ratings,
     moderate_rating,
@@ -241,6 +249,18 @@ from app.services.rating import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The prefix this router is mounted at, declared HERE rather than only as
+# a literal in ``app/main.py``. Two things need to agree about it and they
+# are in different files: the mount itself, and the scope of the
+# request-validation handler below, which must cover exactly the paths
+# this router serves and no others. One constant makes that agreement
+# structural instead of a coincidence that a future edit can break.
+#
+# Every path in this module is declared RELATIVE to it, so nothing here
+# repeats the ``ratings`` segment - see the module docstring for why that
+# is verified by enumerating the registered routes.
+RATINGS_PREFIX = '/api/ratings'
 
 # The role permitted to moderate. Compared inline exactly as
 # ``app/api/listings.py`` compares it when authorizing a deletion,
@@ -255,6 +275,19 @@ ADMIN_ROLE = 'admin'
 ADMIN_ONLY_DETAIL = 'Only administrators can moderate ratings'
 USER_NOT_FOUND_DETAIL = 'User not found'
 RATING_NOT_FOUND_DETAIL = 'Rating not found'
+
+# How many field problems the ``detail`` sentence of a validation failure
+# names before it summarises the rest. The sentence is rendered verbatim
+# by the interface, so it has to stay readable; the COMPLETE set is
+# always carried in the envelope's ``errors`` list, so bounding the prose
+# withholds nothing from a client.
+VALIDATION_DETAIL_LIMIT = 5
+
+# What a validation failure is reported as when it carries no usable
+# problem list at all. Unreachable through the framework, which never
+# raises one empty, and present because a body promising a sentence must
+# never answer with a blank one.
+VALIDATION_FALLBACK_DETAIL = 'The request could not be validated'
 
 # The router's error contract: an EXPLICIT, closed list of the typed
 # failures this API answers, and nothing else. Every entry maps one
@@ -339,6 +372,41 @@ MAPPED_DOMAIN_FAILURES = tuple(
 )
 
 
+class FieldError(BaseModel):
+    """One field-level problem inside a request-validation failure.
+
+    The machine-readable half of :class:`ErrorDetail`. It exists because
+    a validation failure has two audiences and one sentence cannot serve
+    both: a person needs prose, and a form needs to know WHICH input to
+    mark. ``detail`` carries the prose; this carries the location.
+
+    The three fields are exactly what the framework's own validation
+    error reports, kept rather than reshaped so nothing is invented and
+    nothing is lost.
+    """
+
+    loc: List[str] = Field(
+        ...,
+        description=(
+            'Path to the offending value, outermost first - for example '
+            '``["body", "score"]`` or ``["path", "transaction_id"]``. '
+            'List indices appear as their decimal string.'
+        ),
+    )
+    msg: str = Field(
+        ...,
+        description='What is wrong with that value, as a sentence.',
+    )
+    type: str = Field(
+        ...,
+        description=(
+            'The validation rule that rejected it, as the framework '
+            'names it - for example ``value_error.number.not_ge``. It is '
+            'a stable machine key, not prose to show a user.'
+        ),
+    )
+
+
 class ErrorDetail(BaseModel):
     """The shape of EVERY failure this router answers with.
 
@@ -352,18 +420,37 @@ class ErrorDetail(BaseModel):
     which is the worst version of the problem - undocumented behaviour
     that consumers discover in production.
 
-    One field, matching what the framework actually sends: FastAPI
-    renders an ``HTTPException`` as ``{"detail": ...}``. It is typed
-    ``str`` because every failure this router raises carries a sentence -
-    the prose from a domain exception's ``message``, or one of this
-    module's own literals.
+    ``detail`` is always a SENTENCE. That is the property a client can
+    build on: whatever refused the request - a domain guard, the admin
+    gate, the auth dependency, an unreachable datastore, or request
+    validation - the body carries one string fit to render, and it is
+    the same string the eligibility endpoint reports as its ``reason``
+    for the same condition.
 
-    THE ONE EXCEPTION, and it is the framework's rather than ours: a 422
-    from request validation carries a LIST of per-field error objects
-    instead of a string, and FastAPI already publishes that shape as
-    ``HTTPValidationError``. So 422 is deliberately NOT re-declared with
-    this model anywhere below - overriding it would replace an accurate
-    generated schema with a wrong one.
+    ONE ENVELOPE, INCLUDING THE 422 THE FRAMEWORK RAISES
+    -------------------------------------------------------------------
+    This model previously described only the failures the router raised
+    itself, and 422 was deliberately left as the framework's
+    ``HTTPValidationError`` - which publishes ``detail`` as a LIST of
+    per-field objects. So this API had two incompatible bodies under one
+    status code: ``SelfRatingNotAllowed`` and a refused moderation
+    transition answered 422 with ``{"detail": "<sentence>"}``, while a
+    score outside the scale answered the same 422 with
+    ``{"detail": [{...}]}``. A generated client could model only the
+    documented one, so the runtime branch it could not model was the one
+    a user hits by typing the wrong thing - and the official client had
+    to sniff the type of ``detail`` at runtime to cope.
+
+    That is closed by :func:`validation_failure_handler`, which renders
+    a request-validation failure into THIS shape: the per-field problems
+    are composed into the ``detail`` sentence AND kept verbatim in
+    ``errors``. Nothing is lost, one shape is published, and 422 is
+    declared with this model on every operation that can produce it.
+
+    ``errors`` is present only on that path. It is absent - or null - on
+    every failure the router raises itself, because a refused rating has
+    no offending field to point at: the request was well formed and the
+    server's answer is the whole story.
     """
 
     detail: str = Field(
@@ -372,6 +459,17 @@ class ErrorDetail(BaseModel):
             'Why the request was refused, as a sentence fit to show a '
             'user. It never contains a stack trace, a datastore '
             'identifier, a hostname or any other internal detail.'
+        ),
+    )
+    errors: Optional[List[FieldError]] = Field(
+        None,
+        description=(
+            'The per-field problems behind a request-validation '
+            'failure, for a client that marks individual inputs. '
+            'Present only on a 422 raised by validation; absent on '
+            'every other failure, which has no field to point at. The '
+            '``detail`` sentence above already summarises these, so a '
+            'client that only renders a message can ignore this.'
         ),
     )
 
@@ -405,6 +503,37 @@ DATASTORE_UNAVAILABLE_RESPONSE = {
             'The datastore could not be reached within the deadline. '
             'Transient: a ``Retry-After`` header accompanies this '
             'response and the request may be retried unchanged.'
+        ),
+    },
+}
+
+# 422 is declared with the SAME model as every other failure, which is
+# the whole point of :func:`validation_failure_handler`: this status is
+# the one place the framework would otherwise send a second, incompatible
+# body under a status this API also produces itself.
+#
+# Declaring it here REPLACES the generated ``HTTPValidationError`` schema
+# on every operation that spreads this dict - and that replacement is
+# only honest because the handler above makes the runtime body match.
+# Every one of the five operations can reach this status: each has at
+# least one validated path parameter or body field, and two of them
+# additionally answer 422 from a domain refusal.
+VALIDATION_FAILURE_RESPONSE = {
+    422: {
+        'model': ErrorDetail,
+        'description': (
+            'The request is not valid. ``detail`` is one sentence '
+            'naming what to fix, and ``errors`` locates each offending '
+            'field, when the failure came from request validation - a '
+            'score outside the scale, a review over the length limit, '
+            'an identifier that cannot name a document, an unknown '
+            'moderation state, or a moderation reason that does not '
+            'match the state it accompanies. The two domain refusals '
+            'that also answer 422 - rating a transaction that names one '
+            'user as both parties, and a moderation decision the '
+            'service refuses - carry the same envelope with no '
+            '``errors``, because the request was well formed and no '
+            'single field is at fault.'
         ),
     },
 }
@@ -731,6 +860,162 @@ def domain_failure(error: Exception) -> HTTPException:
     raise error
 
 
+def _field_path(location: Any) -> str:
+    """Name the offending input the way a person would refer to it.
+
+    Args:
+        location: The ``loc`` tuple from one framework validation error,
+            outermost first - ``('body', 'score')``, ``('path',
+            'transaction_id')``, or ``('body', 0)`` when the body could
+            not be decoded at all.
+
+    Returns:
+        The field name for the ``detail`` sentence: the location with its
+        leading section word dropped, since "score" reads better than
+        "body.score" to somebody looking at a form. When nothing
+        meaningful is left - a decode failure points at an offset rather
+        than a field - the section word itself is used, so the sentence
+        still says WHERE rather than naming a number.
+    """
+    parts = [str(part) for part in (location or ())]
+    if not parts:
+        return 'request'
+    named = [part for part in parts[1:] if not part.isdigit()]
+    return '.'.join(named) if named else parts[0]
+
+
+def _validation_errors(raw: Any) -> List[Dict[str, Any]]:
+    """Normalise the framework's validation errors for the envelope.
+
+    Args:
+        raw: The list ``RequestValidationError.errors()`` returns.
+
+    Returns:
+        One dict per problem, carrying only ``loc``, ``msg`` and ``type``
+        and nothing else. The framework also attaches ``ctx``, whose
+        contents vary by rule and can include the offending input, and
+        ``url``, which points at documentation for a Pydantic error
+        code. Neither belongs in a response: the first risks echoing a
+        submitted value back into an error body, and the second is
+        noise a client cannot act on.
+    """
+    normalised: List[Dict[str, Any]] = []
+    for problem in raw or ():
+        if not isinstance(problem, dict):
+            continue
+        normalised.append({
+            'loc': [str(part) for part in (problem.get('loc') or ())],
+            'msg': str(problem.get('msg') or 'is not valid'),
+            'type': str(problem.get('type') or 'value_error'),
+        })
+    return normalised
+
+
+def _validation_detail(problems: List[Dict[str, Any]]) -> str:
+    """Compose the one sentence a validation failure is rendered as.
+
+    The interface shows ``detail`` verbatim, so this has to read as
+    prose and it has to say which input to fix. Each problem becomes
+    ``"<field>: <message>"``, duplicates collapse - the same rule firing
+    on two array members says nothing twice - and the result is joined
+    with semicolons.
+
+    It is BOUNDED at :data:`VALIDATION_DETAIL_LIMIT` entries. A body can
+    fail validation in many places at once, and a sentence that grows
+    without limit stops being something a user can read; the complete
+    set stays available in ``errors``, so nothing is lost by summarising
+    here.
+
+    Args:
+        problems: The normalised problems from :func:`_validation_errors`.
+
+    Returns:
+        The sentence. Never empty: a validation failure carrying no
+        usable problem list still gets a truthful message rather than a
+        blank one.
+    """
+    described: List[str] = []
+    for problem in problems:
+        described.append('{0}: {1}'.format(
+            _field_path(problem['loc']),
+            problem['msg'],
+        ))
+    unique = list(dict.fromkeys(described))
+    if not unique:
+        return VALIDATION_FALLBACK_DETAIL
+    shown = unique[:VALIDATION_DETAIL_LIMIT]
+    remaining = len(unique) - len(shown)
+    sentence = '; '.join(shown)
+    if remaining > 0:
+        sentence = '{0}; and {1} further problem{2}'.format(
+            sentence,
+            remaining,
+            '' if remaining == 1 else 's',
+        )
+    return sentence
+
+
+async def validation_failure_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> Response:
+    """Render a request-validation failure in this API's one envelope.
+
+    Registered on the application in ``app/main.py``. It exists because
+    the framework's own 422 body is the single exception to this API's
+    error contract: everything else arrives as
+    ``{"detail": "<sentence>"}``, while validation arrives as
+    ``{"detail": [{...}]}``. Two shapes under one status code cannot both
+    be declared, so a generated client could model only one of them, and
+    the official client had to inspect the runtime type of ``detail`` to
+    tell which it had been sent.
+
+    This does not throw the per-field information away to achieve that.
+    The problems are summarised into the ``detail`` sentence a person
+    reads AND carried verbatim in ``errors`` for a client that marks
+    individual inputs, so the envelope is a superset of what the default
+    handler produced.
+
+    IT IS SCOPED TO THIS ROUTER'S PATHS, DELIBERATELY
+    -------------------------------------------------------------------
+    An exception handler is registered per APPLICATION, not per router,
+    so this function sees validation failures from the listings,
+    transactions and messages routers too. Those are pre-existing
+    published contracts that this work does not own: their operations
+    document 422 as the framework's ``HTTPValidationError``, and
+    reshaping their bodies while leaving that schema in place would
+    create, for three other surfaces, exactly the runtime-versus-declared
+    mismatch this handler exists to remove. So any path outside
+    :data:`RATINGS_PREFIX` is handed to the framework's own handler
+    unchanged - byte for byte the response it would have sent if this
+    handler had never been registered.
+
+    Args:
+        request: The request whose validation failed. Only its path is
+            consulted, to decide whether this surface owns the response.
+        exc: The framework's validation error.
+
+    Returns:
+        A 422 in this API's envelope for a ratings path; otherwise
+        whatever ``fastapi.exception_handlers`` would have returned.
+    """
+    path = request.url.path
+    owned = path == RATINGS_PREFIX or path.startswith(
+        RATINGS_PREFIX + '/'
+    )
+    if not owned:
+        return await request_validation_exception_handler(request, exc)
+    problems = _validation_errors(exc.errors())
+    body = ErrorDetail(
+        detail=_validation_detail(problems),
+        errors=problems,
+    )
+    # ``exclude_none`` is NOT used: ``errors`` is always populated on
+    # this path, and a client reading the envelope should see the key it
+    # was promised rather than have to distinguish absent from empty.
+    return JSONResponse(status_code=422, content=body.dict())
+
+
 @router.post(
     '',
     status_code=201,
@@ -757,11 +1042,15 @@ def domain_failure(error: Exception) -> HTTPException:
                 'The transaction has not completed; or this rater has '
                 'already rated it, which the datastore refuses so the '
                 'rule holds under concurrent submission; or the '
-                'transaction record is missing data a rating requires '
-                'and cannot be rated until it is repaired.'
+                'transaction record cannot be rated until it is '
+                'repaired - it is missing data a rating requires, names '
+                'a counterparty that is not a usable identifier, or '
+                'names one that has no account. Nothing is written on '
+                'any of those paths.'
             ),
         },
         **UNAUTHENTICATED_RESPONSE,
+        **VALIDATION_FAILURE_RESPONSE,
         **DATASTORE_UNAVAILABLE_RESPONSE,
     },
 )
@@ -812,18 +1101,22 @@ def create_rating(
             a party to the transaction (R2); 404 when no such
             transaction exists; 409 when the transaction is not
             completed, when this rater has already rated it, or when the
-            transaction's stored record is too incomplete to rate; 422
+            transaction's stored record cannot support a rating; 422
             for a degenerate transaction naming one user as both
             parties.
 
             The third 409 is the odd one and is stated plainly: a
             transaction that exists, names the caller and is completed
-            but is MISSING the data a rating record requires is a corrupt
-            document in this system's own datastore rather than a mistake
-            the caller made. It is answered as a conflict with the stored
-            state - which is what it is - and the specific defect is
-            logged at ERROR with the transaction named so an operator can
-            repair it. Nothing is written on that path.
+            can still be unratable, because the record itself is
+            defective - it is missing the data a rating denormalises, or
+            it names a counterparty that cannot be a document ID, or it
+            names one that has no user document to rate. Each is a
+            corrupt document in this system's own datastore rather than
+            a mistake the caller made. It is answered as a conflict with
+            the stored state - which is what it is - and the specific
+            defect is logged at ERROR with the transaction named so an
+            operator can repair it. Nothing is written on any of those
+            paths.
 
             503 when the datastore cannot be reached within its
             deadline, carrying ``Retry-After``. Every status here is
@@ -860,6 +1153,7 @@ def create_rating(
                 'beside ``average=null, count=0``.'
             ),
         },
+        **VALIDATION_FAILURE_RESPONSE,
         **DATASTORE_UNAVAILABLE_RESPONSE,
     },
 )
@@ -887,11 +1181,15 @@ def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
       up and positioned this public query from, so any rating ID -
       another user's, or one still unpublished - could be handed in and
       its existence read back off the response;
-    * the aggregate-only mode answered from the user document without
+    * the aggregate-only MODE answered from the user document without
       settling publications that were already due, and it was the mode
       the reputation badge used, so the most-read surface in the product
       was the one that could show a reputation waiting on a worker that
-      will never run;
+      will never run. The badge's need was real, and it is now served by
+      the sibling endpoint ``/user/{user_id}/aggregate`` below, which
+      settles exactly as this one does and then reads only the
+      denormalised pair. A flag was the wrong shape for it, not a wrong
+      idea: it made one response model mean two shapes;
     * and all three widened a published contract that is two fields.
 
     THE PAGE AND THE AGGREGATE COME FROM ONE OPERATION
@@ -948,6 +1246,99 @@ def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
 
 
 @router.get(
+    '/user/{user_id}/aggregate',
+    response_model=RatingAggregate,
+    summary='Read just one user\'s reputation summary',
+    responses={
+        404: {
+            'model': ErrorDetail,
+            'description': (
+                'No such user. Distinct from a user who exists and has '
+                'no ratings, which is a 200 carrying '
+                '``average=null, count=0``.'
+            ),
+        },
+        # Declared here as on every sibling route: ``user_id`` is a
+        # constrained document-ID type, so this endpoint answers 422 for a
+        # path parameter that cannot name a document, and the handler
+        # registered for this router renders that failure in the same
+        # ``ErrorDetail`` envelope as every other refusal. Omitting the
+        # declaration would leave the generated contract promising
+        # FastAPI's default ``HTTPValidationError`` on one route out of
+        # six while the response actually carried the envelope - one
+        # endpoint a client would have to special-case.
+        **VALIDATION_FAILURE_RESPONSE,
+        **DATASTORE_UNAVAILABLE_RESPONSE,
+    },
+)
+def get_user_reputation_aggregate(user_id: DocumentId) -> RatingAggregate:
+    """Report one user's reputation summary, without the reviews. F010-3.
+
+    Resolves to ``GET /api/ratings/user/{user_id}/aggregate``.
+
+    PUBLIC, with no authentication dependency, for the same reason as the
+    sibling read directly above: a reputation is what a prospective
+    counterparty consults before deciding to transact.
+
+    WHY A SECOND ENDPOINT RATHER THAN A MODE
+    -------------------------------------------------------------------
+    The reputation badge renders beside every listing and needs an average
+    and a count. Serving it from ``/user/{user_id}`` meant the busiest read
+    in the product returned a page of rating documents - having walked as
+    far as ten pages past withheld records to fill it - for a client that
+    discarded every one of them. Against the SRS 200 ms budget that is the
+    difference between one document read and hundreds.
+
+    A query parameter would have expressed the same thing, and was
+    rejected: a mode flag makes ONE response model mean two shapes, so the
+    OpenAPI contract stops describing what a caller receives and every
+    consumer has to branch on what it asked for. A distinct path with its
+    own response model states the two contracts separately, and neither
+    endpoint's shape depends on how it was called.
+
+    SETTLEMENT IS NOT WHAT WAS DROPPED
+    -------------------------------------------------------------------
+    An ``aggregate_only`` mode existed here once and was removed because it
+    answered from the user document WITHOUT settling publications that were
+    already due - which, being the mode the badge used, made the most-read
+    reputation in the product the one permitted to sit behind a worker that
+    will never run. This endpoint settles on every call, exactly as its
+    sibling does; what it drops is the listing it read afterwards and threw
+    away. The two therefore cannot report different reputations for the
+    same user: same settlement, same denormalised pair, same projection.
+
+    Args:
+        user_id: The rated user. Validated against the Firestore
+            document-ID grammar before it can reach ``document()``.
+
+    Returns:
+        The aggregate over every published rating received, whatever its
+        score and whatever its moderation state. ``average`` is null with
+        ``count`` zero for a user who has never been rated - which is a
+        state, not an error, and never a zero average, since the scale's
+        floor is 1 and a zero would claim an earned one-star reputation.
+
+    Raises:
+        HTTPException: 404 when no such user exists, keeping "no ratings"
+            and "no such user" distinguishable. 503 when the datastore
+            cannot be reached within its deadline, carrying
+            ``Retry-After``. Both are declared on the decorator.
+    """
+    # One settlement pass and one get-by-ID, both inside the service. This
+    # handler reads nothing itself and decides only the status code.
+    try:
+        aggregate = get_user_aggregate(user_id)
+    except TRANSIENT_PROVIDER_ERRORS as error:
+        raise datastore_unavailable(error) from error
+    if aggregate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=USER_NOT_FOUND_DETAIL,
+        )
+    return aggregate
+
+
+@router.get(
     '/transaction/{transaction_id}',
     response_model=List[RatingView],
     summary='Read the ratings attached to one transaction',
@@ -964,6 +1355,7 @@ def get_user_ratings(user_id: DocumentId) -> UserRatingsResponse:
             'description': 'No transaction exists at the cited ID.',
         },
         **UNAUTHENTICATED_RESPONSE,
+        **VALIDATION_FAILURE_RESPONSE,
         **DATASTORE_UNAVAILABLE_RESPONSE,
     },
 )
@@ -1067,6 +1459,7 @@ def get_transaction_ratings(
             ),
         },
         **UNAUTHENTICATED_RESPONSE,
+        **VALIDATION_FAILURE_RESPONSE,
         **DATASTORE_UNAVAILABLE_RESPONSE,
     },
 )
@@ -1122,9 +1515,10 @@ def get_rating_eligibility(
     # decision this endpoint's contract turns into a 404, and it is
     # translated through the same failure mapping every other endpoint
     # uses. Every other outcome - including a transaction whose stored
-    # record is too incomplete to rate - comes back as a decision this
-    # endpoint reports with 200, which is what keeps its published
-    # contract to 200/401/404.
+    # record cannot support a rating, whether because it is missing data,
+    # names an unusable counterparty or names one with no account - comes
+    # back as a decision this endpoint reports with 200, which is what
+    # keeps its published contract to 200/401/404.
     #
     # An earlier revision instead compared ``decision.reason`` against
     # ``TransactionNotFound.message``, which made an HTTP status code
@@ -1163,6 +1557,7 @@ def get_rating_eligibility(
             ),
         },
         **UNAUTHENTICATED_RESPONSE,
+        **VALIDATION_FAILURE_RESPONSE,
         **DATASTORE_UNAVAILABLE_RESPONSE,
     },
 )
@@ -1257,10 +1652,20 @@ def set_rating_moderation(
             detail=ADMIN_ONLY_DETAIL,
         )
     try:
+        # ``current_user.id`` is forwarded for the AUDIT LINE and for
+        # nothing else. The authorization decision was taken above, from
+        # the caller's stored role, and the service takes none from this
+        # value - it records who moved the state so the decision is
+        # attributable, which matters precisely because a moderation
+        # transition removes somebody's words from view and this codebase
+        # has no audit collection to reconstruct that from afterwards.
+        # It is safe in a log line by construction: ``User.id`` is
+        # grammar-bound, so it carries no newline to forge one with.
         rating = moderate_rating(
             rating_id,
             payload.moderation_status,
             payload.moderation_reason,
+            actor_id=current_user.id,
         )
     except TRANSIENT_PROVIDER_ERRORS as error:
         raise datastore_unavailable(error) from error

@@ -158,16 +158,16 @@ export interface StarRatingInputHandle {
  * The selectable scores, ascending, derived from the shared bounds rather than
  * hardcoded.
  *
- * `RATING_MIN`/`RATING_MAX` are one half of a FIXED cross-stack contract:
- * `settings.RATING_MIN` and `settings.RATING_MAX` are declared `const=True`, so
- * the server accepts no other pair and an environment that tries to override one
- * fails at import. That is what lets this control trust the numbers. It is
- * deliberately NOT true that "widening the scale server-side widens this control
- * with no edit here" — this file is compiled into a separate artefact that cannot
- * read a server environment variable, so a server-only change could only ever
- * leave the two disagreeing: an extra star the server answers with 422, or a
- * missing one a rater cannot choose. Changing the scale means editing both sides
- * and shipping them together.
+ * `RATING_MIN`/`RATING_MAX` are the client half of a cross-stack contract that
+ * NOTHING ENFORCES MECHANICALLY. `settings.RATING_MIN` and `settings.RATING_MAX`
+ * are ordinary defaulted settings on the server, overridable from the
+ * environment, so this control trusts the numbers by convention rather than by
+ * construction. It is deliberately NOT true that "widening the scale
+ * server-side widens this control with no edit here" — this file is compiled
+ * into a separate artefact that cannot read a server environment variable, so a
+ * server-only change leaves the two disagreeing: an extra star the server
+ * answers with 422, or a missing one a rater cannot choose. Changing the scale
+ * means editing both sides and shipping them together.
  *
  * Computed once at module scope: the bounds are module constants, so the result
  * is invariant and there is nothing to recompute per render.

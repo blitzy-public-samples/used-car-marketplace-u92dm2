@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useId, useRef, useState } from 'react';
 import { ProfileForm } from '@/components/ProfileForm';
 import { ListingManagement } from '@/components/ListingManagement';
 import { fetchUserProfile, updateUserProfile } from '@/services/api';
@@ -11,7 +11,8 @@ import { useSelector, selectCurrentUser } from '@/store/userSlice';
  * resolves nowhere: `../../tsconfig.json` declares six aliases — `@components/*`,
  * `@pages/*`, `@utils/*`, `@styles/*`, `@hooks/*`, `@context/*` — every one of
  * them WITHOUT a trailing-slash-only form, and `../../vite.config.ts` mirrors the
- * same six. So `@/…` is honoured by neither the compiler nor the bundler, which
+ * four of those whose target directory exists (`src/hooks` and `src/context` do
+ * not). So `@/…` is honoured by neither the compiler nor the bundler, which
  * is why those four lines account for four of this file's pre-existing TS2307
  * errors. Repairing them belongs to a repository-wide import rewrite that is out
  * of scope here, so they are left exactly as they are — and the new lines below
@@ -35,11 +36,76 @@ import { fetchUserRatings } from '../services/rating';
 // makes it unambiguous that nothing is imported here at runtime.
 import type { Rating, RatingAggregate } from '../schema/rating';
 
+/**
+ * Every distinguishable state the reputation region can be in.
+ *
+ * See the note at the `useState` call for why this is one atom rather than three
+ * variables, and what each state means.
+ */
+type ProfileRatings =
+  | { readonly status: 'unavailable' }
+  | { readonly status: 'pending' }
+  | { readonly status: 'failed' }
+  | {
+      readonly status: 'loaded';
+      /*
+       * `Rating[]` rather than `readonly Rating[]`: `RatingList` declares its prop
+       * as a mutable array, and this page does not own that component's signature.
+       * The PROPERTY is readonly, which is what stops this state being mutated in
+       * place; the array is handed on exactly as the service returned it.
+       */
+      readonly items: Rating[];
+      readonly aggregate: RatingAggregate;
+    };
+
+/**
+ * Read a user identifier off the authenticated-user value, or report its absence.
+ *
+ * `currentUser` arrives from `useSelector(selectCurrentUser)` on line 5, and
+ * BOTH of those symbols are imported from a specifier that resolves nowhere:
+ * `selectCurrentUser` is not exported by `../store/userSlice` at all (that module
+ * exports `setUser`, `setLoading`, `setError` and a default reducer), and
+ * `useSelector` belongs to `react-redux`. Creating the missing selector is out of
+ * scope, so this page cannot treat `currentUser` as guaranteed to be an object
+ * with a string `id`; dereferencing it unconditionally is how a signed-out or
+ * not-yet-hydrated store turns this whole region into a thrown TypeError.
+ *
+ * The two pre-existing dereferences elsewhere in this file are left exactly as
+ * they are — they belong to the profile fetch and the update handler, which are
+ * not part of this change — so this reader is used by the ratings effect alone.
+ *
+ * @param value The authenticated-user value, of unknown shape.
+ * @returns The identifier, or `null` when there is no usable one.
+ */
+const readUserId = (value: unknown): string | null => {
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+
+  const { id } = value as { id?: unknown };
+
+  return typeof id === 'string' && id.length > 0 ? id : null;
+};
+
 const UserProfilePage: React.FC = () => {
   const [profileData, setProfileData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const currentUser = useSelector(selectCurrentUser);
+
+  /*
+   * The accessible name for the reputation region below. `useId` rather than a
+   * literal so the value is unique even if this page is ever mounted twice, and
+   * so it matches the convention the rating components already follow.
+   */
+  const ratingsHeadingId = useId();
+
+  /*
+   * Whose ratings to load, guarded rather than assumed. See `readUserId` for why
+   * `currentUser` cannot be dereferenced here, and the ratings effect below for
+   * what each outcome means. `null` is a state the region renders, not an error.
+   */
+  const ratingsUserId: string | null = readUserId(currentUser);
 
   /*
    * Rating state for the reputation region below. F010-3.
@@ -53,40 +119,52 @@ const UserProfilePage: React.FC = () => {
    * order is identical on every render. A hook placed after a conditional return
    * would break the Rules of Hooks, which `.eslintrc.cjs` enforces at `error`.
    *
-   * `ratingAggregate` starts as `null`, and that null means exactly ONE thing:
-   * the fetch has not returned yet. It does NOT also mean "never been rated" —
-   * `UserRatingsResponse` declares `aggregate` non-nullable, so a successful
-   * response always hands back a real `RatingAggregate` object, and a user who
-   * has never been rated is represented by `{ average: null, count: 0 }` — an
-   * object whose INNER `average` is null. The wrapper null and the inner null are
-   * different states.
+   * ONE STATE ATOM, FOUR NAMED STATES, rather than an array plus a nullable
+   * aggregate plus an error string. Three independent variables could hold
+   * combinations that describe nothing real — items from the previous user beside
+   * the next user's aggregate, or a stale error beside a fresh answer — and each
+   * of those combinations is a sentence this page would have said to a user. A
+   * discriminated union makes every reset atomic and every render branch
+   * exhaustive, so the region can only ever be in a state that is true.
    *
-   * That distinction is load-bearing rather than pedantic: because the wrapper
-   * null is unambiguous, it doubles as the region's "still loading" signal, which
-   * is what lets the render below withhold the empty state until the answer is
-   * actually known — without needing a fourth state variable to track it.
+   * `'loaded'` is the ONLY state carrying data, and it carries BOTH halves of the
+   * server's single envelope together. `GET /api/ratings/user/{userId}` answers
+   * `{ items, aggregate }` from one pinned snapshot, so keeping them in one value
+   * is what guarantees the badge's average and the list's rows cannot contradict
+   * each other.
+   *
+   * The wrapper and the inner null remain different things, and the union makes
+   * that explicit instead of relying on a reader noticing it. `UserRatingsResponse`
+   * declares `aggregate` non-nullable, so a successful response always hands back a
+   * real `RatingAggregate`; a user who has never been rated is
+   * `{ average: null, count: 0 }` — an object whose INNER `average` is null, in the
+   * `'loaded'` state. "Not answered yet" is `'pending'`, which is a different
+   * state entirely and renders different words.
+   *
+   * `'failed'` exists to stop the page telling a lie, and it is why a ratings
+   * failure cannot reuse the `error` variable above: `error` drives a whole-page
+   * early return, so routing a ratings outage into it would delete the entire
+   * profile because a secondary panel failed. Reporting the failure as an empty
+   * list would be worse still — "we could not load this" and "there is nothing
+   * here" are different claims about a person's reputation.
+   *
+   * `'unavailable'` covers a page with no identifiable user to ask about. That is
+   * reachable here: `currentUser` comes from a selector that this module cannot
+   * resolve, so it is not something this page may assume is an object with an id.
    */
-  const [ratings, setRatings] = useState<Rating[]>([]);
-  const [ratingAggregate, setRatingAggregate] = useState<RatingAggregate | null>(
-    null
-  );
+  const [profileRatings, setProfileRatings] = useState<ProfileRatings>({
+    status: 'pending',
+  });
+
   /*
-   * Failure state for the ratings fetch ALONE, and the reason it cannot reuse
-   * `error` above.
+   * Invalidates in-flight ratings requests.
    *
-   * `error` drives a whole-page early return: when it is truthy the entire
-   * profile — form, listing management and all — is replaced by a single error
-   * div. Routing a ratings failure into it would delete the whole page because a
-   * secondary panel failed, so this region owns its own failure flag and renders
-   * it inside itself.
-   *
-   * It also exists to prevent the page telling a lie. Without it, a failed fetch
-   * leaves `ratings` empty and `ratingAggregate` null, and the two children would
-   * then state as fact that this user has no ratings — when the truth is that we
-   * were unable to find out. "We could not load this" and "there is nothing here"
-   * are different claims and are reported differently.
+   * Bumped when a request starts and again on cleanup, so a response that arrives
+   * after the profile's user changed — or after this page unmounted — is discarded
+   * rather than written into state. Without it the slower of two responses wins
+   * and one person's reviews are shown on another person's profile.
    */
-  const [ratingsError, setRatingsError] = useState<string | null>(null);
+  const ratingsRequestRef = useRef(0);
 
   useEffect(() => {
     const loadUserProfile = async () => {
@@ -118,9 +196,16 @@ const UserProfilePage: React.FC = () => {
    * call to `fetchUserReputation` would only re-read the same envelope.
    *
    * DELIBERATELY DOES NOT TOUCH `setError` OR `setIsLoading`. Both drive
-   * whole-page early returns; see the note on `ratingsError` above. `isLoading`
-   * in particular is owned by the profile fetch and is cleared in its `finally`,
-   * so joining it here would gate the entire page on a secondary panel.
+   * whole-page early returns; see the note on the union above. `isLoading` in
+   * particular is owned by the profile fetch and is cleared in its `finally`, so
+   * joining it here would gate the entire page on a secondary panel.
+   *
+   * KEYED ON A GUARDED IDENTIFIER, not on `currentUser.id`. The identifier is read
+   * through `readUserId`, so an absent or not-yet-hydrated user is a value this
+   * effect handles rather than an exception it throws — and because the dependency
+   * is that identifier, the effect re-runs when the profile's subject changes and
+   * resets the region as its first act, instead of leaving one person's reviews on
+   * screen underneath another person's name.
    *
    * Published-only semantics are the SERVER's and are left intact. Under the
    * double-blind publication model a rating stays invisible until its counterpart
@@ -131,32 +216,76 @@ const UserProfilePage: React.FC = () => {
    * `RatingList` below says so in plain words instead.
    */
   useEffect(() => {
+    /*
+     * One generation per run of this effect. Every state write below is gated on
+     * its own generation still being current, so a response for a previous
+     * subject — or for a page that has since unmounted — is dropped.
+     */
+    const generation = (ratingsRequestRef.current += 1);
+    const isCurrent = (): boolean => ratingsRequestRef.current === generation;
+
+    /*
+     * No identifiable user, no request, and the region says so rather than
+     * showing a spinner that will never resolve or an empty state that would
+     * assert this person has no ratings. It also avoids spending a round trip on
+     * `/api/ratings/user/undefined` to be answered 404.
+     */
+    if (ratingsUserId === null) {
+      if (isCurrent()) {
+        setProfileRatings((current) =>
+          current.status === 'unavailable' ? current : { status: 'unavailable' }
+        );
+      }
+
+      return;
+    }
+
+    /*
+     * A new subject starts from "not answered yet". This is the reset the region
+     * previously lacked: without it, a change of user left the previous user's
+     * items, aggregate and error on screen for the whole duration of the next
+     * request, under the new user's name.
+     */
+    if (isCurrent()) {
+      setProfileRatings((current) =>
+        current.status === 'pending' ? current : { status: 'pending' }
+      );
+    }
+
     const loadRatings = async () => {
       try {
-        const response = await fetchUserRatings(currentUser.id);
-        /*
-         * Assigned straight through, untouched and in the order received.
-         *
-         * No `.sort()`, no `.filter()`, no `.slice()`, and the average is taken
-         * from `aggregate` rather than recomputed from `items`. Each of those is
-         * a requirement rather than a preference:
-         *
-         * - The server already guarantees published-only and newest-first, the
-         *   latter through the `(ratee_id, is_published, created_at DESC)`
-         *   composite index. Re-sorting here would override an indexed ordering
-         *   with a local one.
-         * - `items` omits any rating whose review moderation rejected while
-         *   `aggregate` counts every published rating, so `aggregate.count` may
-         *   legitimately exceed `items.length`. Deriving the average from `items`
-         *   would therefore produce a different, wrong number.
-         * - Score-correlated presentation — filtering, reordering or hiding by
-         *   score — is the behaviour 16 CFR Part 465 addresses. Passing the array
-         *   through verbatim is what keeps this page neutral by construction.
-         */
-        setRatings(response.items);
-        setRatingAggregate(response.aggregate);
-        // Clear any earlier failure so a recovered fetch stops reporting one.
-        setRatingsError(null);
+        const response = await fetchUserRatings(ratingsUserId);
+
+        if (isCurrent()) {
+          /*
+           * Assigned straight through, untouched and in the order received.
+           *
+           * No `.sort()`, no `.filter()`, no `.slice()`, and the average is taken
+           * from `aggregate` rather than recomputed from `items`. Each of those is
+           * a requirement rather than a preference:
+           *
+           * - The server already guarantees published-only and newest-first, the
+           *   latter through the `(ratee_id, is_published, created_at DESC)`
+           *   composite index. Re-sorting here would override an indexed ordering
+           *   with a local one.
+           * - `items` omits any rating whose review moderation rejected while
+           *   `aggregate` counts every published rating, so `aggregate.count` may
+           *   legitimately exceed `items.length`. Deriving the average from `items`
+           *   would therefore produce a different, wrong number.
+           * - Score-correlated presentation — filtering, reordering or hiding by
+           *   score — is the behaviour 16 CFR Part 465 addresses. Passing the array
+           *   through verbatim is what keeps this page neutral by construction.
+           *
+           * Committing both halves in ONE state write also replaces any earlier
+           * failure atomically, so a recovered fetch cannot leave a stale error
+           * beside fresh data.
+           */
+          setProfileRatings({
+            status: 'loaded',
+            items: response.items,
+            aggregate: response.aggregate,
+          });
+        }
       } catch (err) {
         /*
          * Contained to this region. `fetchUserRatings` rejects with an
@@ -166,12 +295,21 @@ const UserProfilePage: React.FC = () => {
          * it. Logged for diagnosis, surfaced in words, and nothing else.
          */
         console.error('Failed to load user ratings:', err);
-        setRatingsError('Unable to load ratings right now.');
+
+        if (isCurrent()) {
+          setProfileRatings({ status: 'failed' });
+        }
       }
     };
 
     loadRatings();
-  }, [currentUser.id]);
+
+    return () => {
+      // Invalidates whatever is in flight, so a late response cannot write state
+      // after unmount or against a newer subject.
+      ratingsRequestRef.current += 1;
+    };
+  }, [ratingsUserId]);
 
   const handleProfileUpdate = async (updatedData: any) => {
     try {
@@ -218,7 +356,7 @@ const UserProfilePage: React.FC = () => {
        * style nothing. The two idioms are left to coexist rather than reconciled —
        * restyling the existing page is not part of this change.
        */}
-      <section className="mt-6">
+      <section className="mt-6" aria-labelledby={ratingsHeadingId}>
         {/*
          * `h2`, matching the level of the heading this region replaces and sitting
          * directly under the page's single `h1` above. The level is not a visual
@@ -226,9 +364,17 @@ const UserProfilePage: React.FC = () => {
          * no second h1, which is what lets assistive technology present a correct
          * heading map. `text-lg font-semibold` supplies the appearance, mirroring
          * the section headings in `../components/Footer.tsx`.
+         *
+         * Its `id` NAMES the section through `aria-labelledby`. A `<section>` is
+         * only exposed as a landmark ("region") when it has an accessible name, so
+         * without this pairing the element is announced as an anonymous group and
+         * is absent from the landmark list a screen-reader user navigates by —
+         * which is the one navigation aid this region was added to provide.
          */}
-        <h2 className="text-lg font-semibold mb-4">Ratings &amp; Reviews</h2>
-        {ratingsError ? (
+        <h2 id={ratingsHeadingId} className="text-lg font-semibold mb-4">
+          Ratings &amp; Reviews
+        </h2>
+        {profileRatings.status === 'failed' ? (
           /*
            * The honest failure state, and the reason it is not simply an empty
            * list: rendering the badge and the list here would assert "No ratings
@@ -242,26 +388,30 @@ const UserProfilePage: React.FC = () => {
            * is information, not an interruption.
            */
           <p role="status" className="text-sm text-gray-500">
-            {ratingsError}
+            Unable to load ratings right now.
           </p>
-        ) : ratingAggregate === null ? (
+        ) : profileRatings.status === 'unavailable' ? (
+          /*
+           * No identifiable subject to report on. Distinct from both "no answer
+           * yet" and "no ratings": there is nobody to have ratings, so neither of
+           * the other two sentences would be true.
+           */
+          <p role="status" className="text-sm text-gray-500">
+            Sign in to see your ratings.
+          </p>
+        ) : profileRatings.status === 'pending' ? (
           /*
            * STILL LOADING — and this branch is the whole reason the region does
            * not simply fall through to the badge's empty state.
            *
-           * Before the request settles, `ratings` is `[]` and `ratingAggregate` is
-           * null. Rendering the two children on that state would print "No ratings
-           * yet" — a definite claim about this user's reputation, asserted while we
-           * do not yet know it. Locally the flash is a few milliseconds and easy to
-           * miss; on a slow connection it persists for seconds, and if the request
-           * then FAILS the user was told "you have no ratings" for the entire wait
-           * before being told the truth. That is precisely the misstatement the
-           * error branch above exists to prevent, so it must not be reachable
-           * through the pending path either.
-           *
-           * Distinguishing pending from empty needs no extra state: a successful
-           * response always sets a non-null aggregate object, so a null wrapper can
-           * only mean "no answer yet". See the note on the state declaration.
+           * Rendering the two children before the request settles would print "No
+           * ratings yet" — a definite claim about this user's reputation, asserted
+           * while we do not yet know it. Locally the flash is a few milliseconds and
+           * easy to miss; on a slow connection it persists for seconds, and if the
+           * request then FAILS the user was told "you have no ratings" for the
+           * entire wait before being told the truth. That is precisely the
+           * misstatement the failure branch above exists to prevent, so it must not
+           * be reachable through the pending path either.
            *
            * `role="status"` because this text is replaced asynchronously; `status`
            * is polite, so it does not interrupt.
@@ -276,35 +426,58 @@ const UserProfilePage: React.FC = () => {
              * `ReputationBadge` owns the one-decimal "4.5/5" presentation through
              * `formatRating`, so nothing is formatted, rounded or clamped here.
              *
-             * No null-coalescing is needed: `ratingAggregate` is narrowed to a real
-             * object by the check above, so the values go straight through. `0` is
-             * therefore never substituted for a missing average — which matters,
-             * because the scale starts at 1 and a zero would render an unrated user
-             * as a real, earned one-star reputation. A genuinely unrated user still
-             * reaches the badge's first-class "No ratings yet" rendering, via the
-             * inner `average: null` the server sends for them.
+             * No null-coalescing is needed: the `'loaded'` state carries a real
+             * aggregate object, so the values go straight through. `0` is therefore
+             * never substituted for a missing average — which matters, because the
+             * scale starts at 1 and a zero would render an unrated user as a real,
+             * earned one-star reputation. A genuinely unrated user still reaches the
+             * badge's first-class "No ratings yet" rendering, via the inner
+             * `average: null` the server sends for them.
              *
              * No prop is keyed on the score — no conditional colour, no threshold,
              * no de-emphasis. A 1.0 is passed and displayed exactly as a 5.0 is.
              */}
             <ReputationBadge
-              average={ratingAggregate.average}
-              count={ratingAggregate.count}
+              average={profileRatings.aggregate.average}
+              count={profileRatings.aggregate.count}
             />
             <div className="mt-4">
               {/*
                * The individual ratings behind that average, rendered verbatim.
                *
-               * The empty-state copy is overridden because the default, "No
-               * reviews yet", is true but incomplete on a profile: under the
-               * double-blind model a rating that has genuinely been submitted
-               * against this user stays invisible until the counterparty submits
-               * theirs or the window closes. Saying so plainly is the honest
-               * disclosure of that policy — not a workaround for it.
+               * THE EMPTY COPY IS DERIVED FROM BOTH FIGURES, because "no rows" has
+               * two different meanings on this screen and the default, "No reviews
+               * yet", is only ever right about one of them.
+               *
+               * `aggregate.count === 0` — nothing has been published against this
+               * user. Either nobody has rated them, or a rating exists and the
+               * double-blind model is holding it back until the counterparty submits
+               * or the window closes. Both are covered by saying when a rating
+               * becomes visible, which is the honest disclosure of that policy
+               * rather than a workaround for it.
+               *
+               * `aggregate.count > 0` with no rows — ratings HAVE been published and
+               * are already counted in the average beside this list, but none of them
+               * arrived with a review body to show. Repeating "no reviews yet" there
+               * would contradict the count the user can see immediately above, and
+               * would suggest the average had been computed from nothing. So the copy
+               * says the average covers every rating received and that no written
+               * review is on display.
+               *
+               * It says that WITHOUT naming the mechanism: which records carry a
+               * visible review is a moderation decision, and this page is not the
+               * place to publish moderation state about a third party. Nor is the
+               * copy keyed on the score in any way — the same sentence is shown for a
+               * 1.0 as for a 5.0, and no rating is withheld, reordered or
+               * de-emphasised here on the strength of its value.
                */}
               <RatingList
-                ratings={ratings}
-                emptyMessage="No reviews yet. A rating becomes visible once both parties have submitted theirs, or once the rating window closes."
+                ratings={profileRatings.items}
+                emptyMessage={
+                  profileRatings.aggregate.count > 0
+                    ? 'No written reviews to show. The average above counts every rating this user has received.'
+                    : 'No reviews yet. A rating becomes visible once both parties have submitted theirs, or once the rating window closes.'
+                }
               />
             </div>
           </>

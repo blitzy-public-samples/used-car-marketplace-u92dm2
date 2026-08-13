@@ -8,14 +8,28 @@ import { Rating, RatingAggregate, EligibilityDecision } from '../schema/rating';
  * Implements the client-state half of F010 "Review and Rating System"
  * (`documentation/Software Requirements Specifications (SRS).md` L431). A buyer
  * rates the seller and the seller rates the buyer for a purchase they both took
- * part in. Three surfaces read this branch:
+ * part in.
  *
- *   - the aggregate reputation on a user's profile (F010-3), rendered from
- *     `aggregate` with the ratings that user has received in `items`;
- *   - the seller reputation badge on the vehicle details page, rendered from
- *     `aggregate` alone;
- *   - the submission form on the transaction page, whose enabled state and
- *     displayed explanation both come from `eligibility`.
+ * NOTHING READS THIS BRANCH YET, AND THAT IS WORTH STATING PLAINLY
+ * -----------------------------------------------------------------------------
+ * The branch is registered in `./index` and its three fields model the three
+ * rating surfaces — `aggregate` and `items` for the reputation shown on a user's
+ * profile (F010-3) and beside the seller on a vehicle's detail page, and
+ * `eligibility` for whether the transaction page may offer the submission form
+ * and what to say when it may not. But no screen dispatches into it or selects
+ * out of it today: `UserProfilePage`, `VehicleDetailsPage` and `TransactionPage`
+ * each hold their own rating state with `useState`, because each fetches for
+ * exactly one subject and nothing else on the page needs what it fetched, so
+ * routing that through a shared store would add indirection without adding a
+ * reader. `UserProfilePage` says as much at the declaration site.
+ *
+ * So this module is the registered, tested shape a consumer converts into — not
+ * a description of wiring that exists. Two things follow. A screen that later
+ * needs rating state shared across components should dispatch here rather than
+ * lift another `useState`, and it should convert through `toStoredRating` on the
+ * way in. And if no such screen ever appears, this branch and its registration
+ * are the honest thing to remove; leaving it while claiming consumers it does
+ * not have would be worse than either.
  *
  * F010-5, integrating ratings into search-result ranking, is deliberately out of
  * scope: nothing here is keyed by listing, sorted by score, or shaped for a
@@ -113,8 +127,10 @@ import { Rating, RatingAggregate, EligibilityDecision } from '../schema/rating';
  * is worse than the omission: a typed selector needs `RootState`, `RootState`
  * lives in `./index`, and `./index` imports this module, so importing it back
  * would close a value-level cycle through the file that constructs the store.
- * Consumers read this branch the way the rest of this codebase already does, with
- * an inline callback — `useSelector((state: RootState) => state.rating.aggregate)`.
+ * A future consumer would read this branch the way the rest of this codebase
+ * already does, with an inline callback — `useSelector((state: RootState) =>
+ * state.rating.aggregate)`. None does so yet; see the note at the top of this
+ * file about the branch having no readers today.
  *
  * There is no state interface export. The shape is module-private, matching both
  * siblings; a consumer that needs it derives `RootState['rating']`, which cannot

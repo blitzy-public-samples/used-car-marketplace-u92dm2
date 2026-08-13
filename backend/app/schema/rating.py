@@ -55,7 +55,7 @@ validator on that field, so decomposed Unicode, zero-width characters,
 CRLF line endings and trailing whitespace would each consume a
 reviewer's allowance even though none of them survives normalisation.
 
-Pydantic v1 semantics apply throughout. ``pydantic==1.10.13`` is pinned
+Pydantic v1 semantics apply throughout. ``pydantic==1.10.26`` is pinned
 in ``backend/requirements.txt`` because ``backend/app/core/config.py``
 imports ``BaseSettings`` from ``pydantic``, which v2 removed.
 
@@ -249,28 +249,48 @@ DocumentId = constr(
 )
 
 # A rating's document ID, which is NOT a plain ``DocumentId``: it is the
-# COMPOSITE ``"{transaction_id}_{rater_id}"`` that
-# ``app/services/rating.py:_rating_document_id`` builds, so it can be as
-# long as both components plus the joining underscore.
+# COMPOSITE that ``app/services/rating.py:_rating_document_id`` builds
+# from an escaped transaction ID and an escaped rater ID joined by an
+# underscore, so it can be as long as both encoded components plus that
+# delimiter.
 #
 # It needs a contract of its own because reusing the component bound for
 # the composite is an off-by-a-factor-of-two that only shows up in
 # production. ``DocumentId`` admits a 128-character transaction ID and a
 # 128-character rater ID, both legitimately creatable, whose rating key is
-# 257 characters. ``POST /api/ratings`` would create that document happily
-# and ``PATCH /api/ratings/{rating_id}/moderation`` would then refuse the
-# very key it had just minted with a 422 - a rating that exists, is
-# visible, and cannot be moderated. The service's own
+# far longer than 128 characters. ``POST /api/ratings`` would create that
+# document happily and ``PATCH /api/ratings/{rating_id}/moderation``
+# would then refuse the very key it had just minted with a 422 - a rating
+# that exists, is visible, and cannot be moderated. The service's own
 # ``_is_valid_rating_id`` mirrors this bound for the same reason, so a
 # reachable rating is not reported as "not found" one layer deeper.
 #
+# THE FACTOR OF THREE IS THE ESCAPING, AND IT IS NOT OPTIONAL. The
+# composition percent-escapes ``%`` and ``_`` in each component so that
+# distinct ``(transaction_id, rater_id)`` pairs cannot compose the same
+# key - the delimiter has to be absent from what the components can
+# contribute for the join to be reversible, and therefore for an ID
+# collision to mean "duplicate vote" rather than "two different pairs
+# collided". Each escape turns one character into three, so a component
+# of nothing but underscores triples in length and the composite bound is
+# ``2 * 3 * 128 + 1``. That is a WORST CASE that no Firestore-allocated
+# identifier comes near: those are alphanumeric, so they encode to
+# themselves and a real key stays at 41 characters. Sizing the bound for
+# the worst case is what keeps a legitimately creatable rating
+# addressable by the moderation endpoint.
+#
 # The grammar is otherwise identical. It is the same slash-free,
-# control-character-free rule, and the composite cannot collide with
-# Firestore's reserved ``__.*__`` namespace or with ``.``/``..`` while
-# each half is already refused those forms. 257 bytes is far inside
-# Firestore's own 1500-byte key limit, so nothing here trades one bound
-# for a worse one.
-RATING_ID_MAX_LENGTH = 2 * DOCUMENT_ID_MAX_LENGTH + 1
+# control-character-free rule - percent and underscore are both already
+# admitted by it, and ``%`` is not special to Firestore - and the
+# composite cannot collide with Firestore's reserved ``__.*__`` namespace
+# or with ``.``/``..`` while each half is already refused those forms.
+# 769 bytes is still far inside Firestore's own 1500-byte key limit, so
+# nothing here trades one bound for a worse one.
+RATING_ID_ESCAPE_FACTOR = 3
+
+RATING_ID_MAX_LENGTH = (
+    2 * RATING_ID_ESCAPE_FACTOR * DOCUMENT_ID_MAX_LENGTH + 1
+)
 
 RatingDocumentId = constr(
     strict=True,
@@ -312,10 +332,25 @@ class ModerationStatus(str, Enum):
     suppressing reviews on the basis of rating or negative sentiment.
 
     Review CONTENT is displayed only once it reaches ``APPROVED``,
-    which is what "moderation before display" means; the score is
-    displayed and counted for every published rating, because a number
-    cannot carry a policy violation and suppressing it by sentiment is
-    exactly what the rule forbids.
+    which is what "moderation before display" means. What each state
+    does to a reader other than the rating's author is decided in one
+    place, ``app/services/rating.py:_visible_projection``:
+
+    * ``PENDING`` - the rating is shown with no review text, so
+      unreviewed content is never published by default.
+    * ``APPROVED`` - the rating is shown in full.
+    * ``REJECTED`` - the WHOLE RECORD is withheld from the reader, not
+      merely its text: a moderator has ruled it a policy violation, and
+      a reader cannot tell a stripped review from a rating whose author
+      wrote nothing.
+
+    The score is COUNTED for every published rating whatever its state
+    and whatever its value, because a number cannot carry a policy
+    violation and suppressing it by sentiment is exactly what the rule
+    forbids. Counted is not the same as shown: a withheld record still
+    moves ``rating_average`` and ``rating_count``, so the aggregate can
+    cover more ratings than the list a reader receives. That is the
+    contract, and :class:`RatingAggregate` documents it for clients.
     """
 
     PENDING = 'pending'
@@ -329,11 +364,19 @@ class ModerationStatus(str, Enum):
 # not prose, and the field is written by staff rather than by the public.
 #
 # It needs a bound at all for the same reason the review does. The value
-# is persisted on the rating document and is read back by the author of
-# that rating, so an unbounded moderator note is an unbounded write into
-# a document whose size Firestore caps at 1 MiB, and an unbounded string
-# on a response. 500 characters is ample for a policy reference and
-# leaves the document nowhere near that cap.
+# is persisted on the rating document and is read back by an
+# ADMINISTRATOR - through ``ModeratedRatingView``, the only response
+# shape that carries moderation fields at all - so an unbounded moderator
+# note is an unbounded write into a document whose size Firestore caps at
+# 1 MiB, and an unbounded string on a response. 500 characters is ample
+# for a policy reference and leaves the document nowhere near that cap.
+#
+# It is never logged, and that is deliberate rather than incidental: the
+# text describes a violation in somebody's review, so it can quote the
+# abuse or the personal details that were the violation, and it keeps the
+# newlines ``as_plain_text`` preserves for prose. See the audit line in
+# ``app/services/rating.py:_moderate_rating``, which records the state,
+# the actor and whether a reason exists - never the reason itself.
 MODERATION_REASON_MAX_LENGTH = 500
 
 # The single unrecognised key ``RatingCreate`` tolerates in a request
@@ -351,8 +394,12 @@ def enum_value(value: Any, enumeration: Any, label: str) -> str:
 
     Accepts either an enumeration member or its value string and always
     returns a plain ``str``, so an attribute never holds a member whose
-    ``str()`` on Python 3.9 would render as ``'ClassName.MEMBER'`` and
-    corrupt a write, a log line or a query.
+    ``str()`` renders as ``'ClassName.MEMBER'`` and corrupts a write, a
+    log line or a query. That rendering is not a legacy-interpreter
+    quirk to be waited out: it is still what ``str()``, an f-string and
+    ``'%s'`` all produce for a ``str``-subclassing ``Enum`` member on the
+    delivered runtime (verified on CPython 3.9.25) and on every later
+    interpreter.
 
     Args:
         value: Candidate member or value string.
@@ -501,10 +548,11 @@ class Rating(BaseModel):
     ``direction`` and ``moderation_status`` are typed as plain ``str``
     rather than as their enum classes on purpose. Pydantic v1 does not
     validate field defaults by default, so an enum-typed field would
-    keep the raw member as its default; on Python 3.9 ``str()`` of such
-    a member yields ``'ModerationStatus.PENDING'`` instead of
-    ``'pending'``, which would silently corrupt any write, log or query
-    that stringifies it. Writing the default as ``.value`` keeps a
+    keep the raw member as its default, and ``str()`` of such a member
+    yields ``'ModerationStatus.PENDING'`` instead of ``'pending'`` -
+    on the delivered CPython 3.9 runtime as much as on any later one -
+    which would silently corrupt any write, log or query that
+    stringifies it. Writing the default as ``.value`` keeps a
     genuine ``str`` on the attribute and in ``.dict()``. Both fields
     are nevertheless VALIDATED against their enumerations below,
     including their defaults, so an unrecognised state cannot reach the
@@ -624,14 +672,20 @@ class Rating(BaseModel):
     ) -> Optional[str]:
         """Hold the moderator's reason to a bounded plain-text contract.
 
-        Staff-authored rather than public, but persisted on this document
-        and returned to an administrator and to the rating's own author, so
-        it gets the same normalisation as the review and a bound of its
-        own: an unbounded reason is an unbounded write into a document
-        Firestore caps at 1 MiB, and a newline in it forges a line in any
-        log or export that renders it. Whitespace-only text normalises to
-        ``None``, which keeps "no reason recorded" a single state rather
-        than two.
+        Staff-authored rather than public, and returned to an
+        ADMINISTRATOR alone - :class:`RatingView` declares no moderation
+        fields, so the only response shape carrying this value is
+        :class:`ModeratedRatingView` from the admin-gated moderation
+        endpoint. It is still persisted on this document, so it gets the
+        same normalisation as the review and a bound of its own: an
+        unbounded reason is an unbounded write into a document Firestore
+        caps at 1 MiB, and a newline in it forges a line in any export
+        that renders it. Whitespace-only text normalises to ``None``,
+        which keeps "no reason recorded" a single state rather than two.
+
+        Normalisation preserves newline and tab, because a reason is
+        prose - which is exactly why no log line renders this value; see
+        ``app/services/rating.py:_moderate_rating``.
         """
         return as_plain_text(
             value,
@@ -675,10 +729,14 @@ class RatingView(BaseModel):
     why - and serving them to a participant hands the same information to
     the person most motivated to argue with it. Neither read needs them:
     the visibility decision has ALREADY been applied by
-    ``app/services/rating.py:_visible_projection`` before a view is built,
-    so a withheld review arrives with ``review`` empty, which is the only
-    fact a reader acts on. An author still sees their own words in full
-    through the per-transaction read, so nothing vanishes unexplained.
+    ``app/services/rating.py:_visible_projection`` before a view is
+    built, so a rating awaiting moderation arrives with ``review``
+    empty and one moderation REJECTED is not in the response at all -
+    the whole record is withheld. Either way what reaches a reader is
+    already what they may see. An author still gets their own words
+    through the per-transaction read, so nothing vanishes unexplained on
+    them; the policy note behind a decision reaches nobody but an
+    administrator.
 
     The moderation fields are reachable only through
     :class:`ModeratedRatingView`, which the admin-only moderation endpoint

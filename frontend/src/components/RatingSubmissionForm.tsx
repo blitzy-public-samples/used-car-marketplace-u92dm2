@@ -195,6 +195,93 @@ const SUBMISSION_FAILURE_MESSAGE =
 const UNAVAILABLE_MESSAGE = 'You cannot rate this transaction right now.';
 
 /**
+ * The response statuses that end this caller's ability to rate this transaction.
+ *
+ * WHY A SET OF STATUSES RATHER THAN ONE BRANCH PER MESSAGE. The server's refusals
+ * fall into two kinds, and the interface has to treat them differently:
+ *
+ *   - TERMINAL. `401` not signed in, `403` unverified rater or not a participant,
+ *     `404` no such transaction, `409` already rated or the transaction is not
+ *     completed. Every one of these is a fact about the caller, the transaction or
+ *     the relationship between them, and none of them changes because the user
+ *     edits their review and presses the button again. The server has established
+ *     that this submission cannot succeed.
+ *   - RECOVERABLE. `422` is a fact about the PAYLOAD — a score out of range, a
+ *     review past the bound — so a corrected payload can succeed and the controls
+ *     must stay live. Likewise a transport failure (`status === null`: no
+ *     response, a timeout, a network drop), where nothing has been established at
+ *     all and retrying is the correct remedy.
+ *
+ * Before this distinction existed, a terminal refusal left `eligibility.eligible`
+ * true, so the `finally` re-enabled the controls and the next keystroke cleared
+ * the error — inviting the user to try again, indefinitely, at something the
+ * server had already ruled out. Each retry cost a round trip and each one came
+ * back with the same refusal.
+ *
+ * `409` in particular is worse than merely futile: one rating per rater per
+ * transaction is enforced by a document-id collision in the datastore, so a repeat
+ * attempt after a successful submission cannot ever do anything except fail.
+ */
+const TERMINAL_REFUSAL_STATUSES: readonly number[] = [401, 403, 404, 409];
+
+/**
+ * Whether a rejected submission has settled the question for good.
+ *
+ * Reads the status through the client's own `describeRequestFailure`, which is
+ * safe for ANY thrown value: it wraps a non-object in `{}` and reports
+ * `status: null` when there is no response to read, so a `ZodError` or a network
+ * failure returns `false` here without special-casing. A local `ZodError` never
+ * reached the server and therefore never established anything.
+ *
+ * @param error The rejection value from the submit handler.
+ * @returns `true` when the server has refused in a way a retry cannot change.
+ */
+const isTerminalRefusal = (error: unknown): boolean => {
+  if (error instanceof ZodError) {
+    return false;
+  }
+
+  const { status } = describeRequestFailure(error);
+
+  return status !== null && TERMINAL_REFUSAL_STATUSES.includes(status);
+};
+
+/**
+ * Turn a terminal refusal into the ineligible decision it proves.
+ *
+ * The server's refusal `detail` and its `EligibilityDecision.reason` are the SAME
+ * copy for the same condition — the backend reuses each domain exception's message
+ * in both places — so a terminal refusal is exactly the eligibility answer this
+ * form would have received had it asked a moment later. Recording it as such is
+ * what keeps the controls disabled with an explanation instead of re-enabling them
+ * for an attempt that cannot succeed.
+ *
+ * `rateeId` and `direction` are carried over from the decision already in hand
+ * rather than invented, so the counterparty line does not change under the user as
+ * a side effect of the refusal. They are display context only and are never sent.
+ *
+ * `alreadyRated` becomes true for `409` and only for `409`: that status is the
+ * datastore reporting a document-id collision, which is precisely the statement
+ * that a rating from this rater for this transaction already exists.
+ *
+ * @param current The decision in hand, or `null` if none arrived.
+ * @param reason The server's own explanation, rendered verbatim.
+ * @param status The refusal status, used only to decide `alreadyRated`.
+ * @returns An ineligible decision carrying that reason.
+ */
+const refusalAsDecision = (
+  current: EligibilityDecision | null,
+  reason: string,
+  status: number | null,
+): EligibilityDecision => ({
+  eligible: false,
+  reason,
+  rateeId: current === null ? null : current.rateeId,
+  direction: current === null ? null : current.direction,
+  alreadyRated: status === 409 ? true : current !== null && current.alreadyRated,
+});
+
+/**
  * Read a server-authored explanation out of a rejected request.
  *
  * `../services/rating` rejects with the ORIGINAL axios error, so a refusal
@@ -204,16 +291,18 @@ const UNAVAILABLE_MESSAGE = 'You cannot rate this transaction right now.';
  * locally invented copy keyed by status code.
  *
  * THE READING ITSELF BELONGS TO `../services/rating`, VIA `readServerDetail`.
- * Two reasons, and the second is the one that bit. First, one owner: the service
- * already needs the same extraction to build its sanitised log line, and two
- * hand-rolled readers of one wire shape drift apart. Second, FastAPI emits `detail`
- * in TWO shapes and a local reader only ever handled one. A refusal raised by the
- * router is a string; a request Pydantic rejected before any handler ran is an
- * ARRAY of issue objects — `[{loc, msg, type}]` — because the backend registers no
- * custom `RequestValidationError` handler. Reading only the string case meant every
- * 422 degraded to axios's own "Request failed with status code 422", so a score
- * outside the scale or an over-long review told the user nothing about what to
- * change. `readServerDetail` handles both and reports the issue messages.
+ * One owner: the service already needs the same extraction to build its sanitised
+ * log line, and two hand-rolled readers of one wire shape drift apart.
+ *
+ * That reader is now trivial, because the server answers every failure in one
+ * envelope — `{ detail: "<sentence>", errors?: [...] }` — and `detail` is always
+ * the sentence to render. It was not always so: 422 used to arrive with `detail`
+ * as an ARRAY of issue objects when Pydantic rejected a field, and as a string
+ * when the router refused a rating, so a reader that handled only the string case
+ * degraded every field error to axios's own "Request failed with status code 422"
+ * and told the user nothing about what to change. The backend now renders
+ * validation failures into the same envelope, naming the offending fields in the
+ * sentence, so there is one shape to read and one message to show.
  *
  * What remains here is the FALLBACK ORDER, which is a presentation decision and so
  * belongs to the component: the server's words first, then the error's own message
@@ -626,6 +715,46 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
   const eligibilityRequestRef = useRef(0);
 
   /**
+   * Sequence number of the most recently STARTED submission, on the same principle
+   * as the eligibility counter above and for a sharper reason.
+   *
+   * A submission is a POST that can take as long as any other request, and while it
+   * is in flight the surrounding screen can move on: a parent that renders one of
+   * these per completed transaction can hand this component a different
+   * `transactionId`, or unmount it altogether. Without an identity per submission,
+   * the response for the abandoned transaction still ran to completion and wrote
+   * `submittedRating`, queued a focus move, and — worst of all — invoked
+   * `onSubmitted` with a rating that belongs to a transaction the screen is no
+   * longer showing. The parent's refresh then re-read eligibility or reputation for
+   * the WRONG transaction, and the confirmation on screen claimed a rating had been
+   * recorded for the one the user was now looking at.
+   *
+   * Every write in the submit handler is gated on its own number still being the
+   * latest, and the transaction-change effect bumps the counter both on entry and in
+   * its cleanup, so a change of transaction and an unmount each invalidate whatever
+   * is outstanding.
+   */
+  const submissionRequestRef = useRef(0);
+
+  /**
+   * Where focus was when the user started the request that is now in flight.
+   *
+   * This is the difference between RESTORING a position and STEALING one. A request
+   * begins from a control the user has just operated — the submit button, the retry
+   * button — and by the time it settles focus may be somewhere else entirely,
+   * because the user read the page, tabbed into the review field, or moved to
+   * another region while waiting. Moving focus then is an interruption, and one that
+   * WCAG 2.1's focus-order expectations exist to prevent: the user did not ask for
+   * it and nothing they can see explains it.
+   *
+   * Recording the origin lets the focus effect distinguish the two cases without
+   * guessing. `Element | null` because `document.activeElement` is nullable, and a
+   * ref rather than state because reading it must not cause a render and its value
+   * is never displayed.
+   */
+  const focusOriginRef = useRef<Element | null>(null);
+
+  /**
    * The confirmation region, so focus can be MOVED to it once a rating exists.
    *
    * The polite `role="status"` paragraph carries the confirmation and is the only
@@ -847,13 +976,30 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
     // no longer on screen.
     setPendingFocus(null);
 
+    /*
+     * A submission for the PREVIOUS transaction is abandoned here, in two steps that
+     * do different jobs.
+     *
+     * Bumping the counter invalidates the request itself, so when it settles it
+     * writes nothing and does not call `onSubmitted` — see the ref's own note for
+     * what that prevented. Clearing the flag is what the user sees: `isSubmitting`
+     * feeds `controlsDisabled` and the button's label, so a submission left in
+     * flight by a transaction change would otherwise render THIS transaction's form
+     * as "Submitting…" and inert, waiting on a request that can no longer affect it.
+     * Nothing is cancelled at the network level — the previous rating was legitimate
+     * and the server should still record it — only its effect on this component.
+     */
+    submissionRequestRef.current += 1;
+    setIsSubmitting(false);
 
     loadEligibility();
 
     return () => {
       // Invalidates whatever is in flight, so a late response cannot set state
-      // after unmount or against a newer transaction.
+      // after unmount or against a newer transaction. Both counters, because both
+      // an eligibility check and a submission can be outstanding at once.
       eligibilityRequestRef.current += 1;
+      submissionRequestRef.current += 1;
     };
   }, [transactionId, loadEligibility]);
 
@@ -867,12 +1013,21 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * in-flight flag has cleared. Doing it in the handler would focus an element that
    * was still disabled, or one React was about to replace.
    *
-   * TWO KINDS OF DESTINATION, AND THEY ARE NOT SYMMETRICAL. `'confirmation'` and
-   * `'controls'` follow a SUCCESS that removed the element the user was on, so they
-   * move focus somewhere new and do so unconditionally — there is nothing left to
-   * preserve. `'retry'` and `'submit'` follow a FAILURE that merely disabled that
-   * element and then put it back, so they RESTORE rather than move, and only when
-   * `focusWasDropped()` confirms the browser is pointing at nothing.
+   * TWO KINDS OF DESTINATION, AND THEY ARE NOT SYMMETRICAL IN WHERE THEY SEND
+   * FOCUS. `'confirmation'` and `'controls'` follow a SUCCESS that removed the
+   * element the user was on, so they move focus somewhere NEW; `'retry'` and
+   * `'submit'` follow a FAILURE that merely disabled that element and then put it
+   * back, so they RESTORE it to where it already was.
+   *
+   * THEY ARE SYMMETRICAL, HOWEVER, IN WHETHER THEY MAY ACT AT ALL — and that is a
+   * correction. The two success intents used to move focus unconditionally, on the
+   * reasoning that a success removes the old home so there is nothing left to
+   * preserve. That reasoning holds for the ELEMENT and not for the USER: a request
+   * takes as long as it takes, and a user who spent it reading further down the page
+   * or tabbing into another region is somewhere they chose to be. Yanking them back
+   * to a confirmation is an unrequested focus change with nothing on screen to
+   * explain it, which is the very interruption the failure intents were already
+   * careful to avoid. So all four now consult one predicate, `mayMoveFocus`.
    *
    * `tabIndex={-1}` on the status and alert paragraphs is what makes them focusable
    * at all without adding them to the tab sequence — neither is a control, so Tab
@@ -893,22 +1048,44 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       return;
     }
 
+    /*
+     * THE ONE QUESTION EVERY DESTINATION HAS TO ANSWER: has the user moved focus
+     * themselves since this request began?
+     *
+     * Two conditions mean they have not, and either one licenses a move:
+     *
+     *   - `focusWasDropped()` — the browser is pointing at nothing, which is what
+     *     disabling or unmounting the focused control produces. There is no
+     *     position to preserve, so placing focus deliberately is strictly better
+     *     than leaving the keyboard on `document.body` with no visible indicator.
+     *   - Focus is STILL on the element the request was started from. The user has
+     *     not moved, so moving them is continuing the interaction they began rather
+     *     than interrupting one they chose. This covers the case where the control
+     *     was never disabled and is about to be replaced anyway.
+     *
+     * Anything else means a real, attached element that is NOT the origin holds
+     * focus: the user went somewhere on purpose, and they stay there. The intent is
+     * still cleared below, so an abandoned move is dropped rather than retried on a
+     * later render.
+     */
+    const mayMoveFocus =
+      focusWasDropped() || document.activeElement === focusOriginRef.current;
+
+    if (!mayMoveFocus) {
+      setPendingFocus(null);
+
+      return;
+    }
+
     if (pendingFocus === 'controls') {
       scoreGroupRef.current?.focus();
     } else if (pendingFocus === 'confirmation') {
       statusRef.current?.focus();
-    } else if (focusWasDropped()) {
+    } else {
       /*
-       * A FAILURE destination, and the guard above is the whole difference
-       * between restoring a place and stealing one. The two success intents move
-       * focus to somewhere new because the old home no longer exists. These two
-       * put it back where it already was, so they must only act when it was in
-       * fact taken away: `focusWasDropped()` is true exactly when the browser
-       * has nowhere to point, which is what disabling the focused control
-       * produces. If the user spent the request Tabbing into the review field —
-       * or anywhere else on the page — focus stays with them, because being
-       * yanked back to a button you deliberately left is worse than the loss
-       * this is fixing.
+       * A FAILURE destination: the control is put BACK rather than moved on from,
+       * so it has to still be able to take focus. `mayMoveFocus` above has already
+       * established that the position is the component's to give.
        */
       const control =
         pendingFocus === 'retry'
@@ -1030,6 +1207,13 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
    * never rejects.
    */
   const handleRetry = (): void => {
+    /*
+     * Recorded BEFORE the request starts, because that is the only moment at which
+     * "where the user was when they asked for this" is knowable. By the time the
+     * response arrives the button may have been disabled, replaced, or left behind.
+     */
+    focusOriginRef.current = document.activeElement;
+
     void loadEligibility(true);
   };
 
@@ -1087,6 +1271,20 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       return;
     }
 
+    /*
+     * The identity of THIS submission, and the origin of the focus that started it.
+     *
+     * Both are captured before anything is awaited. `isCurrent` closes over the
+     * number, so every write below asks whether it is still the latest submission
+     * rather than whether the component happens to be mounted — a change of
+     * `transactionId` is just as disqualifying as an unmount, and neither is
+     * observable from inside an `async` function without this.
+     */
+    const generation = (submissionRequestRef.current += 1);
+    const isCurrent = (): boolean => submissionRequestRef.current === generation;
+
+    focusOriginRef.current = document.activeElement;
+
     setIsSubmitting(true);
 
     try {
@@ -1116,6 +1314,29 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       });
 
       const created = await submitRating(payload);
+
+      /*
+       * SUPERSEDED WHILE IN FLIGHT: the rating was created and the server has it,
+       * but this component has moved on to a different transaction or has been
+       * unmounted. Nothing is written and `onSubmitted` is NOT called.
+       *
+       * Silence is the correct outcome rather than a lost update. `onSubmitted` is
+       * the parent's cue to re-read eligibility or reputation, and it carries no
+       * transaction of its own, so calling it now would make the parent refresh the
+       * transaction currently on screen on the strength of a rating for a different
+       * one — and this form would render a confirmation for a rating the user cannot
+       * see the subject of. The rating itself is safe: it is persisted, and it will
+       * be reported by the eligibility check the next time this transaction is
+       * opened. Logged so the drop is visible in diagnosis rather than silent.
+       */
+      if (!isCurrent()) {
+        console.info(
+          'A rating was submitted for a transaction this form has moved on from; ' +
+            'the response was discarded',
+        );
+
+        return;
+      }
 
       /**
        * The rating is persisted. Commit the success state BEFORE telling anyone
@@ -1182,6 +1403,58 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
       // see `describeSubmissionForLog`.
       console.error('Failed to submit rating', describeSubmissionForLog(error));
 
+      /*
+       * A superseded submission reports nothing. The failure belongs to a
+       * transaction this form is no longer showing, so surfacing it here would put
+       * a refusal about one rating above the controls for another — and, in the
+       * terminal case below, would disable those controls on the strength of it.
+       * It is already in the log above.
+       */
+      if (!isCurrent()) {
+        return;
+      }
+
+      /*
+       * A TERMINAL REFUSAL BECOMES AN INELIGIBLE DECISION, NOT A RETRYABLE ERROR.
+       *
+       * The server has established that this caller cannot rate this transaction —
+       * see `TERMINAL_REFUSAL_STATUSES` for which statuses mean that and why. So the
+       * form enters exactly the state it would have been in had the eligibility
+       * check returned that answer up front: controls present but disabled, with the
+       * server's own sentence beside them. Leaving `eligibility.eligible` true
+       * instead is what allowed the `finally` to re-enable the button and the next
+       * keystroke to clear the message, inviting attempt after attempt at something
+       * already ruled out.
+       *
+       * `errorMessage` is deliberately left CLEAR on this path. The reason is about
+       * to be rendered by the polite status region, and writing the identical
+       * sentence into the assertive region as well would announce it twice — once
+       * interrupting, once not — for one event. The status region is the right
+       * carrier because this is now a STATE of the form ("you cannot rate this")
+       * rather than the outcome of an attempt, and a change to a polite live region
+       * is still announced. One event, one announcement.
+       *
+       * FOCUS GOES TO THE STATUS REGION, not back to the button. The button the user
+       * pressed was disabled while the request was in flight, which dropped focus to
+       * `document.body`, and on this path it is never re-enabled — so restoring it
+       * there is impossible and leaving the keyboard on the body would strand the
+       * user with no position and no indicator. The status paragraph is the element
+       * that now carries the explanation, exactly as it is when a retried
+       * eligibility check comes back ineligible, and that path queues the same
+       * intent. `tabIndex={-1}` makes it a legitimate programmatic destination
+       * without putting a paragraph in the tab sequence.
+       */
+      if (isTerminalRefusal(error)) {
+        const { status } = describeRequestFailure(error);
+
+        setEligibility((current) =>
+          refusalAsDecision(current, describeSubmissionFailure(error), status),
+        );
+        setIsSubmitting(false);
+        setPendingFocus('confirmation');
+
+        return;
+      }
 
       setErrorMessage(describeSubmissionFailure(error));
 
@@ -1211,8 +1484,18 @@ const RatingSubmissionForm: React.FC<RatingSubmissionFormProps> = ({
 
       return;
     } finally {
-      // In `finally` so a failure re-enables the button for another attempt.
-      setIsSubmitting(false);
+      /*
+       * In `finally` so a failure re-enables the button for another attempt — but
+       * gated, because a superseded submission must not touch the flag either. The
+       * transaction-change effect has already cleared it for the form now on screen,
+       * and writing `false` here would be this submission reporting on a state it no
+       * longer owns: if the user has since started a submission for the NEW
+       * transaction, that one is legitimately in flight and its button must stay
+       * disabled.
+       */
+      if (isCurrent()) {
+        setIsSubmitting(false);
+      }
     }
   };
 

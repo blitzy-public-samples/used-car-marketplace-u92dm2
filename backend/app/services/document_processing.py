@@ -1,4 +1,13 @@
-from PyPDF2 import PdfReader
+# ``pypdf`` rather than ``PyPDF2``: PyPDF2 is retired - its own import
+# warns "PyPDF2 is deprecated. Please move to the pypdf library instead"
+# - and it is the LAST release of a project whose maintenance moved
+# wholesale to pypdf, so the infinite-loop advisory against 3.0.1
+# (PYSEC-2026-1835) is fixed only in the successor package. The reader
+# API used below is unchanged across the rename: ``PdfReader``, its
+# ``pages`` sequence and ``extract_text`` are the same names with the
+# same semantics, which is why this is an import change and not a
+# rewrite.
+from pypdf import PdfReader
 from google.cloud.documentai import DocumentProcessorServiceClient
 from typing import List, Dict, Any
 from app.core.config import settings

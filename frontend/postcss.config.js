@@ -11,14 +11,12 @@
  * point. Any one of the four missing fails silently: the markup still carries the
  * class names, and nothing is styled.
  *
- * STATUS: three of the four are in place; the fourth is NOT YET DONE. `src/index.tsx`
- * carries no CSS import today, so nothing pulls src/styles/index.css into the
- * bundle and no rule is emitted for any class name in the application. That
- * import is the remaining step, and it belongs to the entry-point change that
- * has not been made yet. Until it lands, the pipeline configured here is correct
- * and idle — this file is what makes the final import work, not evidence that it
- * has happened.
-
+ * STATUS: all four are in place. `src/index.tsx` imports './styles/index.css',
+ * which is the link that was previously missing, so the pipeline configured here
+ * is live rather than idle. Verified by compiling src/styles/index.css through
+ * postcss with this configuration and confirming real rules are emitted -
+ * utilities, Tailwind's preflight base layer, and vendor prefixes from
+ * autoprefixer - including the focus-ring utilities discussed below.
  *
  * That silence is why this file is load-bearing rather than boilerplate. No
  * component library is installed, so Tailwind's utilities ARE the design system,
@@ -26,9 +24,8 @@
  * interactive control (`focus:outline-none focus:ring-2 focus:ring-offset-2`).
  * Without the `tailwindcss` plugin registered below, no rule backs those class
  * names and the focus ring never appears, while the component's markup and tests
- * continue to look correct. The same is true, today, of the missing entry-point
- * import described above: the focus ring will not render until it lands.
- *
+ * continue to look correct. The same is true of the entry-point import: remove
+ * it and the focus ring stops rendering, with nothing else changing. *
  * Discovery is by convention, not by reference: vite.config.ts deliberately sets
  * no `css.postcss` option, so Vite, Vitest and any direct PostCSS run locate this
  * file from the package root. Renaming or relocating it disables the pipeline.

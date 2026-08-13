@@ -163,11 +163,13 @@ Three rules decide what a reader gets, and they are applied by
    keep appearing. A number cannot carry abuse or personal data, and
    withholding one for being LOW is the suppression the FTC rule
    forbids, so there is no score threshold anywhere in this module.
-3. Authorship overrides both, for the author only. A rater always sees
-   their own rating in full, including while it is unrevealed and
-   including when its review was rejected, together with the reason -
-   otherwise a withheld review would vanish with no explanation to the
-   person who wrote it.
+3. Authorship overrides both, for the author only. A rater always gets
+   their own rating back, including while it is unrevealed and including
+   when its review was rejected - otherwise a withheld review would
+   vanish on the person who wrote it. What they get is their own WORDS;
+   the moderator's policy note is not part of it, because every response
+   outside the admin-gated moderation endpoint is projected through
+   ``RatingView``, which declares no moderation fields at all.
 
 The AGGREGATE is deliberately not governed by rule 2. It counts every
 published rating whatever its score and whatever its moderation state,
@@ -196,6 +198,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -215,9 +218,9 @@ from pydantic import ValidationError
 
 from app.core.config import settings
 from app.db.firestore import (
-    DATASTORE_CALL,
     DATASTORE_UNAVAILABLE_ERRORS,
     create_document_with_id,
+    datastore_call,
     db,
     run_in_read_only_transaction,
     run_in_transaction,
@@ -245,12 +248,6 @@ RATINGS_COLLECTION = 'ratings'
 USERS_COLLECTION = 'users'
 TRANSACTIONS_COLLECTION = 'transactions'
 
-# Firestore's name for a document's own ID, usable as an ordering field.
-# Ordering by it is how a query that needs no data ordering still gets a
-# TOTAL order - which a cursor requires - without a composite index and
-# without excluding documents that lack some data field.
-DOCUMENT_ID_FIELD = '__name__'
-
 # The only transaction state that authorizes a rating. This is the
 # literal value app/api/transactions.py writes, compared
 # case-insensitively so a differently-cased document still matches.
@@ -259,30 +256,39 @@ COMPLETED_STATUS = 'completed'
 # Page sizes for the collection reads. Both are bounded so no read path
 # can degrade into an unbounded scan as the collection grows.
 #
-# This module issues exactly TWO shapes that need a composite index, and
-# each is served by one of the TWO indexes declared in
+# This module issues exactly FOUR shapes that need a composite index, and
+# each is served by one of the four declared in
 # infrastructure/firestore.indexes.json. Nothing here may introduce a
-# third without declaring the index for it, because a query needing an
+# fifth without declaring the index for it, because a query needing an
 # undeclared composite index fails outright at runtime rather than
 # degrading:
 #
-#   ratings received by one user, and the due subset of them
+#   published ratings received by one user, newest first
 #     -> (ratee_id ASC, is_published ASC, created_at DESC)
+#   the DUE unpublished ratings of one user, oldest first
+#     -> (ratee_id ASC, is_published ASC, created_at ASC)
+#   every DUE unpublished rating, oldest first (the scheduled sweep)
+#     -> (is_published ASC, created_at ASC)
 #   ratings belonging to one transaction, ordered by rater
 #     -> (transaction_id ASC, rater_id ASC)
 #
 # A query using a prefix of an index's fields for equality is served by
-# that same index, which is why the first index serves both the
-# published listing and the due-settlement read.
+# that same index.
 #
-# The third shape this module reads - the global sweep for ratings whose
-# window has closed - needs NO composite index, and that is a deliberate
-# design constraint rather than an accident. It filters on
-# ``is_published`` alone and walks the automatic single-field index by
-# document name, deciding due-ness in Python. Adding the deadline to the
-# query would read better and cost an index: an equality filter combined
-# with a range on a different field requires a composite index, and this
-# project declares two. See :func:`_publish_expired_ratings`.
+# The two ASCENDING declarations are what make publication starvation-free
+# rather than merely bounded: both settlement walks are capped, so they
+# must spend that cap on the records that have waited LONGEST, and
+# ordering by age is the only way to guarantee it. Firestore can walk an
+# index backwards, so a descending index would in all likelihood serve an
+# ascending order too - but "in all likelihood" is decided in a
+# deployment where indexes are enforced, and the local emulator cannot
+# falsify it because it serves any query at all. Declaring the direction
+# each query asks for costs one index and removes the question.
+#
+# The write cost of four composite indexes is offset in the same
+# declaration file: ``fieldOverrides`` exempts ``review`` and
+# ``moderation_reason`` - the two large fields no query touches - from
+# Firestore's automatic single-field indexing.
 DEFAULT_RATINGS_PAGE_SIZE = 50
 DEFAULT_SWEEP_PAGE_SIZE = 200
 
@@ -382,14 +388,44 @@ _DEFERRED = object()
 # that into this sentinel.
 _NO_CLAIM = object()
 
-# The stored average is rounded to two decimals, matching how a
-# reputation figure is presented ("4.5/5"). Rounding the stored value
-# rather than only the displayed one is a deliberate consequence of the
-# incremental mean: the running total is reconstructed from the stored
-# average, so successive folds inherit at most a two-decimal rounding
-# error. Recomputing exactly would require querying every rating, which
-# a Firestore transaction cannot do.
+# How many decimals a reputation is PRESENTED to, matching how the
+# figure is written in this project's own success criteria ("4.5/5").
+#
+# THIS IS A PRESENTATION PRECISION AND NOTHING ELSE. It is applied where
+# an aggregate is projected into a response - see
+# :func:`_aggregate_from_snapshot` - and deliberately NOT to the value
+# that is stored.
+#
+# It used to be applied to the stored value too, and that was a
+# correctness defect rather than a rounding preference. The incremental
+# mean reconstructs a running total from the stored pair, so rounding the
+# stored average made every fold inherit the previous fold's rounding
+# error: the scores (1, 1, 1, 1, 1, 2, 1) published one at a time stored
+# 1.15, while the true mean is 8/7 = 1.142857..., which presents as 1.14.
+# Worse, the SAME seven scores published in one batch stored 1.14, so a
+# reputation depended on the order and grouping in which ratings happened
+# to be revealed - two users with identical ratings could hold different
+# averages, and neither could be reproduced from the ratings themselves.
+#
+# Storing the unrounded mean removes that: the pair (average, count) then
+# determines the exact integer score total, so a fold is arithmetic on
+# the totals rather than on a lossy summary of them. See
+# :func:`_exact_score_total` for why that reconstruction is exact, and
+# :func:`_fold_scores` for the fold itself.
 AGGREGATE_PRECISION = 2
+
+# When a stored average is close enough to an integer total to BE one.
+#
+# The companion of the decision above. :func:`_exact_score_total`
+# multiplies a stored average back by its count to recover the total the
+# scores actually summed to, and this decides whether the result is that
+# total or evidence that something else wrote the field. The threshold is
+# far above the floating-point error of an exact reconstruction (about
+# 1e-6 even at a billion ratings, and nearer 1e-15 at realistic ones) and
+# far below the smallest discrepancy a rounded average produces (a
+# fiftieth of a rating at the very least), so the two cases cannot be
+# mistaken for one another in either direction.
+AGGREGATE_RECONSTRUCTION_TOLERANCE = 1e-4
 
 # The one moderation state on which a reason may be recorded, and the one
 # on which a reason is REQUIRED. Both halves of that sentence are enforced
@@ -599,17 +635,31 @@ class TransactionInvariantError(Exception):
     """A transaction document does not satisfy its own contract.
 
     Raised when a transaction that is otherwise eligible - it exists,
-    names the caller as a participant and is completed - is missing data
-    the rating record requires, specifically the ``vehicle_listing_id``
-    that every ``Transaction`` declares and that a rating denormalises so
-    it can be displayed with context.
+    names the caller as a participant and is completed - cannot support
+    the rating record it is being asked to authorize. Three stored-data
+    defects reach this class, and they are listed rather than
+    generalised because each was a distinct way for a bad document to
+    produce a bad rating:
 
-    The alternative would be to invent a value, and a rating carrying an
-    empty listing reference is worse than no rating at all: it satisfies
-    the model, persists silently, and can never be traced back to what
-    was actually bought. So nothing is written - the guard sequence
-    refuses, and when this is raised from inside the submission
-    transaction Firestore rolls that transaction back.
+    * The ``vehicle_listing_id`` every ``Transaction`` declares is
+      missing, and a rating denormalises it so it can be displayed with
+      context. The alternative would be to invent a value, and a rating
+      carrying an empty listing reference is worse than no rating at
+      all: it satisfies the model, persists silently, and can never be
+      traced back to what was actually bought.
+    * The counterparty field cannot BE a document ID - a non-string, a
+      slash-bearing value that ``document()`` would read as a nested
+      path, or one past the length a key may have. Persisting it wrote a
+      rating whose own response model then rejected it, after the
+      commit.
+    * The counterparty names no user document. A rating about a
+      participant the datastore does not have can never publish, because
+      publication requires that document to credit the score to, so the
+      record would stay invisible and uncounted with no way back.
+
+    In every case nothing is written - the guard sequence refuses, and
+    when this is raised from inside the submission transaction Firestore
+    rolls that transaction back.
 
     Deliberately NOT a :class:`RatingError`, exactly like
     :class:`PublicationInvariantError` above, because it does not belong
@@ -670,6 +720,51 @@ class TransactionInvariantError(Exception):
         super().__init__(self.detail)
 
 
+def _encode_key_component(component: str) -> str:
+    """Escape one natural-key component so the join stays reversible.
+
+    The delimiter problem this solves is not theoretical. A rating's
+    document ID joins two identifiers with an underscore, and an
+    underscore is a LEGAL character in a Firestore document ID - so a
+    plain join is not injective: ``('a_b', 'c')`` and ``('a', 'b_c')``
+    both compose ``'a_b_c'``. Two different, legitimate pairs would
+    address the SAME document, which turns the uniqueness constraint
+    into a false positive: the second rater to submit is told they have
+    already rated this transaction, and the datastore agrees.
+
+    Percent-escaping fixes it by removing the delimiter from the
+    alphabet each component can contribute. ``%`` is escaped first so
+    the escape character itself cannot be forged, then ``_``:
+
+        %  ->  %25
+        _  ->  %5F
+
+    An encoded component therefore contains no bare underscore, so the
+    single bare underscore in the composed key is unambiguously the
+    delimiter and the original pair is recoverable from the key. That is
+    exactly the definition of injectivity, and it is what makes an ID
+    collision mean "the same rater rating the same transaction" and
+    nothing else.
+
+    Escaping rather than length-prefixing is a deliberate compatibility
+    choice. Firestore's own allocated IDs are alphanumeric, so for every
+    identifier this system actually mints the encoding is the IDENTITY
+    and the composed key is byte-for-byte what the previous ambiguous
+    join produced. A length prefix would have changed every key,
+    stranding any rating already written under the old scheme.
+
+    Args:
+        component: One natural-key component - a transaction ID or a
+            rater ID. Already validated as a usable document ID by the
+            caller.
+
+    Returns:
+        The component with ``%`` and ``_`` percent-escaped, which for an
+        ordinary Firestore identifier is the component unchanged.
+    """
+    return component.replace('%', '%25').replace('_', '%5F')
+
+
 def _rating_document_id(transaction_id: str, rater_id: str) -> str:
     """Compose the deterministic document ID for one rating.
 
@@ -678,6 +773,17 @@ def _rating_document_id(transaction_id: str, rater_id: str) -> str:
     module's uniqueness mechanism, and it is exposed rather than inlined
     so the router, the publication paths and the tests all derive the
     same key from the same code.
+
+    THE COMPOSITION IS INJECTIVE, WHICH IS WHAT MAKES A COLLISION MEAN
+    SOMETHING
+    ---------------------------------------------------------------
+    Each component is escaped by :func:`_encode_key_component` before
+    the two are joined, so distinct pairs cannot produce the same key -
+    see that function for why a plain underscore join could, and for the
+    two legitimate pairs that proved it. Without injectivity this
+    module's uniqueness rule refuses ratings it should accept, and
+    "you have already rated this transaction" becomes a lie the
+    datastore backs up.
 
     Both components are Firestore scatter-allocated identifiers, so the
     resulting key space is well distributed. That matters: Google's
@@ -705,6 +811,9 @@ def _rating_document_id(transaction_id: str, rater_id: str) -> str:
         rater_id: ID of the authenticated user submitting it.
 
     Returns:
+        The escaped transaction ID and the escaped rater ID joined by a
+        single underscore. For ordinary Firestore identifiers, which
+        carry neither ``%`` nor ``_``, that is literally
         ``"{transaction_id}_{rater_id}"``.
 
     Raises:
@@ -722,7 +831,10 @@ def _rating_document_id(transaction_id: str, rater_id: str) -> str:
                 'Cannot compose a rating key from {0}={1!r}: it is not a '
                 'usable Firestore document ID.'.format(label, component)
             )
-    return '{0}_{1}'.format(transaction_id, rater_id)
+    return '{0}_{1}'.format(
+        _encode_key_component(transaction_id),
+        _encode_key_component(rater_id),
+    )
 
 
 def _load_transaction(transaction_id: str) -> Optional[Dict[str, Any]]:
@@ -760,11 +872,70 @@ def _load_transaction(transaction_id: str) -> Optional[Dict[str, Any]]:
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
         .document(transaction_id)
-        .get(**DATASTORE_CALL)
+        .get(**datastore_call())
     )
     if not snapshot.exists:
         return None
     return snapshot.to_dict() or {}
+
+
+def _user_exists(user_id: str) -> bool:
+    """Report whether a user document exists. One get-by-ID, no lock.
+
+    The default counterparty reader for :func:`_assess`, used by the
+    read-only eligibility path where there is no transaction to read
+    through. The write path supplies :func:`_locked_user_exists`
+    instead, so the same guard is decided against a LOCKED snapshot
+    there - see that function for why the distinction matters.
+
+    Args:
+        user_id: The user to look for. Must already have passed
+            :func:`_is_valid_document_id`; the caller's guard sequence
+            applies that first, because an unusable value must never
+            reach ``document()`` where a forward slash would resolve a
+            nested path.
+
+    Returns:
+        ``True`` when a document exists at ``users/{user_id}``.
+    """
+    snapshot = (
+        db.collection(USERS_COLLECTION)
+        .document(user_id)
+        .get(**datastore_call())
+    )
+    return bool(snapshot.exists)
+
+
+def _locked_user_exists(
+    transaction: firestore.Transaction,
+    user_id: str,
+) -> bool:
+    """Report whether a user document exists, read THROUGH the lock.
+
+    The counterparty reader the submission path supplies to
+    :func:`_assess`. Reading through ``transaction`` is what makes the
+    proof binding rather than advisory: the document is enrolled in the
+    transaction, so a counterparty deleted between the check and the
+    commit aborts the commit and the rating is never written. An
+    unlocked read would leave exactly the window this guard exists to
+    close.
+
+    Args:
+        transaction: Active Firestore transaction. Every read must
+            precede every write in it, which is why this is issued
+            while the guard sequence runs and before the create.
+        user_id: The user to look for, already grammar-checked by the
+            guard that derives it.
+
+    Returns:
+        ``True`` when a document exists at ``users/{user_id}``.
+    """
+    snapshot = (
+        db.collection(USERS_COLLECTION)
+        .document(user_id)
+        .get(transaction=transaction, **datastore_call())
+    )
+    return bool(snapshot.exists)
 
 
 def _derive_counterparty(
@@ -786,6 +957,16 @@ def _derive_counterparty(
         ``(ratee_id, direction)`` where ``direction`` is a
         :class:`RatingDirection` value string, or ``(None, None)`` when
         the caller is not one of the two participants.
+
+        ``ratee_id`` is returned EXACTLY as the transaction document
+        stores it, of whatever type that turns out to be, and is
+        therefore evidence rather than a usable identifier: a stored
+        participant field is data, and data can be absent, of the wrong
+        type, slash-bearing or over-long. Every caller must hold it to
+        :func:`_is_valid_document_id` before composing it into a path or
+        persisting it - :func:`_assess` does so in the guard that calls
+        this function, which is why nothing downstream repeats the
+        check.
     """
     buyer_id = transaction.get('buyer_id')
     seller_id = transaction.get('seller_id')
@@ -802,6 +983,7 @@ def _assess(
     supplied_ratee_id: Any = _NO_CLAIM,
     transaction: Any = _UNREAD,
     is_verified: Any = _UNREAD,
+    read_ratee: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
     """Run the ordered eligibility guard sequence exactly once.
 
@@ -823,17 +1005,63 @@ def _assess(
     3. The caller is the buyer or the seller - else
        :class:`NotATransactionParticipant`.
     4. The derived counterparty agrees with any supplied claim - else
-       :class:`NotATransactionParticipant`; and differs from the caller
-       - else :class:`SelfRatingNotAllowed`.
+       :class:`NotATransactionParticipant`; differs from the caller -
+       else :class:`SelfRatingNotAllowed`; and is a usable document ID -
+       else :class:`TransactionInvariantError`, RAISED, before the
+       counterparty is recorded on the outcome or staged for a write.
     5. The transaction is ``completed`` - else
        :class:`TransactionNotCompleted`.
     6. The transaction carries the data a rating record requires - else
        :class:`TransactionInvariantError`, which is RAISED rather than
        returned, because it reports a defect in stored data rather than
-       a refusal the caller caused. LAST, because "wait until the
-       transaction completes" is something the caller can act on
+       a refusal the caller caused. AFTER guard 5, because "wait until
+       the transaction completes" is something the caller can act on
        whereas a malformed document is not, so the actionable failure
-       is reported first when both apply.
+       is reported first when both apply. The counterparty check in
+       guard 4 is the one invariant that CANNOT be deferred this way:
+       its value is used, not merely required, so proving it after the
+       state guards would mean proving it after it had already been
+       written.
+    7. The derived counterparty HAS a user document - else
+       :class:`TransactionInvariantError`. Last, because it is the only
+       guard that costs a read of its own, and there is nothing to ask
+       until the record is otherwise ratable.
+
+    GUARDS 4 AND 7 ARE THE COUNTERPARTY-INTEGRITY PAIR
+    -------------------------------------------------------------------
+    They exist because a derived counterparty was previously trusted on
+    two facts it had never been held to, and both failures landed after
+    the rating had already been written:
+
+    * The grammar half. ``ratee_id`` comes off the transaction document,
+      so it is stored data of whatever type and shape that document
+      happens to carry - a slash-bearing string, a number, an over-long
+      value. It was checked only for truthiness, so an unusable value
+      passed every guard, was persisted by the create, and then failed
+      ``Rating(**result)`` back in :func:`submit_rating` - AFTER the
+      commit. The caller received a 500 for a rating that had in fact
+      been recorded, and the retry that 500 invites was answered 409 by
+      the uniqueness constraint. Refusing it here means nothing is
+      written at all. It is checked at DERIVATION rather than later
+      because this value is published in ``outcome['ratee_id']`` and
+      reported to the caller by the eligibility endpoint, so a value
+      that cannot be a document ID must not enter the outcome either -
+      reporting a coerced counterparty would be its own defect.
+    * The existence half. A well-formed ID naming no user was answered
+      201, and the rating it created could never publish: the
+      publication transaction requires the ratee's document to credit
+      (see :func:`_locked_user_state`) and refuses without it, so the
+      record stayed invisible and uncounted forever while the aggregate
+      it was meant to move never learned it existed. There is no path
+      back from that state, which is what makes proving the target
+      up front the only correct treatment.
+
+    Both are reported as :class:`TransactionInvariantError` because that
+    is what they are - a defect in this system's own stored data that no
+    caller provoked and none can repair - and that class is already
+    mapped to a 409 by the router and converted into an ineligible
+    decision by :func:`evaluate_eligibility`, so both entry points stay
+    inside the status sets they publish.
 
     Uniqueness is NOT assessed here. It is enforced by the datastore at
     the moment of the create-only write, because an existence read
@@ -863,6 +1091,16 @@ def _assess(
             sentinel, which falls back to the value on ``caller``. Must
             be literally ``True`` to pass; any other value, of any type,
             is refused.
+        read_ratee: How guard 7 asks whether the derived counterparty
+            has a user document. Defaults to ``None``, which uses
+            :func:`_user_exists` - one unlocked get-by-ID, correct for
+            the read-only eligibility report. The submission path
+            passes a reader bound to its Firestore transaction, so the
+            same guard is decided against a locked snapshot and the
+            answer still holds at the instant the create commits. It is
+            a callable rather than a value because the ID being asked
+            about is DERIVED here: no caller can read the document
+            before this function has computed which one it is.
 
     Returns:
         A dict with keys ``error`` (a :class:`RatingError` instance, or
@@ -873,10 +1111,16 @@ def _assess(
         counterparty.
 
     Raises:
-        TransactionInvariantError: Guard 6 - the transaction document is
-            missing ``vehicle_listing_id``, which every ``Transaction``
-            declares. Not a caller-facing refusal, so it is raised
-            instead of being returned in ``error``; see that class.
+        TransactionInvariantError: The transaction document does not
+            satisfy its own contract - guard 4, its counterparty field
+            cannot be a document ID; guard 6, it is missing
+            ``vehicle_listing_id``, which every ``Transaction``
+            declares; or guard 7, the counterparty it names has no user
+            document. None is a caller-facing refusal, so each is
+            raised instead of being returned in ``error``; see that
+            class. In no case are the outcome's
+            context keys populated, so an unusable identifier is not
+            echoed back to a caller either.
     """
     outcome: Dict[str, Any] = {
         'error': None,
@@ -974,6 +1218,75 @@ def _assess(
         # seller are the same user, never from client input.
         outcome['error'] = SelfRatingNotAllowed()
         return outcome
+    if not _is_valid_document_id(ratee_id):
+        # The transaction names a counterparty that cannot BE a
+        # counterparty: a slash-bearing string would resolve a nested
+        # path through ``document()``, a non-string cannot address a
+        # document at all, and an over-long value produces a rating key
+        # no endpoint can accept. Refused here, before the value is
+        # published in ``outcome`` or composed into anything, so no
+        # write is attempted and no fabricated counterparty is reported.
+        #
+        # The log names the transaction - grammar-checked, so it cannot
+        # forge a line - and DESCRIBES the offending value rather than
+        # rendering it: this string comes from stored data and may carry
+        # newlines or run to Firestore's document size limit, so its
+        # type and length are the diagnostic an operator needs without
+        # putting untrusted text in the log.
+        logger.error(
+            'Transaction %s names a counterparty that is not a usable '
+            'user document ID (type=%s, length=%s). No rating can be '
+            'recorded against it until the document is repaired.',
+            transaction_id,
+            type(ratee_id).__name__,
+            len(ratee_id) if isinstance(ratee_id, str) else 'n/a',
+        )
+        raise TransactionInvariantError(
+            'Transaction {0} names a counterparty that is not a usable '
+            'user document ID'.format(transaction_id)
+        )
+
+    # The derived counterparty must be a USABLE document ID, and this is
+    # proved BEFORE it is recorded on the outcome or staged for a write.
+    #
+    # Both participants are covered by this one check. The caller's own
+    # ID was proved by guard 1, and guard 3 has just proved the caller IS
+    # one of the two participants, so the only participant whose shape is
+    # still unknown is the other one - the value derived here.
+    #
+    # Validating it late was a real defect rather than a theoretical one,
+    # and the sequence is worth spelling out. A transaction whose stored
+    # ``buyer_id`` or ``seller_id`` carries a slash, a control character
+    # or 200 characters passes every guard above: it exists, it names the
+    # caller, it is completed. The rating was then CREATED with that
+    # value in ``ratee_id`` - and only afterwards did the ``Rating``
+    # model, whose ``ratee_id`` is grammar-bound, refuse to serialise the
+    # committed document. The caller received a 500 for a rating that had
+    # in fact been written; retrying returned "you have already rated
+    # this transaction"; and the record could never publish, because
+    # every publication path resolves ``users/{ratee_id}`` and a slash in
+    # that value addresses a nested path rather than a user. An
+    # unpublishable, unserialisable, undeletable orphan, produced by a
+    # request that was entirely well formed.
+    #
+    # RAISED rather than reported, exactly like guard 6 and for the same
+    # reason: this is a defect in stored data that no caller provoked and
+    # none can repair, so it is logged with the transaction named and
+    # propagates - out of the eligibility read, and out of the submission
+    # transaction, which Firestore then rolls back. Nothing is written.
+    if not _is_valid_document_id(ratee_id):
+        logger.error(
+            'Transaction %s names a counterparty that cannot be used as '
+            'a user document ID: %r. No rating can be recorded against '
+            'it, and none can be published to it, until the document is '
+            'repaired.',
+            transaction_id,
+            ratee_id,
+        )
+        raise TransactionInvariantError(
+            'Transaction {0} names counterparty {1!r}, which is not a '
+            'usable user document ID'.format(transaction_id, ratee_id)
+        )
 
     outcome['ratee_id'] = ratee_id
     outcome['direction'] = direction
@@ -993,15 +1306,17 @@ def _assess(
     # and substituting an empty string would persist a rating that
     # references nothing while satisfying the model. Refuse instead.
     #
-    # RAISED rather than reported, which is what separates it from the
-    # five guards above. Those are refusals the caller caused and can
-    # act on, so they travel back in ``outcome['error']`` as prose the
-    # interface shows. This is a defect in stored data that no caller
-    # provoked and none can repair, so it is an internal invariant: it
-    # is logged with the transaction named so an operator can find it,
-    # and it propagates - out of the eligibility read, and out of the
-    # submission transaction, which Firestore then rolls back, so
-    # nothing is ever written against a transaction this incomplete.
+    # RAISED rather than reported, like the counterparty checks in
+    # guards 4 and 7 and unlike every caller-facing refusal here. Those
+    # are failures the caller caused and can act on, so they travel back
+    # in ``outcome['error']`` as prose the interface shows. This is a
+    # defect in stored data that no caller provoked and none can repair,
+    # so it is an internal invariant: it is logged with the transaction
+    # named so an operator can find it, and it propagates out of this
+    # function - the eligibility read converts it into an ineligible
+    # decision, and the submission transaction lets it out so Firestore
+    # rolls that transaction back, which is why nothing is ever written
+    # against a transaction this incomplete.
     listing_id = transaction.get('vehicle_listing_id')
     if not isinstance(listing_id, str) or not listing_id.strip():
         logger.error(
@@ -1017,6 +1332,43 @@ def _assess(
             )
         )
     outcome['vehicle_listing_id'] = listing_id.strip()
+
+    # Guard 7 - the counterparty must exist as a user to be rated.
+    #
+    # A rating is a record ABOUT somebody, and this is the guard that
+    # proves the somebody is there. Without it a well-formed but
+    # unknown participant ID was answered 201 and produced a rating
+    # that could never publish: the publication transaction refuses
+    # without the ratee's document to credit, so the record would stay
+    # invisible and uncounted forever, its deferred contribution never
+    # applied and its idempotency check permanently satisfied. There is
+    # no way back from that state once the document is committed, which
+    # is why the proof belongs before the write rather than at the
+    # reveal.
+    #
+    # ``read_ratee`` is what makes the proof binding on the write path:
+    # the submission transaction supplies a reader bound to its own
+    # lock, so the counterparty document is enrolled in that
+    # transaction and a deletion racing the commit aborts it instead of
+    # stranding a rating. The eligibility report has no lock to offer
+    # and uses the plain get-by-ID, which is the right cost there - a
+    # question, answered as of now.
+    #
+    # Issued LAST of the seven, so it is only spent on a request every
+    # cheaper guard has already approved.
+    reader = _user_exists if read_ratee is None else read_ratee
+    if not reader(ratee_id):
+        logger.error(
+            'Transaction %s names counterparty %s, which has no user '
+            'document. No rating can be recorded against it until '
+            'either the transaction or the account is repaired.',
+            transaction_id,
+            ratee_id,
+        )
+        raise TransactionInvariantError(
+            'Transaction {0} names counterparty {1}, which has no user '
+            'document'.format(transaction_id, ratee_id)
+        )
 
     return outcome
 
@@ -1051,14 +1403,16 @@ def _is_valid_rating_id(value: Any) -> bool:
     """Report whether a value may be used as a RATING document ID.
 
     Separate from :func:`_is_valid_document_id` because a rating's ID is
-    not a component ID: it is the composite ``"{transaction_id}_{rater_id}"``
-    that :func:`_rating_document_id` builds, so it may be as long as both
-    halves plus the joining underscore.
+    not a component ID: it is the composite that
+    :func:`_rating_document_id` builds from two ESCAPED halves and a
+    delimiter, so it may be as long as both encoded halves plus that
+    delimiter - see ``app.schema.rating.RATING_ID_MAX_LENGTH`` for why
+    escaping puts a factor of three in that bound.
 
     Applying the component bound to the composite - which is what this
     module did until now - makes a rating that genuinely exists
     unreachable. Two 128-character participant IDs are both legitimately
-    creatable, ``submit_rating`` writes their 257-character key without
+    creatable, ``submit_rating`` writes their composite key without
     complaint, and every later lookup of that key then failed this check
     and returned ``None``, which the router reports as 404. A rating that
     is visible on a profile and cannot be moderated or read individually
@@ -1261,6 +1615,62 @@ def _coerce_aggregate(
     return average, int(count or 0)
 
 
+def _exact_score_total(average: Optional[float], count: int) -> int:
+    """Recover the exact integer total of the scores behind an average.
+
+    The stored aggregate is a mean and a count, and the fold needs the
+    TOTAL. Recovering it is exact rather than approximate, and that is
+    the property the whole aggregate's correctness rests on, so it is
+    worth stating why.
+
+    Every score is an integer in ``RATING_MIN..RATING_MAX``, so the total
+    is an integer and ``average`` is the double nearest to ``total /
+    count``. Multiplying back therefore lands within a couple of units in
+    the last place of the true total - for a five-star scale that is an
+    error around ``1e-6`` even at a billion ratings - so rounding to the
+    nearest integer recovers the total EXACTLY. The pair
+    ``(average, count)`` is thus a faithful encoding of
+    ``(total, count)``, which is what lets the aggregate stay two fields
+    on the user document while the arithmetic behaves as though the total
+    were stored outright.
+
+    A stored average that CANNOT have come from an integer total is
+    reported and snapped rather than refused. That happens when something
+    other than this module wrote the field - a hand edit, or a value
+    rounded for presentation by an older revision of this code - and the
+    snap is the closest true aggregate to what is stored, off by at most
+    the rounding that produced it. Snapping keeps publication live and
+    self-healing: the next fold writes an exact value and the drift is
+    gone for good. Refusing would strand every future rating for that
+    user behind an operator repair, which is a worse answer to a
+    discrepancy of a hundredth of a star.
+
+    Args:
+        average: Stored mean, or ``None`` when there are no ratings.
+        count: Stored number of published ratings.
+
+    Returns:
+        The exact integer total of the scores the pair summarises. Zero
+        when there are none.
+    """
+    if average is None or count <= 0:
+        return 0
+    reconstructed = average * count
+    total = int(round(reconstructed))
+    if abs(reconstructed - total) > AGGREGATE_RECONSTRUCTION_TOLERANCE:
+        logger.warning(
+            'Stored rating average %r over %d rating(s) implies a '
+            'non-integer score total (%r); snapping to %d. The value was '
+            'not written by this module, or predates exact aggregate '
+            'storage - the next publication rewrites it exactly.',
+            average,
+            count,
+            reconstructed,
+            total,
+        )
+    return total
+
+
 def _fold_scores(
     current_average: Optional[float],
     current_count: Optional[int],
@@ -1279,6 +1689,24 @@ def _fold_scores(
     hold the SRS 200 ms budget as a rating count grows, and because
     locking a whole result set rather than one document would make
     contention and transaction reruns far more likely.
+
+    THE FOLD IS EXACT, AND ORDER CANNOT CHANGE ITS ANSWER
+    -------------------------------------------------------------------
+    It adds integers. The stored pair is turned back into the exact
+    integer total by :func:`_exact_score_total`, the new scores are added
+    to it, and the mean is divided out once at the end - so the result
+    depends only on the MULTISET of scores, never on how they were
+    grouped or in what order they were revealed. Two users with the same
+    ratings hold the same average, and either average can be recomputed
+    from the ratings themselves.
+
+    That is a repair. The fold used to reconstruct the total from a
+    stored average that had itself been rounded to two decimals, so each
+    fold inherited the last one's error: (1, 1, 1, 1, 1, 2, 1) published
+    one at a time stored 1.15 against a true mean of 1.142857..., and the
+    same seven scores published in a single batch stored 1.14. The
+    returned average is now unrounded; rounding belongs at the
+    presentation boundary, where :data:`AGGREGATE_PRECISION` is applied.
 
     Every published rating is counted, whatever its score. There is no
     threshold and no sentiment weighting here, and none may be added.
@@ -1302,9 +1730,12 @@ def _fold_scores(
 
     Returns:
         ``(average, count)`` after the fold, satisfying the same
-        invariant :func:`_coerce_aggregate` enforces. For the very first
-        rating this is ``(float(score), 1)``: the average moves from
-        ``None`` to exactly the submitted score.
+        invariant :func:`_coerce_aggregate` enforces. The average is the
+        UNROUNDED mean of every published score, so ``average * count``
+        recovers their exact total; presentation rounding happens where a
+        response is built. For the very first rating this is
+        ``(float(score), 1)``: the average moves from ``None`` to exactly
+        the submitted score.
 
     Raises:
         ValueError: A score being folded in is not a valid vote, or the
@@ -1340,8 +1771,13 @@ def _fold_scores(
         # must stay distinguishable from a genuine average of zero.
         return None, 0
 
-    running_total = (base_average or 0.0) * base_count + sum(added)
-    average = round(running_total / total_count, AGGREGATE_PRECISION)
+    # Integer arithmetic, then ONE division. The base total is recovered
+    # exactly rather than reconstructed from a rounded summary, which is
+    # what makes the result independent of how the scores were grouped.
+    running_total = (
+        _exact_score_total(base_average, base_count) + sum(added)
+    )
+    average = running_total / total_count
     if not settings.RATING_MIN <= average <= settings.RATING_MAX:
         # Unreachable with a validated base and validated scores, so
         # reaching it means an assumption above has broken. Refusing is
@@ -1555,7 +1991,7 @@ def _rating_exists(transaction_id: str, rater_id: str) -> bool:
     snapshot = (
         db.collection(RATINGS_COLLECTION)
         .document(document_id)
-        .get(**DATASTORE_CALL)
+        .get(**datastore_call())
     )
     return bool(snapshot.exists)
 
@@ -1652,7 +2088,7 @@ def _committed_rating_state(
         snapshot = (
             db.collection(RATINGS_COLLECTION)
             .document(document_id)
-            .get(**DATASTORE_CALL)
+            .get(**datastore_call())
         )
         if snapshot.exists:
             body = snapshot.to_dict() or {}
@@ -1714,7 +2150,11 @@ def _submit_transaction_body(
     re-evaluated against the state that actually holds. Without this,
     both gates would be advisory rather than enforced.
 
-    All three reads precede the single write, which Firestore requires.
+    All four reads precede the single write, which Firestore requires.
+    The fourth is the counterparty's user document, read inside guard 7
+    through the reader this function supplies - so the target of the
+    rating is proved to exist under the same lock, and no rating is ever
+    written about a participant the datastore does not have.
 
     A guard failure raises out of the callable, which rolls the
     transaction back, so a refused rating leaves nothing behind.
@@ -1746,16 +2186,21 @@ def _submit_transaction_body(
     Raises:
         RatingError: Any guard failed against the locked state. The
             transaction is rolled back, so nothing is written.
+        TransactionInvariantError: The transaction's stored record
+            cannot support a rating - an unusable counterparty field, no
+            ``vehicle_listing_id``, or a counterparty with no user
+            document. Raised from the guard sequence, so the transaction
+            is rolled back and nothing is written.
         DuplicateRating: A rating already exists at this key.
     """
     rater_id = getattr(caller, 'id', None) or ''
 
     # Reads and guards are INTERLEAVED, in the contract's own order: each
     # read is followed immediately by every guard that read enables, and
-    # only then is the next read issued. All three reads still precede the
+    # only then is the next read issued. All four reads still precede the
     # single write, which is what Firestore requires.
     #
-    # Doing all three reads first and then evaluating the whole guard
+    # Doing every read first and then evaluating the whole guard
     # sequence - which is what this function used to do - silently makes
     # the error contract depend on the datastore. The guard order is
     # published: an unverified caller must be told about verification even
@@ -1773,7 +2218,7 @@ def _submit_transaction_body(
     user_snapshot = (
         db.collection(USERS_COLLECTION)
         .document(rater_id)
-        .get(transaction=transaction, **DATASTORE_CALL)
+        .get(transaction=transaction, **datastore_call())
     )
     if not user_snapshot.exists:
         # The caller authenticated against a document that has since
@@ -1823,7 +2268,7 @@ def _submit_transaction_body(
         transaction_snapshot = (
             db.collection(TRANSACTIONS_COLLECTION)
             .document(transaction_id)
-            .get(transaction=transaction, **DATASTORE_CALL)
+            .get(transaction=transaction, **datastore_call())
         )
         transaction_body = (
             (transaction_snapshot.to_dict() or {})
@@ -1833,21 +2278,35 @@ def _submit_transaction_body(
     else:
         transaction_body = None
 
-    # --- guards 2 to 6 (R2, self-rating, completed, ratable) ---
+    # --- guards 2 to 7, and read 3 inside guard 7 ---
+    # R2, the counterparty grammar check, self-rating, completed,
+    # ratable, and the proof that the counterparty has a user document.
+    #
+    # ``read_ratee`` binds guard 7's read to THIS transaction, so the
+    # counterparty document is enrolled in the same lock as the rater,
+    # the transaction and the target key. That is what makes the guard
+    # enforced rather than advisory: an account deleted between the
+    # check and the commit aborts the commit, and the callable is rerun
+    # against the state that actually holds. The ID it reads is derived
+    # inside ``_assess`` and grammar-checked there before this reader
+    # ever sees it, which is why nothing here re-validates it.
     outcome = _assess(
         transaction_id,
         caller,
         supplied_ratee_id=supplied_ratee_id,
         transaction=transaction_body,
         is_verified=user_body.get('is_verified', False),
+        read_ratee=lambda ratee_id: _locked_user_exists(
+            transaction, ratee_id
+        ),
     )
     if outcome['error'] is not None:
         raise outcome['error']
 
-    # --- read 3: the target key, for the duplicate report ---
+    # --- read 4: the target key, for the duplicate report ---
     rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
     existing = rating_ref.get(
-        transaction=transaction, **DATASTORE_CALL
+        transaction=transaction, **datastore_call()
     )
     if existing.exists:
         raise DuplicateRating()
@@ -1934,9 +2393,11 @@ def evaluate_eligibility(
         are populated only once the caller is confirmed a participant of
         a transaction that names both parties, so a rejected caller
         learns nothing about the counterparty. EVERY outcome is reported
-        as a decision, including the malformed-transaction case that the
-        guard sequence raises - see the conversion below - so this
-        function raises nothing a caller has to classify.
+        as a decision, including the three unratable-record cases the
+        guard sequence raises - an unusable counterparty field, a
+        missing ``vehicle_listing_id``, and a counterparty with no user
+        document; see the conversion below - so this function raises
+        nothing a caller has to classify.
     """
     caller_id = getattr(caller, 'id', None) or ''
 
@@ -1960,13 +2421,15 @@ def evaluate_eligibility(
     # not a party to the transaction - and whose ``already_rated`` value
     # nobody can act on anyway.
     #
-    # Guard 6 RAISES rather than reporting, because a malformed
-    # transaction document is a data defect and not a refusal the caller
-    # caused. This function's contract is nonetheless to REPORT every
-    # outcome - it is the answer an interface renders to decide whether
-    # the submission control is available - so the raise is converted
-    # here into the decision it implies: not eligible, with the same
-    # sentence the write path answers 409 with. Letting it propagate
+    # Guards 4, 6 and 7 RAISE rather than reporting, because an unusable
+    # counterparty field, a transaction missing the data a rating
+    # denormalises and a counterparty with no user document are all data
+    # defects rather than refusals the caller caused. This function's
+    # contract is nonetheless to REPORT every outcome - it is the answer
+    # an interface renders to decide whether the submission control is
+    # available - so the raise is converted here into the decision it
+    # implies: not eligible, with the same sentence the write path
+    # answers 409 with. Letting it propagate
     # instead is what previously took this endpoint outside its own
     # published status set, and left the interface with no reason to
     # show. ``ratee_id`` and ``direction`` stay ``None``: nothing can be
@@ -1974,6 +2437,14 @@ def evaluate_eligibility(
     # there is no counterparty for the interface to prepare a rating
     # for. The write path is untouched by this - it still raises, which
     # is what makes the refusal a status code there.
+    #
+    # Guard 7 reads the counterparty's user document, so this endpoint
+    # costs one get-by-ID more than it used to for a caller who passes
+    # every other guard. That is deliberate: an interface told "eligible"
+    # about a counterparty the datastore does not have would offer a
+    # control whose submission the write path refuses, which is exactly
+    # the disagreement between the reported reason and the enforced one
+    # that this endpoint exists to prevent.
     try:
         outcome = _assess(transaction_id, caller, transaction=transaction)
     except TransactionInvariantError as invariant:
@@ -2085,6 +2556,12 @@ def submit_rating(payload: RatingCreate, caller: User) -> Rating:
             parties.
         TransactionNotCompleted: The transaction is not ``completed``.
         DuplicateRating: This rater has already rated this transaction.
+        TransactionInvariantError: The transaction's stored record cannot
+            support a rating - its counterparty field is not a usable
+            document ID, it carries no ``vehicle_listing_id``, or the
+            counterparty it names has no user document. A defect in
+            stored data rather than a refusal the caller caused, and
+            nothing is written on any of those paths.
     """
     transaction_id = getattr(payload, 'transaction_id', None) or ''
     score = getattr(payload, 'score')
@@ -2355,7 +2832,7 @@ def _locked_transaction(
     snapshot = (
         db.collection(TRANSACTIONS_COLLECTION)
         .document(transaction_id)
-        .get(transaction=transaction, **DATASTORE_CALL)
+        .get(transaction=transaction, **datastore_call())
     )
     if not snapshot.exists:
         raise PublicationInvariantError(
@@ -2504,7 +2981,7 @@ def _locked_user_state(
         )
     user_ref = db.collection(USERS_COLLECTION).document(user_id)
     snapshot = user_ref.get(
-        transaction=transaction, **DATASTORE_CALL
+        transaction=transaction, **datastore_call()
     )
     if not snapshot.exists:
         raise PublicationInvariantError(
@@ -2552,7 +3029,7 @@ def _locked_rating(
     """
     rating_ref = db.collection(RATINGS_COLLECTION).document(document_id)
     snapshot = rating_ref.get(
-        transaction=transaction, **DATASTORE_CALL
+        transaction=transaction, **datastore_call()
     )
     if not snapshot.exists:
         return None
@@ -2617,7 +3094,7 @@ def _reciprocal_publication_body(
             document_id
         )
         snapshot = rating_ref.get(
-            transaction=transaction, **DATASTORE_CALL
+            transaction=transaction, **datastore_call()
         )
         if not snapshot.exists:
             # The counterparty has not rated yet - the ordinary case,
@@ -2876,7 +3353,7 @@ def _transaction_rating_snapshots(transaction_id: str) -> List[Any]:
         .order_by('rater_id')
         .limit(DEFAULT_RATINGS_PAGE_SIZE)
     )
-    return list(query.stream(**DATASTORE_CALL))
+    return list(query.stream(**datastore_call()))
 
 
 def _reciprocal_possible(snapshots: Iterable[Any]) -> bool:
@@ -3066,41 +3543,47 @@ def _publish_expired_ratings(
     that is due. This function is the scheduled equivalent of the same
     work, not a prerequisite for it.
 
-    ONE EQUALITY FILTER, AND THE DEADLINE APPLIED IN PYTHON
+    IT ASKS THE DATASTORE FOR DUE RECORDS, OLDEST FIRST
     ---------------------------------------------------------------
-    The query asks for unpublished ratings and nothing else, walked by
-    document name, with due-ness decided here by
-    :func:`_window_elapsed`. Asking the datastore for "unpublished AND
-    past the deadline" would read better and would cost an index this
-    project does not have: an equality filter combined with a range on a
-    DIFFERENT field requires a composite index, and
-    infrastructure/firestore.indexes.json declares exactly two - both
-    shaped for the read paths, neither able to serve
-    ``(is_published, created_at)``. A query needing an undeclared
-    composite index does not run slowly, it fails outright with
-    ``FailedPrecondition``, so the shape that needs no declaration is the
-    shape this sweep uses. Filtering on ``is_published`` alone is served
-    by Firestore's automatic single-field index.
+    The query is "unpublished AND past the deadline", ordered by
+    ``created_at`` ascending, served by the declared
+    ``(is_published ASC, created_at ASC)`` composite index.
 
-    What that costs is reading not-yet-due candidates: on a healthy
-    system most unpublished ratings are inside their window, and each
-    pass pays for those documents to discover they are not actionable.
-    The ceiling below bounds that cost, and it is the right trade against
-    a third index, because this sweep runs on a worker rather than on a
-    request path - and because nothing dispatches it, the read paths
-    carry the real burden with the far narrower per-user query.
+    An earlier revision asked only for unpublished ratings, walked them by
+    document NAME and decided due-ness here in Python, to avoid declaring
+    that index. The saving was not worth what it cost, and what it cost
+    was liveness rather than time. Document name is unrelated to age, and
+    a pass is bounded at :data:`DEFAULT_SWEEP_SCAN_LIMIT` documents
+    EXAMINED - so a collection whose first few thousand unpublished
+    ratings are all inside their window spends the whole ceiling
+    discovering that, and a due record sorting after them is never
+    reached. Every pass then examines the same not-yet-due prefix and
+    reaches the same point, so the record does not merely wait: it is
+    permanently invisible to this sweep, however often it runs. Filtering
+    in the query removes the prefix from the result set altogether, and
+    the ascending order means the ceiling is spent on the records that
+    have waited longest.
 
-    Ordering by document NAME rather than by ``created_at`` is what keeps
-    the walk index-free and total. It also cannot silently exclude a
-    record: Firestore drops a document that lacks an ordered field from
-    the result set entirely, so ordering by a timestamp would hide a
-    rating that has not been stamped, while every document has a name.
+    Progress is therefore durable without any stored cursor. Publishing a
+    record removes it from this query permanently, so each pass faces a
+    strictly smaller due set than the last, drains it from the oldest end,
+    and cannot spend its budget on records it has already declined.
 
-    Progress is durable without any stored cursor. Publishing a record
-    removes it from this query permanently, so each pass faces a strictly
-    smaller PUBLISHABLE set than the last; and because a pass walks a
-    cursor to the ceiling rather than re-reading one page, a due record
-    cannot starve behind a run of not-yet-due ones.
+    The trade this accepts is one more composite index on ``ratings``, and
+    the write cost of maintaining it. That is the right way round: an
+    index is a cost paid per write, whereas the starvation it removes was
+    a rating that never became visible at all. The
+    ``fieldOverrides`` in the same declaration file exempt ``review`` and
+    ``moderation_reason`` from automatic single-field indexing, which more
+    than pays for it.
+
+    One consequence is worth stating rather than discovering: Firestore
+    drops a document that lacks an ordered field from a result set, so a
+    rating with no ``created_at`` is not returned here at all. It was
+    previously read and then declined, because :func:`_window_elapsed`
+    reads an unusable timestamp as "not yet due" - the same verdict, one
+    round trip earlier. Such a record needs its timestamp repaired; no
+    reader of any kind will publish it.
 
     The walk is bounded twice over - the cursor pagination of
     :func:`_paginate` caps documents examined at ``limit``, and
@@ -3111,18 +3594,18 @@ def _publish_expired_ratings(
     :func:`_apply_publication`, where separate transactions would each
     read the same starting count and lose an update.
 
-    A rating whose ``created_at`` is absent or unusable is examined and
-    then declined, because :func:`_window_elapsed` reads an unusable
-    timestamp as "not yet due" - deferring a reveal rather than risking
-    an early one. Nothing is stranded by that: no path would publish
-    such a record, because every one of them decides due-ness through
-    that same function. The record needs its timestamp repaired, not
-    another reader.
+    Due-ness is still re-proved here by :func:`_due_snapshots` even though
+    the query has already filtered on the deadline, and that is
+    deliberate: it keeps :func:`_window_elapsed` the single reading of
+    "is this due?" that every path in this module shares, and it costs one
+    comparison per record already in hand. The two cannot disagree in a
+    way that publishes something early - the function recomputes "now",
+    so it is if anything more inclusive than the deadline the query used.
 
     Args:
-        limit: Ceiling on the number of unpublished ratings examined in
-            one pass, so no single call becomes an unbounded read. A
-            larger backlog drains across successive passes.
+        limit: Ceiling on the number of DUE ratings examined in one pass,
+            so no single call becomes an unbounded read. A larger backlog
+            drains across successive passes, oldest first.
 
     Returns:
         The IDs of the ratings this pass published, which the Celery task
@@ -3133,7 +3616,15 @@ def _publish_expired_ratings(
         .where(
             filter=firestore.FieldFilter('is_published', '==', False)
         )
-        .order_by(DOCUMENT_ID_FIELD)
+        .where(
+            filter=firestore.FieldFilter(
+                'created_at', '<=', _window_deadline()
+            )
+        )
+        # OLDEST FIRST, so a bounded pass spends its budget on the
+        # records that have waited longest instead of re-examining a
+        # not-yet-due prefix. See the docstring.
+        .order_by('created_at', direction=firestore.Query.ASCENDING)
     )
 
     published: List[str] = []
@@ -3195,9 +3686,12 @@ def publish_expired_ratings(limit: Optional[int] = None) -> List[str]:
 
     Everything that makes the pass safe lives behind this call:
 
-    * the walk is a CURSOR over the unpublished ratings ordered by
-      document name, so each matching document is seen once per pass and
-      a due rating cannot starve behind a run of not-yet-due ones;
+    * the walk is a CURSOR over the ratings that are BOTH unpublished
+      and past their deadline, ordered by ``created_at`` ascending, so a
+      bounded pass spends its budget on the records that have waited
+      longest and a due rating cannot starve behind a run of not-yet-due
+      ones - those are absent from the result set entirely rather than
+      examined and declined;
     * the pass is CEILINGED at ``limit`` documents examined, so a large
       backlog drains across successive passes instead of exhausting the
       worker's memory or its time budget;
@@ -3240,17 +3734,40 @@ def _publish_due_for_ratee(user_id: str) -> bool:
     would simply never become correct. So a read that is about to report
     a user's reputation settles what is already due first.
 
-    IT WALKS THE WHOLE DUE SET, NOT ONE PAGE OF IT
+    OLDEST DUE RECORD FIRST, WHICH IS WHAT MAKES IT STARVATION-FREE
     ---------------------------------------------------------------
-    The work is bounded by a scan ceiling rather than by a single page,
-    and that distinction is a correctness one. An earlier revision took
-    the ``SETTLE_BATCH_SIZE`` NEWEST due records and reversed that page in
-    memory, which looks equivalent and is not: under sustained arrivals
-    more than a page can become due between two reads, and the oldest
-    record then sits behind a permanently replenished run of newer ones
-    and is never reached. Overdue is exactly the state that must not be
-    able to persist, so the walk advances a cursor over every due record
-    it finds, up to :data:`SETTLE_SCAN_LIMIT` documents examined.
+    The walk is bounded - it has to be, on a public read path - so what
+    matters is WHICH bounded slice of the due set it takes. Taking the
+    newest, which is what this did while ordering by ``created_at``
+    descending, is the one choice that can starve: under sustained
+    arrivals the ceiling is filled by records that only just became due,
+    and an older one sits behind a permanently replenished run of newer
+    ones and is never reached. The rating that has waited longest is
+    precisely the one whose reveal is most overdue.
+    Ordering ASCENDING inverts that. Each pass takes the oldest due
+    records, publishing one removes it from the due set permanently, so
+    every pass makes progress at the front of the queue and no record can
+    be passed over twice for the same reason. A backlog larger than the
+    ceiling drains from the oldest end across successive reads instead of
+    accumulating an oldest tail nothing ever reaches.
+
+    The ordering also decides the index. The shape - two equality filters,
+    a range on ``created_at`` and an ascending order on it - is served by
+    the declared ``(ratee_id ASC, is_published ASC, created_at ASC)``
+    composite, which exists for this query alone. Firestore can walk an
+    index backwards, so the DESCENDING sibling would probably serve this
+    too; "probably" is not good enough for a public read path, because a
+    wrong answer about index-direction semantics surfaces as
+    ``FailedPrecondition`` in a deployment where indexes are enforced and
+    the local emulator cannot falsify it - it serves any query, declared
+    index or not. Declaring the direction the query asks for removes the
+    question.
+
+    The walk itself is bounded by a scan ceiling rather than by a single
+    page, and that distinction matters as much as the ordering: a cursor
+    advances over every due record it finds, up to
+    :data:`SETTLE_SCAN_LIMIT` documents examined, so a page boundary
+    cannot hide the record after it.
 
     Bounded three ways, because this runs on the critical path of a public
     read against the SRS 200 ms budget:
@@ -3274,10 +3791,12 @@ def _publish_due_for_ratee(user_id: str) -> bool:
       into a single aggregate write and skips a record that cannot be
       re-proved without costing the rest of its group theirs.
 
-    A backlog larger than the ceiling still drains: the query selects only
-    records that are BOTH unpublished AND past their deadline, and
-    settling a record removes it from that set permanently, so each read
-    faces a strictly smaller candidate set than the last.
+    A backlog larger than the ceiling still drains, and drains from the
+    right end: the query selects only records that are BOTH unpublished
+    AND past their deadline, they arrive oldest first, and settling one
+    removes it from that set permanently - so each read faces a strictly
+    smaller candidate set than the last and always works on the records
+    that have waited longest.
 
     The reciprocal reveal is NOT attempted here. It belongs to the
     submission that completes the pair (:func:`submit_rating`) and to the
@@ -3288,30 +3807,13 @@ def _publish_due_for_ratee(user_id: str) -> bool:
     whose reveal failed transiently is still revealed by either of those
     two paths, and window expiry publishes it regardless.
 
-    The query shape - two equality filters, then a range and an order on
-    ``created_at`` - is served by the declared
-    ``(ratee_id ASC, is_published ASC, created_at DESC)`` composite
-    index, and the ordering here is DESCENDING so it matches that
-    declaration exactly rather than relying on the datastore to scan the
-    trailing field backwards. That reliance is the thing worth avoiding:
-    it is an assumption about index-direction semantics that the local
-    emulator cannot falsify, because the emulator serves any query
-    without a declared index at all. A deployment where indexes ARE
-    enforced would be the first place it was tested, and a wrong answer
-    there surfaces as ``FailedPrecondition`` on a public read path.
-    Matching the declared direction removes the question. Ordering is a
-    free choice here anyway - see the draining argument above - so there
-    is no reason to spend it on an assumption.
-
     A rating whose ``created_at`` is absent or unusable never matches the
     range filter and so is never settled here - the same "unusable
     timestamp means not yet due" reading :func:`_window_elapsed` applies,
-    deferring a reveal rather than risking an early one. The global sweep
-    does examine such a record, because it filters on the deadline in
-    Python rather than in its query, and then declines it for the same
-    reason. Nothing is stranded either way: every path decides due-ness
-    through :func:`_window_elapsed`, so the record needs its timestamp
-    repaired rather than another reader.
+    deferring a reveal rather than risking an early one. The scheduled
+    sweep treats such a record identically, because it filters on the
+    same deadline. Nothing is stranded by a reader: the record needs its
+    timestamp repaired, and until it is, no path will publish it.
 
     Args:
         user_id: The rated user whose due ratings are settled.
@@ -3341,7 +3843,9 @@ def _publish_due_for_ratee(user_id: str) -> bool:
         .where(
             filter=firestore.FieldFilter('created_at', '<=', deadline)
         )
-        .order_by('created_at', direction=firestore.Query.DESCENDING)
+        # OLDEST FIRST. The bound above makes this the choice between
+        # draining the queue and starving its front - see the docstring.
+        .order_by('created_at', direction=firestore.Query.ASCENDING)
     )
     changed = False
     for batch in _chunked(
@@ -3502,10 +4006,27 @@ def _visible_projection(rating: Rating) -> Optional[Rating]:
     returned. That is a property of the contract, not a discrepancy, and
     it is stated on the response model so no client renders it as one.
 
-    ``moderation_reason`` is redacted on every path, approved or not: it
-    is an internal note recording why a moderator acted, written for
-    operators rather than for the public. The rating's author sees it
-    through their own view instead.
+    ``moderation_reason`` is redacted here on every path, approved or
+    not: it is an internal note recording why a moderator acted, written
+    for operators rather than for the public.
+
+    Nobody outside the administrator who set it ever receives it, and
+    that is worth stating precisely because it is easy to assume
+    otherwise. Redaction here is only the first of two steps: every
+    response this service feeds - the public read, the per-transaction
+    read and the submission - is projected through
+    ``app.schema.rating.RatingView``, which declares no moderation
+    fields at all, so neither ``moderation_status`` nor
+    ``moderation_reason`` can reach a caller through them even when this
+    function returns a rating unredacted. ``ModeratedRatingView``, from
+    the admin-gated moderation endpoint, is the ONE response shape that
+    carries them.
+
+    What a rating's own author does get is their own WORDS: the
+    per-transaction read returns their rating whatever its state, so a
+    withheld review does not vanish on them. The policy note behind the
+    decision is not part of that - it is operational, and an author is
+    the reader most motivated to argue with it.
 
     RELATIONSHIP METADATA IS DELIBERATELY RETAINED
     ---------------------------------------------------------------
@@ -3581,12 +4102,16 @@ def _paginate(
     seen exactly once and the walk terminates.
 
     ``query`` MUST carry an ordering, because a cursor is defined
-    relative to one. Ordering by ``__name__`` is the cheapest choice
-    when no other order is needed: Firestore's automatic single-field
-    indexes are keyed by (value, document name), so an equality-filtered
-    query ordered by name is served without any composite index - and,
-    unlike ordering by a data field, it cannot silently exclude
-    documents that lack that field.
+    relative to one, and every caller in this module orders by
+    ``created_at`` - which is not only for the cursor's benefit. The
+    order decides WHICH bounded slice of a larger result set the walk
+    takes, so ordering by age is what lets the settlement walks spend
+    their ceiling on the records that have waited longest instead of
+    re-examining the same ones. One consequence travels with that choice:
+    Firestore omits a document that lacks the ordered field, so a rating
+    with no ``created_at`` is absent from these walks rather than examined
+    and declined. It is unpublishable either way - see
+    :func:`_window_elapsed` - and needs its timestamp repaired.
 
     Args:
         query: An ordered Firestore query, without a ``limit``.
@@ -3613,7 +4138,7 @@ def _paginate(
             page_query = page_query.start_after(cursor)
         page = list(
             page_query.stream(
-                transaction=transaction, **DATASTORE_CALL
+                transaction=transaction, **datastore_call()
             )
         )
         if not page:
@@ -3629,13 +4154,19 @@ def _paginate(
 def _due_snapshots(snapshots: Iterable[Any]) -> Iterable[Any]:
     """Keep only the snapshots whose publication window has closed.
 
-    The deadline half of the sweep's predicate, applied here rather than
-    in the query. Combining an equality filter on ``is_published`` with a
-    range on ``created_at`` would require a composite index that
-    infrastructure/firestore.indexes.json does not declare - and a query
-    needing an undeclared composite index fails outright rather than
-    running slowly - so the datastore answers the part it can index and
-    this decides the rest. See :func:`_publish_expired_ratings`.
+    A RE-PROOF, not the filter. The sweep's query already asks the
+    datastore for records past the deadline, using the
+    ``(is_published ASC, created_at ASC)`` composite index declared for
+    it, so in the normal case every snapshot reaching here is due and
+    every one of them is yielded.
+
+    It stays because it keeps :func:`_window_elapsed` the single reading
+    of "is this due?" that every path in this module shares - the
+    per-user settlement, the per-transaction read, and this sweep - and
+    the cost is one comparison per record already in hand. The two cannot
+    disagree in the dangerous direction: this recomputes "now", so it is
+    if anything more inclusive than the deadline the query was built with
+    a moment earlier, and nothing is revealed early.
 
     Lazy, so the sweep still interleaves settlement with the cursor walk
     instead of materialising every candidate first.
@@ -3849,7 +4380,7 @@ def _reputation_snapshot_body(
     snapshot = (
         db.collection(USERS_COLLECTION)
         .document(user_id)
-        .get(transaction=transaction, **DATASTORE_CALL)
+        .get(transaction=transaction, **datastore_call())
     )
     if not snapshot.exists:
         return None
@@ -3923,6 +4454,85 @@ def get_user_reputation(user_id: str) -> Optional[UserReputation]:
         return None
     items, aggregate = answer
     return UserReputation(items, aggregate)
+
+
+def get_user_aggregate(user_id: str) -> Optional[RatingAggregate]:
+    """Report one user's reputation SUMMARY and nothing else. PUBLIC. F010-3.
+
+    The supported entry point for the reputation badge, which needs an
+    average and a count and never needs the reviews behind them. It exists
+    because :func:`get_user_reputation` cannot serve that need cheaply:
+    the badge renders beside every listing, and answering it was reading
+    up to a page of rating documents - and walking as far as ten pages
+    past withheld records to fill it - purely to discard them at the
+    client. On the busiest read in the product, against the SRS 200 ms
+    budget, that is the difference between one document and hundreds.
+
+    WHAT IT DOES NOT GIVE UP
+    -------------------------------------------------------------------
+    An aggregate-only mode existed once and was REMOVED, because it
+    answered straight from the user document without settling
+    publications that were already due - and being the mode the badge
+    used, it made the most-read reputation in the product the one
+    permitted to sit behind a worker that will never run. That objection
+    was correct and is not reintroduced here: this function settles
+    first, on every call, exactly as the full read does. The saving is in
+    what it reads AFTERWARDS, not in what it skips beforehand.
+
+    The two functions therefore cannot disagree about a user's
+    reputation. Both settle the same bounded due set through the same
+    :func:`_publish_due_for_ratee`, and both then read the aggregate from
+    the same denormalised pair on the same user document through the same
+    :func:`_aggregate_from_snapshot`.
+
+    ONE GET-BY-ID, AND NO TRANSACTION
+    -------------------------------------------------------------------
+    Settlement, then a single get-by-ID. There is deliberately no
+    read-only transaction around it: a transaction exists in the full read
+    to make the list and the aggregate describe ONE instant, and with no
+    list to reconcile there is nothing here for it to make coherent - a
+    single-document read is already atomic. Wrapping it would add a
+    BeginTransaction and a Commit round trip to a one-RPC answer and
+    would make the cost claim in this docstring untrue.
+
+    Args:
+        user_id: The rated user.
+
+    Returns:
+        A :class:`RatingAggregate`, or ``None`` when there is no such
+        user. ``None`` is distinct from ``average=None, count=0``: "there
+        is no such user" and "this user has never been rated" are
+        different answers and only the second is a 200, which is the same
+        distinction :func:`get_user_reputation` draws.
+
+    Raises:
+        Exception: A permanent settlement failure propagates rather than
+            being reported as a stale reputation - see
+            :func:`_publish_due_for_ratee`. A transient datastore fault on
+            the read itself propagates to the router, which answers 503.
+    """
+    # Grammar applied before the value reaches ``document()``, for the
+    # reasons ``_list_ratings_for_user`` sets out: an unusable ID is a
+    # missing user, not a malformed datastore call.
+    if not _is_valid_document_id(user_id):
+        return None
+
+    # SETTLEMENT IS NEVER SKIPPED. Bounded, and ordered oldest-first, so
+    # this read makes progress on the records that have waited longest
+    # instead of merely reporting whatever a worker has not done. It runs
+    # before existence is established, which costs one bounded query for a
+    # user who does not exist and keeps the answer downstream of anything
+    # this pass revealed.
+    _publish_due_for_ratee(user_id)
+
+    snapshot = (
+        db.collection(USERS_COLLECTION)
+        .document(user_id)
+        .get(**datastore_call())
+    )
+    if not snapshot.exists:
+        return None
+    return _aggregate_from_snapshot(user_id, snapshot)
 
 
 def require_eligibility(
@@ -4140,6 +4750,7 @@ def moderate_rating(
     rating_id: str,
     status: Any,
     reason: Optional[str] = None,
+    actor_id: Optional[str] = None,
 ) -> Optional[Rating]:
     """Move a rating's moderation state, recording why. PUBLIC. F010-4.
 
@@ -4154,7 +4765,12 @@ def moderate_rating(
         reason: The policy reason justifying the transition, describing the
             violation in the review CONTENT. Required when rejecting and
             refused on any other state - see :func:`_moderate_rating` for
-            both halves of that matrix.
+            both halves of that matrix. It is persisted on the rating and
+            never logged.
+        actor_id: The administrator the router authorized, recorded on
+            the audit line so the decision is attributable. Logged only;
+            it takes part in no authorization decision and is not
+            written to the document.
 
     Returns:
         The rating in its new state, or ``None`` when no rating exists at
@@ -4165,7 +4781,7 @@ def moderate_rating(
             reason, or a reason accompanies a state that displays the
             review.
     """
-    return _moderate_rating(rating_id, status, reason)
+    return _moderate_rating(rating_id, status, reason, actor_id=actor_id)
 
 
 def _aggregate_from_snapshot(
@@ -4219,6 +4835,15 @@ def _aggregate_from_snapshot(
         body.get('rating_count', 0),
         'users/{0}'.format(user_id),
     )
+    # THE PRESENTATION BOUNDARY, and the only place the aggregate is
+    # rounded. The stored average is the exact unrounded mean, because
+    # the fold reconstructs a total from it and rounding the stored value
+    # made successive folds inherit each other's error - see
+    # ``AGGREGATE_PRECISION``. A reputation is read as "4.5/5" rather
+    # than to sixteen decimals, so the rounding happens here, on the way
+    # out, where it changes nothing that is subsequently computed.
+    if average is not None:
+        average = round(average, AGGREGATE_PRECISION)
     return RatingAggregate(average=average, count=count)
 
 
@@ -4239,11 +4864,15 @@ def _project_transaction_ratings(
     Two distinct rules therefore apply, and which one a rating gets
     depends only on authorship:
 
-    * The caller's OWN rating is returned in full - unrevealed, and even
-      when moderation rejected its review, together with the recorded
-      reason. Anything else makes a withheld review vanish without
+    * The caller's OWN rating is returned unprojected - unrevealed, and
+      even when moderation rejected its review, so their own words come
+      back to them. Anything else makes a withheld review vanish without
       explanation, leaving its author unable to tell whether it was ever
-      received.
+      received. The moderation note behind the decision is NOT part of
+      what they see: this function returns the stored record, and the
+      router projects every rating through ``RatingView``, which
+      declares no moderation fields - only the admin-gated moderation
+      endpoint's ``ModeratedRatingView`` carries them.
     * Anyone else's is subject to the same policy as the public read:
       visible once published, with unapproved review content and the
       internal moderation reason removed, and withheld entirely once
@@ -4299,7 +4928,7 @@ def _get_rating(rating_id: str) -> Optional[Rating]:
     snapshot = (
         db.collection(RATINGS_COLLECTION)
         .document(rating_id)
-        .get(**DATASTORE_CALL)
+        .get(**datastore_call())
     )
     if not snapshot.exists:
         return None
@@ -4351,7 +4980,7 @@ def _moderation_transaction_body(
     """
     rating_ref = db.collection(RATINGS_COLLECTION).document(rating_id)
     snapshot = rating_ref.get(
-        transaction=transaction, **DATASTORE_CALL
+        transaction=transaction, **datastore_call()
     )
     if not snapshot.exists:
         return None
@@ -4388,6 +5017,7 @@ def _moderate_rating(
     rating_id: str,
     status: Any,
     reason: Optional[str] = None,
+    actor_id: Optional[str] = None,
 ) -> Optional[Rating]:
     """Move a rating's moderation state, recording why. F010-4.
 
@@ -4406,12 +5036,34 @@ def _moderate_rating(
     465) prohibits. The aggregate continues to count every published
     rating whatever its value.
 
-    What a rejection withholds is therefore the REVIEW TEXT, not the
-    rating. A published rejected rating keeps appearing in its ratee's
-    list with its score intact and its words removed, so the ratings a
-    reader can see still account for the average they are shown; only
-    its author sees the text and the recorded reason. See
-    :func:`_visible_projection`.
+    What a rejection withholds is therefore CONTENT, never a score. The
+    score remains counted: a rejected rating keeps contributing to its
+    ratee's ``rating_average`` and ``rating_count`` exactly as it did
+    before, because letting a moderation decision move a reputation is
+    what would make moderation sentiment-relevant.
+
+    What the reader loses is the whole RECORD, not merely its words.
+    :func:`_visible_projection` withholds a rejected rating from a
+    reader's list entirely - stripping the text and showing the score is
+    the ``pending`` behaviour, which is a different state meaning
+    "nobody has read this yet", and a reader cannot tell a stripped
+    review from a rating whose author wrote nothing. The consequence is
+    worth stating rather than discovering: ``aggregate.count`` can
+    exceed the number of
+    ratings returned, and in the extreme - every rating a user has
+    received rejected - the list is EMPTY beside a non-null average. A
+    client must render the aggregate from the aggregate and infer nothing
+    from the length of the list.
+
+    Two visibility limits on the reason itself, both narrower than they
+    may appear. Its author keeps seeing their own review text through the
+    authorship override, but NOT the reason recorded about it: no view
+    except :class:`app.schema.rating.ModeratedRatingView` carries that
+    field, and that view is returned only to the administrator who just
+    set it. And the reason is never logged verbatim either - the
+    transition logs which rating moved, where to, that a reason exists
+    and how long it is. See :func:`_visible_projection` for the reader
+    side of this.
 
     Authorization is the router's concern; it restricts this to
     administrators the same way listing deletion is restricted.
@@ -4428,7 +5080,18 @@ def _moderate_rating(
             :data:`MODERATION_REASON_REQUIRED_STATUS` for both halves of
             that matrix and why it is a matrix rather than a default.
             Any previously stored reason is cleared by the transition
-            that leaves ``rejected``, in the same write.
+            that leaves ``rejected``, in the same write. It is NEVER
+            logged; see the audit line at the end of this function.
+        actor_id: The administrator the router authorized, recorded on
+            the audit line so a moderation decision is attributable.
+            Optional so a caller that is not an HTTP request - the
+            background tier, a console session - can still moderate,
+            and such a decision is logged as unattributed rather than
+            being silently ascribed to nobody. It is only ever logged:
+            no authorization decision is taken from it, because
+            authorization belongs to the router, and it is never
+            written to the document, because a rating is append-only and
+            this codebase has no audit collection to widen.
 
     Returns:
         The rating in its new state, or ``None`` when no rating exists at
@@ -4525,10 +5188,38 @@ def _moderate_rating(
     if body is None:
         return None
 
+    # The audit line for a moderation decision, and it carries NO free
+    # text. What a moderator wrote is persisted on the rating document,
+    # which is the record of it; a log is a different medium with
+    # different readers and a different retention, and putting the
+    # reason in one is wrong twice over:
+    #
+    #   * DISCLOSURE. The reason describes a policy violation in
+    #     somebody's review, so it can quote abusive wording or the
+    #     personally identifying information that was the violation.
+    #     Logs are shipped, aggregated and retained far beyond the
+    #     document, and this line was emitted at INFO, so the text
+    #     travelled to every collector by default.
+    #   * INJECTION. ``as_plain_text`` deliberately preserves newline
+    #     and tab, because a review is prose. Rendered into a log line
+    #     that makes a stored value able to write ADDITIONAL lines, so a
+    #     reason could forge a second, plausible-looking record.
+    #
+    # What is logged instead is structured and every field is bounded:
+    # the rating key and the actor are both document IDs, which the
+    # grammar holds to no control characters and no slash; the state is
+    # one of three enumerated values; and the reason appears only as
+    # whether one was recorded and how long it was. That is enough to
+    # audit the decision - who moved which rating to which state, and
+    # whether it carried a justification - and to reconcile against the
+    # document, which is where the words themselves stay.
     logger.info(
-        'Rating %s moderation status set to %s (reason=%s)',
+        'Moderation decision recorded: rating=%s status=%s actor=%s '
+        'reason_recorded=%s reason_length=%s',
         rating_id,
         status_value,
-        recorded_reason or 'none',
+        actor_id if actor_id else 'unattributed',
+        recorded_reason is not None,
+        len(recorded_reason) if recorded_reason is not None else 0,
     )
     return _rating_from_dict(body)
