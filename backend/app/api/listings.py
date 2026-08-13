@@ -34,7 +34,7 @@ async def create_listing(listing: VehicleListing, current_user: User = Depends(g
 
     # Analyze vehicle photos. analyze_vehicle_photo is synchronous and accepts
     # ONE image payload as bytes, so it is called without await, once per
-    # photo, with each entry normalised to bytes exactly as the maintenance
+    # photo, with each entry normalised to bytes the same way the maintenance
     # loop below does. The previous
     # `await analyze_vehicle_photo(listing.photos)` raised TypeError: object
     # dict can't be used in 'await' expression on every request -- including

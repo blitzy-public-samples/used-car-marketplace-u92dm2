@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
 
     class Config:
+        # A .env file is read only when pydantic's optional python-dotenv
+        # extra is installed. It is not part of this project's dependency
+        # set, so with the documented install a .env file present in the
+        # working directory makes Settings() raise ImportError at import.
+        # Exported environment variables are the supported path; see
+        # documentation/ONBOARDING.md section 1.5.
         env_file = ".env"
         env_file_encoding = "utf-8"
 
@@ -32,7 +38,11 @@ class Settings(BaseSettings):
                 value = raw_val.strip()
                 if value.startswith("["):
                     return json.loads(value)
-                return [origin.strip() for origin in value.split(",") if origin.strip()]
+                return [
+                    origin.strip()
+                    for origin in value.split(",")
+                    if origin.strip()
+                ]
             return cls.json_loads(raw_val)
 
 settings = Settings()

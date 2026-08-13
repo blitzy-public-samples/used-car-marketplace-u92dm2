@@ -13,7 +13,9 @@ from app.schema.user import User
 # tokenUrl must name the route that actually mints tokens. The literal 'token'
 # matched no route, so the OpenAPI security scheme advertised an endpoint that
 # does not exist and the Swagger authorize flow could never complete.
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f'{settings.API_V1_STR}/auth/login')
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl=f'{settings.API_V1_STR}/auth/login'
+)
 # This module held a complete set of authentication helpers and no router at
 # all, so main.py had nothing to mount and every auth path answered 404.
 router = APIRouter()
@@ -70,6 +72,7 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
+
 class RegisterRequest(BaseModel):
     # The field set comes from the User schema, not from a client: the SPA
     # ships no register function, and every User field except the password
@@ -81,15 +84,16 @@ class RegisterRequest(BaseModel):
     last_name: str
     role: str
 
+
 class LoginRequest(BaseModel):
-    # The SPA posts a JSON body {email, password}, so login binds a
-    # request model rather than OAuth2PasswordRequestForm: a form-bound
-    # route would reject every call the client makes, and would newly
-    # require python-multipart. Accepted consequence: Swagger's
-    # "Authorize" password flow, which submits a form, cannot complete
-    # against this route.
+    # The SPA posts a JSON body {email, password}, so login binds a request
+    # model rather than OAuth2PasswordRequestForm: a form-bound route would
+    # reject every call the client makes, and would newly require
+    # python-multipart. Accepted consequence: Swagger's "Authorize" password
+    # flow, which submits a form, cannot complete against this route.
     email: str
     password: str
+
 
 def _public_user(user: User) -> dict:
     # Project the public fields explicitly. No route in this codebase
@@ -106,6 +110,7 @@ def _public_user(user: User) -> dict:
         'updated_at': user.updated_at,
     }
 
+
 def _issue_token(user: User) -> str:
     # Supply the configured lifetime explicitly.
     # ACCESS_TOKEN_EXPIRE_MINUTES is a required setting that no module
@@ -119,6 +124,7 @@ def _issue_token(user: User) -> str:
             minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
         ),
     )
+
 
 @router.post('/register', status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest):
@@ -139,7 +145,6 @@ def register(payload: RegisterRequest):
         .get()
     )
     if existing:
-        logger.warning("Registration rejected: email already registered")
         raise HTTPException(
             status_code=409,
             detail="Email is already registered",
@@ -147,6 +152,7 @@ def register(payload: RegisterRequest):
     # Reserve the document reference first so its id can be stored inside the
     # document itself: authenticate_user and get_current_user both hydrate
     # through User.from_dict, which requires every field but the hash.
+    # Reserving allocates an id client-side and writes nothing.
     user_ref = db.collection('users').document()
     now = datetime.utcnow()
     user_data = {
@@ -159,10 +165,14 @@ def register(payload: RegisterRequest):
         'updated_at': now,
         'hashed_password': get_password_hash(payload.password),
     }
-    user_ref.set(user_data)
-    logger.info("Registered user %s", user_ref.id)
+    # Validate the document and mint the token before the irreversible write.
+    # Both steps can fail -- from_dict on a value the schema rejects,
+    # _issue_token on an ALGORITHM the signer does not support -- and doing
+    # them afterwards would commit a real account that its owner was never
+    # told about and could not create again, because the retry answers 409.
     user = User.from_dict(user_data)
     token = _issue_token(user)
+    user_ref.set(user_data)
     # access_token and token_type honour the OAuth2 convention the Token
     # model above describes; token and user are the keys the SPA actually
     # reads, and it throws "Invalid response from server" when a top-level
@@ -174,6 +184,7 @@ def register(payload: RegisterRequest):
         'user': _public_user(user),
     }
 
+
 @router.post('/login')
 def login(payload: LoginRequest):
     """Exchange an email and password for an access token."""
@@ -183,7 +194,6 @@ def login(payload: LoginRequest):
     # user is None" would treat every failed login as a success and mint a
     # token for it.
     if not user:
-        logger.warning("Login rejected: invalid credentials")
         # One message for an unknown email and for a wrong password, so the
         # response cannot be used to enumerate accounts, and the same header
         # get_current_user already returns on a 401.
@@ -193,7 +203,6 @@ def login(payload: LoginRequest):
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = _issue_token(user)
-    logger.info("Issued access token for user %s", user.id)
     # The same four keys register returns, for the same client contract.
     return {
         'access_token': token,
@@ -201,6 +210,7 @@ def login(payload: LoginRequest):
         'token': token,
         'user': _public_user(user),
     }
+
 
 @router.post('/logout')
 def logout(current_user: User = Depends(get_current_user)):
@@ -210,12 +220,12 @@ def logout(current_user: User = Depends(get_current_user)):
     # so nothing here can shorten a token's life. The route exists because
     # the SPA posts to it and clears its stored token whatever the
     # outcome, and 404 was the only answer it ever received.
-    logger.info("Logout acknowledged for user %s", current_user.id)
     return {"detail": "Logged out"}
+
 
 @router.get('/me')
 def read_current_user(current_user: User = Depends(get_current_user)):
     """Return the authenticated user's public profile."""
-    # Nested under 'user' because the SPA reads response.data.user; a flat body
-    # would hand it undefined.
+    # Nested under 'user' because the SPA reads response.data.user; a flat
+    # body would hand it undefined.
     return {'user': _public_user(current_user)}

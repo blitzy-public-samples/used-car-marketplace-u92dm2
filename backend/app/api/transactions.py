@@ -1,5 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.schema.transaction import Transaction
+# `User` annotates the current_user parameter of both handlers, and Python
+# evaluates annotations when the `def` executes, so the absent import raised
+# NameError while this module was still being imported -- no router could be
+# mounted and the whole backend failed to boot. Mirrors app/api/listings.py.
 from app.schema.user import User
 from app.db.firestore import db
 from app.api.auth import get_current_user
@@ -23,17 +27,19 @@ async def create_transaction(transaction: Transaction, current_user: User = Depe
     # Check if the vehicle listing is still available
     # Transaction declares no vehicle_id; the listing reference field is
     # vehicle_listing_id, so the old read raised AttributeError every request.
-    vehicle_ref = db.collection('vehicles').document(transaction.vehicle_listing_id)
+    vehicle_ref = db.collection('vehicles').document(
+        transaction.vehicle_listing_id
+    )
     vehicle = vehicle_ref.get()
     if not vehicle.exists or vehicle.to_dict().get('status') != 'available':
         raise HTTPException(status_code=400, detail="Vehicle is not available for purchase")
 
     # Process the payment using the payment service
     # process_payment is synchronous and takes (token, amount, currency). It
-    # was awaited with only two arguments, one of them payment_method, which is
-    # not a Transaction field at all, so the call raised AttributeError then
-    # TypeError before any payment could run. stripe_payment_intent_id is the
-    # only Stripe-credential-shaped field the schema declares.
+    # was awaited with only two arguments, one of them payment_method, which
+    # is not a Transaction field at all, so the call raised AttributeError and
+    # then TypeError before any payment could run. stripe_payment_intent_id is
+    # the only Stripe-credential-shaped field the schema declares.
     payment_result = process_payment(
         transaction.stripe_payment_intent_id,
         transaction.amount,
