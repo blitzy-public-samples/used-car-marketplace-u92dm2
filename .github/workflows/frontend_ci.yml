@@ -11,13 +11,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
+    # Node 20.x is mandatory, not cosmetic: the repository root is an npm
+    # workspace root, and npm workspaces require npm 7 or later. The Node 14
+    # pin used here before this fix ships npm 6, which can neither resolve a
+    # "workspaces" array nor read the committed lockfileVersion 3 lockfile;
+    # Node 14 has also been end-of-life since 30 April 2023. Held at 20.x
+    # rather than a newer major to match the engines floor in both manifests,
+    # the README prerequisite and scripts/setup_environment.sh, and the
+    # Vite 4 / Vitest 0.34 toolchain. The npm cache below keys on the root
+    # package-lock.json, which this fix commits; none existed before.
     - name: Use Node.js
-      uses: actions/setup-node@v2
+      uses: actions/setup-node@v4
       with:
-        node-version: '14.x'
+        node-version: '20.x'
+        cache: 'npm'
 
+    # This step previously failed with ENOENT (errno -2, exit code 254): it
+    # ran at the repository root, which held no package.json, and no lockfile
+    # was committed anywhere in the repository. Both now exist here, so the
+    # command below is correct as written and installs the whole workspace.
     - name: Install dependencies
       run: npm ci
 
